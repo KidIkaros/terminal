@@ -1,0 +1,216 @@
+# Configuration Reference
+
+This document describes all configuration options available in `terminal.toml`.
+
+## Configuration File Locations
+
+Configuration is loaded from the following locations (in order of priority):
+
+1. `./terminal.toml` - Current directory
+2. `~/.config/terminal/config.toml` - XDG config directory
+3. Built-in defaults
+
+## Font Configuration
+
+```toml
+[font]
+family = "JetBrains Mono"  # Font family name (for future use)
+size = 15.0                # Font size in pixels
+path = ""                  # Path to font file (optional)
+bold_path = ""             # Path to bold font file (optional)
+italic_path = ""           # Path to italic font file (optional)
+ligatures = true           # Enable ligature rendering
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `family` | string | `"JetBrains Mono"` | Font family name (currently informational) |
+| `size` | float | `15.0` | Font size in pixels |
+| `path` | string | `""` | Path to custom font file (TTF/OTF) |
+| `bold_path` | string | `""` | Path to bold variant font |
+| `italic_path` | string | `""` | Path to italic variant font |
+| `ligatures` | bool | `true` | Enable ligature rendering |
+
+## Window Configuration
+
+```toml
+[window]
+title = "Terminal"        # Window title
+cols = 80                 # Default columns
+rows = 24                 # Default rows
+padding = 0               # Window padding in pixels
+opacity = 1.0             # Window opacity (0.0 - 1.0)
+decorations = true        # Show window decorations
+always_on_top = false     # Keep window on top
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `title` | string | `"Terminal"` | Window title |
+| `cols` | u16 | `80` | Default terminal width in columns |
+| `rows` | u16 | `24` | Default terminal height in rows |
+| `padding` | u16 | `0` | Window padding in pixels |
+| `opacity` | float | `1.0` | Window opacity (0.0 = transparent, 1.0 = opaque) |
+| `decorations` | bool | `true` | Show window title bar and borders |
+| `always_on_top` | bool | `false` | Keep window above other windows |
+
+## Color Configuration
+
+```toml
+[colors]
+# Theme name (overrides individual colors if set)
+# theme = "Catppuccin Mocha"
+
+# Base colors
+background = "#1E1E2E"    # Background color
+foreground = "#CDD6F4"    # Foreground text color
+cursor = "#F5E0DC"        # Cursor color
+cursor_text = "#1E1E2E"   # Text color under cursor
+selection_bg = "#585B70"   # Selection background
+selection_fg = "#CDD6F4"   # Selection text color
+
+# Tab bar colors
+tab_bar_bg = "#181825"    # Tab bar background
+active_tab = "#89B4FA"    # Active tab color
+inactive_tab = "#45475A"  # Inactive tab color
+
+# ANSI color palette (16 colors)
+ansi = [
+    "#45475A",  # Black (0)
+    "#F38BA8",  # Red (1)
+    "#A6E3A1",  # Green (2)
+    "#F9E2AF",  # Yellow (3)
+    "#89B4FA",  # Blue (4)
+    "#F5C2E7",  # Magenta (5)
+    "#94E2D5",  # Cyan (6)
+    "#BAC2DE",  # White (7)
+    "#585B70",  # Bright Black (8)
+    "#F38BA8",  # Bright Red (9)
+    "#A6E3A1",  # Bright Green (10)
+    "#F9E2AF",  # Bright Yellow (11)
+    "#89B4FA",  # Bright Blue (12)
+    "#F5C2E7",  # Bright Magenta (13)
+    "#94E2D5",  # Bright Cyan (14)
+    "#A6ADC8",  # Bright White (15)
+]
+
+# Optional overrides
+# bold = "#FFFFFF"        # Bold text color
+# dim = "#888888"         # Dim text color
+```
+
+### Color Formats
+
+Colors can be specified in the following formats:
+
+- `#RRGGBB` - 6-digit hex (e.g., `#FF0000`)
+- `#RRGGBBAA` - 8-digit hex with alpha (e.g., `#FF000080`)
+- `rgb:R/G/B` - RGB format (e.g., `rgb:255/0/0`)
+
+### Available Themes
+
+| Theme | Variant |
+|-------|---------|
+| Catppuccin | Mocha, Latte, Frappe, Macchiato |
+| Gruvbox | Dark, Light |
+| Dracula | - |
+| Tokyo Night | Normal, Storm |
+| Nord | - |
+| Solarized | Dark, Light |
+| One Dark | - |
+| Monokai | - |
+| GitHub | Dark, Light |
+
+## Cursor Configuration
+
+```toml
+cursor_style = "block"    # Cursor style: "block", "bar", or "underline"
+cursor_blink_ms = 500     # Blink interval in milliseconds (0 = no blink)
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `cursor_style` | string | `"block"` | Cursor appearance |
+| `cursor_blink_ms` | u64 | `500` | Blink interval (0 to disable) |
+
+### Cursor Styles
+
+- `"block"` - Full cell block cursor
+- `"bar"` - Vertical line cursor
+- `"underline"` - Underline cursor
+
+## Keyboard Configuration
+
+```toml
+[keyboard]
+# Custom key bindings (future implementation)
+# bindings = [
+#     { key = "Ctrl+Shift+C", action = "copy" },
+#     { key = "Ctrl+Shift+V", action = "paste" },
+# ]
+```
+
+## Shell Configuration
+
+```toml
+# Shell to launch (defaults to $SHELL or /bin/bash)
+# shell = "/bin/bash"
+```
+
+## Scrollback Configuration
+
+```toml
+# Number of lines to keep in scrollback buffer
+# scrollback = 10000
+```
+
+## Mouse Configuration
+
+```toml
+# Enable mouse reporting by default
+# mouse_reporting = false
+```
+
+## Example Configurations
+
+### Minimal Configuration
+
+```toml
+[font]
+size = 14.0
+
+[window]
+cols = 120
+rows = 40
+```
+
+### Catppuccin Mocha Theme
+
+```toml
+[colors]
+background = "#1E1E2E"
+foreground = "#CDD6F4"
+cursor = "#F5E0DC"
+```
+
+Or simply:
+
+```toml
+[colors]
+theme = "Catppuccin Mocha"
+```
+
+### Performance Tuning
+
+```toml
+[font]
+ligatures = false  # Disable ligatures for better performance
+
+cursor_blink_ms = 0  # Disable cursor blink
+```
