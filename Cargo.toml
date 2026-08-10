@@ -1,0 +1,59 @@
+[package]
+name = "terminal"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, GPU-accelerated terminal emulator written in Rust"
+license = "MIT"
+repository = "https://github.com/user/terminal"
+readme = "README.md"
+keywords = ["terminal", "emulator", "gpu", "wgpu"]
+categories = ["command-line-utilities"]
+rust-version = "1.70"
+
+[[bin]]
+name = "terminal"
+path = "src/main.rs"
+
+[dependencies]
+# PTY / OS
+nix = { version = "0.29", features = ["process", "term", "ioctl", "fs"] }
+
+# Unicode column width (UAX #11)
+unicode-width = "0.2"
+
+# Windowing
+winit = "0.30"
+
+# GPU rendering
+wgpu = "22"
+
+# Font rasterization (pure Rust, no C deps)
+fontdue = "0.8"
+
+# Safe Pod casts for GPU buffer uploads
+bytemuck = { version = "1", features = ["derive"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Channel for cross-thread communication
+crossbeam-channel = "0.5"
+pollster = "1.0.1"
+
+# Clipboard access (Ctrl+C/V)
+arboard = "3.6"
+
+# Base64 encoding for OSC52
+base64 = "0.22"
+
+# Configuration file (TOML)
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+dirs = "5.0"
+
+# Regex for search
+regex = "1.11"
+
+# Open URLs in browser
+open = "5.3"
