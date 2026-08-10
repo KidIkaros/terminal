@@ -1,0 +1,34 @@
+{
+    "app-id": "com.github.terminal",
+    "runtime": "org.freedesktop.Platform",
+    "runtime-version": "23.08",
+    "sdk": "org.freedesktop.Sdk",
+    "command": "terminal",
+    "finish-args": [
+        "--share=ipc",
+        "--socket=wayland",
+        "--socket=x11",
+        "--device=dri",
+        "--filesystem=home",
+        "--filesystem=xdg-config",
+        "--talk-name=org.freedesktop.portal.Desktop",
+        "--talk-name=org.freedesktop.portal.FileChooser"
+    ],
+    "modules": [
+        {
+            "name": "terminal",
+            "buildsystem": "simple",
+            "build-commands": [
+                "cargo build --release",
+                "install -Dm755 target/release/terminal /app/bin/terminal"
+            ],
+            "sources": [
+                {
+                    "type": "git",
+                    "url": "https://github.com/user/terminal.git",
+                    "tag": "v0.1.0"
+                }
+            ]
+        }
+    ]
+}

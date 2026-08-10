@@ -1,0 +1,39 @@
+name: terminal
+version: '0.1.0'
+summary: A fast, GPU-accelerated terminal emulator
+description: |
+  Terminal is a fast, GPU-accelerated terminal emulator written in Rust.
+  It features a clean architecture with 4 layers: PTY, parser, grid, and renderer.
+
+base: core22
+confinement: strict
+grade: stable
+
+apps:
+  terminal:
+    command: bin/terminal
+    plugs:
+      - opengl
+      - unity7
+      - home
+      - x11
+      - wayland
+      - pulseaudio
+      - desktop
+      - desktop-legacy
+      - browser-support
+      - network
+      - network-bind
+
+parts:
+  terminal:
+    plugin: rust
+    source: https://github.com/user/terminal.git
+    build-packages:
+      - libgl1-mesa-dev
+      - libvulkan-dev
+      - libxkbcommon-dev
+      - libwayland-dev
+    rust:
+      cargoflags:
+        - --release

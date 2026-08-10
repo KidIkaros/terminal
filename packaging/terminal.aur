@@ -1,0 +1,35 @@
+# Maintainer: Terminal Contributors <contributors@example.com>
+# Contributor: Terminal Contributors
+
+pkgname=terminal
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A fast, GPU-accelerated terminal emulator written in Rust"
+arch=('x86_64')
+url="https://github.com/user/terminal"
+license=('MIT')
+depends=('vulkan-icd-loader' 'wayland' 'libxkbcommon')
+makedepends=('rust' 'cargo' 'vulkan-headers' 'wayland-protocols')
+source=("https://github.com/user/terminal/archive/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    cargo build --release --locked
+}
+
+package() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    install -Dm755 "target/release/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+    
+    # Install shell completion scripts
+    install -Dm644 "packaging/completions/terminal.bash" "${pkgdir}/usr/share/bash-completion/completions/${pkgname}"
+    install -Dm644 "packaging/completions/terminal.zsh" "${pkgdir}/usr/share/zsh/site-functions/_${pkgname}"
+    install -Dm644 "packaging/completions/terminal.fish" "${pkgdir}/usr/share/fish/vendor_completions.d/${pkgname}.fish"
+    
+    # Install man page
+    install -Dm644 "docs/terminal.1" "${pkgdir}/usr/share/man/man1/${pkgname}.1"
+    
+    # Install default config
+    install -Dm644 "terminal.toml" "${pkgdir}/etc/terminal/terminal.toml"
+}
