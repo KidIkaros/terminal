@@ -58,10 +58,16 @@ impl TabBar {
         self.height
     }
 
+    /// Width reserved for each tab.
+    const TAB_WIDTH: u32 = 150;
+    /// Size of header buttons (new tab, search, close).
+    const BUTTON_SIZE: f32 = 24.0;
+    const BUTTON_MARGIN: f32 = 4.0;
+
     /// Check if a click is on a tab, return tab index
-    pub fn tab_at_position(&self, x: f64, _y: f64, cell_width: u32) -> Option<usize> {
-        let tab_width = 150; // pixels per tab
-        let tab_index = (x / tab_width as f64) as usize;
+    pub fn tab_at_position(&self, x: f64, _y: f64, _cell_width: u32) -> Option<usize> {
+        let tab_width = Self::TAB_WIDTH as f64;
+        let tab_index = (x / tab_width) as usize;
         if tab_index < self.tabs.len() {
             Some(tab_index)
         } else {
@@ -69,56 +75,91 @@ impl TabBar {
         }
     }
 
+    /// Bounding rectangle (x, y, w, h) for the close button on tab `index`.
+    pub fn close_button_rect(&self, index: usize) -> Option<(f32, f32, f32, f32)> {
+        if index >= self.tabs.len() {
+            return None;
+        }
+        let x = index as f32 * Self::TAB_WIDTH as f32 + (Self::TAB_WIDTH as f32 - Self::BUTTON_SIZE - Self::BUTTON_MARGIN);
+        let y = Self::BUTTON_MARGIN;
+        Some((x, y, Self::BUTTON_SIZE, Self::BUTTON_SIZE))
+    }
+
     /// Check if a click is on a close button
-    pub fn close_button_at_position(&self, x: f64, y: f64, cell_width: u32) -> Option<usize> {
-        let tab_width = 150;
-        let close_button_width = 20;
-        let tab_index = (x / tab_width as f64) as usize;
-        
+    pub fn close_button_at_position(&self, x: f64, y: f64, _cell_width: u32) -> Option<usize> {
+        let tab_width = Self::TAB_WIDTH as f64;
+        let tab_index = (x / tab_width) as usize;
+
         if tab_index < self.tabs.len() {
-            let tab_x = x % tab_width as f64;
-            // Close button is at the right side of the tab
-            if tab_x > (tab_width - close_button_width) as f64 {
-                return Some(tab_index);
+            if let Some((cx, cy, cw, ch)) = self.close_button_rect(tab_index) {
+                if x >= cx as f64 && x <= (cx + cw) as f64 && y >= cy as f64 && y <= (cy + ch) as f64 {
+                    return Some(tab_index);
+                }
             }
         }
         None
     }
 
+    /// Position (x, y, w, h) for the right-aligned new-tab button.
+    pub fn new_tab_button_rect(&self, screen_width: u32) -> (f32, f32, f32, f32) {
+        let x = screen_width as f32 - 2.0 * (Self::BUTTON_SIZE + Self::BUTTON_MARGIN);
+        let y = Self::BUTTON_MARGIN;
+        (x, y, Self::BUTTON_SIZE, Self::BUTTON_SIZE)
+    }
+
+    /// Check if a click is on the new-tab button.
+    pub fn new_tab_button_at_position(&self, x: f64, y: f64, screen_width: u32) -> bool {
+        let (bx, by, bw, bh) = self.new_tab_button_rect(screen_width);
+        x >= bx as f64 && x <= (bx + bw) as f64 && y >= by as f64 && y <= (by + bh) as f64
+    }
+
+    /// Position (x, y, w, h) for the right-aligned search button.
+    pub fn search_button_rect(&self, screen_width: u32) -> (f32, f32, f32, f32) {
+        let x = screen_width as f32 - (Self::BUTTON_SIZE + Self::BUTTON_MARGIN);
+        let y = Self::BUTTON_MARGIN;
+        (x, y, Self::BUTTON_SIZE, Self::BUTTON_SIZE)
+    }
+
+    /// Check if a click is on the search button.
+    pub fn search_button_at_position(&self, x: f64, y: f64, screen_width: u32) -> bool {
+        let (bx, by, bw, bh) = self.search_button_rect(screen_width);
+        x >= bx as f64 && x <= (bx + bw) as f64 && y >= by as f64 && y <= (by + bh) as f64
+    }
+
     /// Generate vertex data for rendering
-    pub fn generate_vertices(&self, screen_width: u32) -> Vec<TabBarVertex> {
+    pub fn generate_vertices(&self, _screen_width: u32) -> Vec<TabBarVertex> {
         let mut vertices = Vec::new();
-        let tab_width = 150;
-        
+        let tab_width = Self::TAB_WIDTH as f32;
+
         for (i, tab) in self.tabs.iter().enumerate() {
-            let x = i as f32 * tab_width as f32;
+            let x = i as f32 * tab_width;
             let y = 0.0;
-            let w = tab_width as f32;
+            let w = tab_width;
             let h = self.height as f32;
-            
+
             // Tab background
             let color = if tab.active {
                 &self.active_color
             } else {
                 &self.inactive_color
             };
-            
+
             vertices.push(TabBarVertex {
                 position: [x, y],
                 size: [w, h],
                 color: color_to_floats(color),
             });
-            
+
             // Close button (X)
-            let close_x = x + w - 25.0;
-            let close_y = y + 5.0;
-            vertices.push(TabBarVertex {
-                position: [close_x, close_y],
-                size: [15.0, 15.0],
-                color: [0.7, 0.7, 0.7, 1.0],
-            });
+            if let Some((close_x, close_y, close_w, close_h)) = self.close_button_rect(i) {
+                vertices.push(TabBarVertex {
+                    position: [close_x, close_y],
+                    size: [close_w, close_h],
+                    color: [0.7, 0.7, 0.7, 1.0],
+                });
+            }
         }
-        
+
         vertices
     }
 }
@@ -131,7 +172,7 @@ pub struct TabBarVertex {
     pub color: [f32; 4],
 }
 
-fn color_to_floats(color: &Color) -> [f32; 4] {
+pub fn color_to_floats(color: &Color) -> [f32; 4] {
     match color {
         Color::Default => [0.0, 0.0, 0.0, 1.0],
         Color::Rgb(r, g, b) => [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],

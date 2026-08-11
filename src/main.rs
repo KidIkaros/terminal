@@ -464,21 +464,16 @@ impl App {
     }
 
     fn pixel_size(&self, atlas: &GlyphAtlas) -> (u32, u32) {
-        // Tab bar only shows with 2+ tabs; initial window has 1 tab so no offset.
+        let tb_h = if self.show_tab_bar { self.config.tabs.height } else { 0 };
         (
             self.size.cols as u32 * atlas.cell_width,
-            self.size.rows as u32 * atlas.cell_height,
+            self.size.rows as u32 * atlas.cell_height + tb_h,
         )
     }
 
-    /// Current tab bar height in pixels (0 if hidden or only one tab).
+    /// Current tab bar height in pixels (0 if hidden).
     fn tab_bar_height(&self) -> u32 {
-        let tab_count = self.tab_manager.as_ref().map(|tm| tm.len()).unwrap_or(1);
-        if self.show_tab_bar && tab_count > 1 {
-            self.config.tabs.height
-        } else {
-            0
-        }
+        if self.show_tab_bar { self.config.tabs.height } else { 0 }
     }
 }
 
@@ -633,6 +628,8 @@ impl ApplicationHandler for App {
                     let (mx, my) = self.mouse_position;
                     if my < tb_h as f64 {
                         let cell_width = self.atlas.as_ref().map(|a| a.cell_width).unwrap_or(8);
+                        let screen_width = self.window.as_ref().map(|w| w.inner_size().width).unwrap_or(0);
+
                         // Check close button first
                         if let Some(idx) = self.tab_bar.close_button_at_position(mx, my, cell_width) {
                             let close_result = self.tab_manager.as_mut().map(|tm| tm.close_tab(idx));
@@ -640,6 +637,16 @@ impl ApplicationHandler for App {
                                 self.should_quit = true;
                             }
                             self.refresh_tab_bar();
+                        } else if self.tab_bar.new_tab_button_at_position(mx, my, screen_width) {
+                            match self.tab_manager.as_mut().map(|tm| tm.new_tab()) {
+                                Some(Ok(_)) => {
+                                    self.refresh_tab_bar();
+                                }
+                                Some(Err(e)) => log::error!("Failed to spawn new tab: {e}"),
+                                None => {}
+                            }
+                        } else if self.tab_bar.search_button_at_position(mx, my, screen_width) {
+                            self.search.activate();
                         } else if let Some(idx) = self.tab_bar.tab_at_position(mx, my, cell_width) {
                             if let Some(tm) = &mut self.tab_manager {
                                 tm.switch_to(idx);

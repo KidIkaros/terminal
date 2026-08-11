@@ -457,6 +457,43 @@ impl TerminalPipeline {
     // Render frame
     // -----------------------------------------------------------------------
 
+    /// Center a single glyph `ch` inside a `button_w x button_h` rectangle and
+    /// append it to `instances`. Falls back to a plain ASCII alternative if the
+    /// requested glyph is not in the atlas.
+    fn add_glyph_button(
+        instances: &mut Vec<GlyphInstance>,
+        atlas: &mut GlyphAtlas,
+        baseline: i32,
+        ch: char,
+        button_x: f32,
+        button_y: f32,
+        button_w: f32,
+        button_h: f32,
+        fg_color: [f32; 4],
+        bg_color: [f32; 4],
+    ) {
+        let cw = atlas.cell_width as f32;
+        let ch_h = atlas.cell_height as f32;
+        let region = atlas.get_or_rasterize(ch, false, false)
+            .or_else(|| atlas.get_or_rasterize('x', false, false));
+        if let Some(r) = &region {
+            let text_x = button_x + (button_w - cw) / 2.0;
+            let text_y = button_y + (button_h - ch_h) / 2.0;
+            let gx = text_x + r.metrics.xmin as f32;
+            let gy = text_y + baseline as f32 - r.metrics.height as f32 - r.metrics.ymin as f32;
+            instances.push(GlyphInstance {
+                cell_pos: [gx, gy],
+                cell_size: [r.metrics.width as f32, r.metrics.height as f32],
+                atlas_uv_min: r.uv_min,
+                atlas_uv_max: r.uv_max,
+                fg_color,
+                bg_color,
+                mode: 1,
+                _pad: [0; 3],
+            });
+        }
+    }
+
     pub fn render(&mut self, params: RenderParams<'_>) {
         let RenderParams { grid, atlas, cursor_visible, colors, selection, tab_bar, tab_bar_height } = params;
         let cw = atlas.cell_width as f32;
@@ -475,9 +512,24 @@ impl TerminalPipeline {
         // --- Tab bar background rectangles ---
         if let Some(tb) = tab_bar {
             let tab_width = 150.0f32;
-            let active_color = parse_hex_color(&colors.selection_bg);
-            let inactive_color = parse_hex_color(&colors.background);
+            let active_color = crate::tab_bar::color_to_floats(&tb.active_color);
+            let inactive_color = crate::tab_bar::color_to_floats(&tb.inactive_color);
             let text_color = parse_hex_color(&colors.foreground);
+            let header_color = crate::tab_bar::color_to_floats(&tb.bg_color);
+            let screen_w = self.surface_config.width as f32;
+
+            // Header bar background (fills the full width at the top)
+            instances.push(GlyphInstance {
+                cell_pos: [0.0, 0.0],
+                cell_size: [screen_w, tab_bar_height],
+                atlas_uv_min: [0.0; 2],
+                atlas_uv_max: [0.0; 2],
+                fg_color: header_color,
+                bg_color: header_color,
+                mode: 0,
+                _pad: [0; 3],
+            });
+
             for (i, tab) in tb.tabs.iter().enumerate() {
                 let x = i as f32 * tab_width;
                 let color = if tab.active { active_color } else { inactive_color };
@@ -517,7 +569,19 @@ impl TerminalPipeline {
                         text_x += cw;
                     }
                 }
+
+                // Close button (×) on the right of the tab
+                if let Some((cx, cy, cw_btn, ch_btn)) = tb.close_button_rect(i) {
+                    Self::add_glyph_button(&mut instances, atlas, baseline, '×', cx, cy, cw_btn, ch_btn, text_color, color);
+                }
             }
+
+            // New tab (+) and search (S) buttons, right-aligned
+            let (new_x, new_y, new_w, new_h) = tb.new_tab_button_rect(self.surface_config.width);
+            Self::add_glyph_button(&mut instances, atlas, baseline, '+', new_x, new_y, new_w, new_h, text_color, header_color);
+
+            let (search_x, search_y, search_w, search_h) = tb.search_button_rect(self.surface_config.width);
+            Self::add_glyph_button(&mut instances, atlas, baseline, 'S', search_x, search_y, search_w, search_h, text_color, header_color);
         }
 
         for row in 0..grid.rows {
