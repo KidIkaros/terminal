@@ -17,7 +17,7 @@ mod tests {
     fn headless_render() {
         // ---- Build a grid with some content ----
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Simulate a typical bash prompt with color

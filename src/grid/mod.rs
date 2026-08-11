@@ -263,9 +263,10 @@ impl Default for Color {
 // ---------------------------------------------------------------------------
 
 /// Mouse tracking mode as defined by DECSET private modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MouseMode {
     /// No mouse tracking (default).
+    #[default]
     None,
     /// Normal tracking (DECSET 1000): Button press + release only.
     Normal,
@@ -276,9 +277,10 @@ pub enum MouseMode {
 }
 
 /// Mouse event encoding format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MouseEncoding {
     /// Legacy X10 encoding (default).
+    #[default]
     X10,
     /// SGR extended encoding (DECSET 1006) — supports >223 columns.
     SGR,
@@ -315,6 +317,8 @@ pub struct Grid {
     pub scrollback_offset: usize, // 0 = no scroll, >0 = lines scrolled up
     /// Fractional scroll offset for smooth scrolling (0.0 to 1.0)
     pub scroll_fraction: f32,
+    /// Maximum number of lines in scrollback buffer
+    pub scrollback_capacity: usize,
 
     // DECTCEM cursor visibility
     pub cursor_visible: bool,
@@ -343,7 +347,7 @@ pub struct Grid {
 }
 
 impl Grid {
-    pub fn new(size: WinSize) -> Self {
+    pub fn new(size: WinSize, scrollback: usize) -> Self {
         let cols = size.cols as usize;
         let rows = size.rows as usize;
         let len = cols * rows;
@@ -363,6 +367,7 @@ impl Grid {
             scrollback: Vec::new(),
             scrollback_offset: 0,
             scroll_fraction: 0.0,
+            scrollback_capacity: scrollback,
             cursor_visible: true,
             alt_saved_cursor: Cursor::default(),
             mouse_mode: MouseMode::None,
@@ -431,6 +436,9 @@ impl Grid {
         self.scroll_bottom = new_rows - 1;
         self.cursor.col = self.cursor.col.min(new_cols.saturating_sub(1));
         self.cursor.row = self.cursor.row.min(new_rows.saturating_sub(1));
+        
+        // Mark all cells dirty since the grid has been resized
+        self.mark_all_dirty();
     }
 
     // -----------------------------------------------------------------------
@@ -621,7 +629,7 @@ impl Grid {
     // Scrolling
     // -----------------------------------------------------------------------
 
-    fn scroll_up(&mut self, n: usize) {
+     fn scroll_up(&mut self, n: usize) {
         // Push top line(s) into scrollback (primary screen only)
         if !self.alt_active {
             for r in self.scroll_top..self.scroll_top + n {
@@ -631,6 +639,10 @@ impl Grid {
                         .collect();
                     self.scrollback.push(row);
                 }
+            }
+            // Enforce scrollback limit
+            while self.scrollback.len() > self.scrollback_capacity {
+                self.scrollback.remove(0);
             }
         }
 
@@ -650,6 +662,13 @@ impl Grid {
                 cells[bot * cols + c] = Cell::default();
             }
         }
+        
+        // Mark all visible cells dirty after scroll
+        for r in top..=bot {
+            for c in 0..cols {
+                self.mark_dirty(c, r);
+            }
+        }
     }
 
     fn scroll_down(&mut self, n: usize) {
@@ -667,6 +686,13 @@ impl Grid {
             // Clear top line
             for c in 0..cols {
                 cells[top * cols + c] = Cell::default();
+            }
+        }
+        
+        // Mark all visible cells dirty after scroll
+        for r in top..=bot {
+            for c in 0..cols {
+                self.mark_dirty(c, r);
             }
         }
     }
@@ -1262,7 +1288,7 @@ impl Perform for Grid {
                         *self = Grid::new(WinSize {
                             cols: self.cols as u16,
                             rows: self.rows as u16,
-                        });
+                        }, self.scrollback_capacity);
                         self.cursor_visible = true;
                     }
                     _ => {}
@@ -1285,7 +1311,7 @@ mod tests {
     use super::*;
 
     fn make_grid(cols: u16, rows: u16) -> Grid {
-        Grid::new(WinSize { cols, rows })
+        Grid::new(WinSize { cols, rows }, 1000)
     }
 
     fn feed(grid: &mut Grid, input: &[u8]) {
@@ -1722,5 +1748,50 @@ mod tests {
         let mut palette = ColorPalette::default();
         palette.set_color(100, 123, 45, 67);
         assert_eq!(palette.get_color(100), Some((123, 45, 67)));
+    }
+
+    #[test]
+    fn test_dirty_cells_after_print() {
+        let mut g = make_grid(10, 3);
+        // Initially all cells are dirty (Cell::default sets dirty: true)
+        assert!(g.has_dirty_cells());
+        
+        // Clear initial dirty flags
+        let _ = g.take_dirty_cells();
+        
+        // No dirty cells now
+        assert!(!g.has_dirty_cells());
+        
+        // Print some text - should mark cells dirty
+        feed(&mut g, b"Hello");
+        assert!(g.has_dirty_cells());
+        
+        // Take dirty cells - should return them and clear flags
+        let dirty = g.take_dirty_cells();
+        assert!(dirty.len() >= 5); // At least 5 cells for "Hello"
+        
+        // Second call should return empty (flags cleared)
+        let dirty2 = g.take_dirty_cells();
+        assert!(dirty2.is_empty());
+        
+        // No dirty cells now
+        assert!(!g.has_dirty_cells());
+    }
+
+    #[test]
+    fn test_scrollback_capacity_enforcement() {
+        // Grid with only 3 lines of scrollback capacity
+        let mut g = Grid::new(WinSize { cols: 10, rows: 3 }, 3);
+        
+        // Fill the visible area and scroll up to generate scrollback
+        feed(&mut g, b"Line1\r\nLine2\r\nLine3\r\n");
+        // Cursor is now at row 3, which will cause scroll up
+        feed(&mut g, b"Line4\r\n");
+        feed(&mut g, b"Line5\r\n");
+        feed(&mut g, b"Line6\r\n");
+        feed(&mut g, b"Line7\r\n");
+        
+        // Scrollback should never exceed capacity
+        assert!(g.scrollback.len() <= 3);
     }
 }

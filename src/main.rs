@@ -29,12 +29,14 @@ use winit::{
 
 use clipboard::ClipboardManager;
 use config::Config;
-use grid::{Grid, WinSize};
+use grid::WinSize;
 use mouse::MouseButton;
-use parser::Parser;
-use render::{font::GlyphAtlas, pipeline::TerminalPipeline};
+use render::{font::GlyphAtlas, pipeline::{RenderParams, TerminalPipeline}};
 use search::SearchState;
 use selection::{Selection, SelectionMode};
+use tab_bar::TabBar;
+use tabs::TabManager;
+use theme::Theme;
 
 // ---------------------------------------------------------------------------
 // Application (winit ApplicationHandler)
@@ -47,13 +49,10 @@ struct App {
     pipeline: Option<TerminalPipeline>,
     atlas: Option<GlyphAtlas>,
 
-    // Terminal state — parser + grid both single-threaded
-    grid: Grid,
-    parser: Parser,
-
-    // PTY I/O
-    pty_writer: Option<pty::PtyWriter>,
-    pty_rx: Option<crossbeam_channel::Receiver<Vec<u8>>>,
+    // Tab management — each tab owns its own grid, parser, and PTY.
+    tab_manager: Option<TabManager>,
+    tab_bar: TabBar,
+    show_tab_bar: bool,
 
     // Clipboard
     clipboard: ClipboardManager,
@@ -73,6 +72,9 @@ struct App {
     cursor_visible: bool,
     last_cursor_blink: std::time::Instant,
 
+    // Set when the last tab is closed — signals the event loop to exit.
+    should_quit: bool,
+
     // Configuration
     config: Config,
 
@@ -81,7 +83,15 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let config = Config::load();
+        let mut config = Config::load();
+
+        // Load theme if specified in config
+        if let Some(ref theme_name) = config.colors.theme {
+            if let Some(theme) = Theme::find(theme_name) {
+                config.colors = theme.colors;
+            }
+        }
+
         let size = WinSize {
             cols: config.window.cols,
             rows: config.window.rows,
@@ -90,42 +100,107 @@ impl App {
             window: None,
             pipeline: None,
             atlas: None,
-            grid: Grid::new(size),
-            parser: Parser::new(),
-            pty_writer: None,
-            pty_rx: None,
+            // TabManager is spawned in `resumed` so PTY errors can be handled.
+            tab_manager: None,
+            tab_bar: TabBar::new(),
+            show_tab_bar: config.tabs.show_tab_bar,
             clipboard: ClipboardManager::new(),
             modifiers: ModifiersState::default(),
-            mouse_position: (0.0, 0.0),
+            mouse_position: (0.0, f64::NEG_INFINITY),
             mouse_button_pressed: None,
             search: SearchState::new(),
             selection: Selection::new(),
             cursor_visible: true,
             last_cursor_blink: std::time::Instant::now(),
+            should_quit: false,
             config,
             size,
         }
     }
 
-    /// Drain all pending bytes from the PTY channel, parse them, update grid.
-    fn drain_pty(&mut self) {
+    /// Refresh the tab bar from the current tab manager state.
+    fn refresh_tab_bar(&mut self) {
+        if let Some(tm) = &self.tab_manager {
+            let titles = tm.titles();
+            let active = tm.active_index();
+            self.tab_bar.update_tabs(&titles, active);
+        }
+    }
+
+    // --- Active tab accessors (return defaults when tab_manager is not yet
+    //     initialized, i.e. before `resumed`). ---
+
+    fn active_mouse_mode(&self) -> grid::MouseMode {
+        self.tab_manager.as_ref()
+            .map(|tm| tm.active().grid.mouse_mode)
+            .unwrap_or_default()
+    }
+
+    fn active_mouse_encoding(&self) -> grid::MouseEncoding {
+        self.tab_manager.as_ref()
+            .map(|tm| tm.active().grid.mouse_encoding)
+            .unwrap_or_default()
+    }
+
+    fn active_all_lines(&self) -> Vec<String> {
+        self.tab_manager.as_ref()
+            .map(|tm| tm.active().grid.all_lines())
+            .unwrap_or_default()
+    }
+
+    fn active_bracketed_paste(&self) -> bool {
+        self.tab_manager.as_ref()
+            .map(|tm| tm.active().grid.bracketed_paste)
+            .unwrap_or(false)
+    }
+
+    /// Drain all pending bytes from the active tab's PTY channel, parse them,
+    /// update the grid. Returns true if any data was processed.
+    fn drain_pty(&mut self) -> bool {
+        let Some(tm) = &mut self.tab_manager else { return false };
+        let tab = tm.active_mut();
+
+        // Capture the title before parsing so we can detect OSC title changes.
+        let title_before = tab.grid.palette.title.clone();
+
         // Collect chunks first so we can split the borrow cleanly
         let mut pending: Vec<Vec<u8>> = Vec::new();
-        if let Some(rx) = &self.pty_rx {
+        if let Some(rx) = &tab.pty_rx {
             while let Ok(chunk) = rx.try_recv() {
                 pending.push(chunk);
             }
         }
+        let had_data = !pending.is_empty();
         for chunk in pending {
             for byte in chunk {
-                self.parser.advance(&mut self.grid, byte);
+                tab.parser.advance(&mut tab.grid, byte);
             }
         }
+        if had_data {
+            tab.grid.mark_all_dirty();
+
+            // If the shell set a title via OSC 0/2, update the tab manager + tab bar.
+            let title_after = &tab.grid.palette.title;
+            if title_after != &title_before && !title_after.is_empty() {
+                let new_title = title_after.clone();
+                let active_idx = self.tab_manager.as_ref().map(|tm| tm.active_index()).unwrap_or(0);
+                if let Some(tm) = &mut self.tab_manager {
+                    tm.set_active_title(&new_title);
+                }
+                self.tab_bar.update_tabs(
+                    &self.tab_manager.as_ref().map(|tm| tm.titles()).unwrap_or_default(),
+                    active_idx,
+                );
+            }
+        }
+        had_data
     }
 
     fn write_to_pty(&self, data: &[u8]) {
-        if let Some(w) = &self.pty_writer {
-            w.write(data);
+        if let Some(tm) = &self.tab_manager {
+            if let Some(w) = &tm.active().pty_writer {
+                w.write(data);
+            }
         }
     }
 
@@ -144,7 +219,7 @@ impl App {
             // Ctrl+Shift+C — Copy selection to clipboard
             Key::Character(s) if s.as_str() == "C" && ctrl && shift => {
                 if self.selection.active {
-                    let lines = self.grid.all_lines();
+                    let lines = self.active_all_lines();
                     let text = self.selection.extract_text(&lines, self.size.cols as usize);
                     if !text.is_empty() {
                         self.clipboard.copy(&text);
@@ -159,7 +234,8 @@ impl App {
             Key::Character(s) if s.as_str() == "V" && ctrl && shift => {
                 if let Some(text) = self.clipboard.paste() {
                     // Wrap in bracketed paste mode if enabled
-                    if self.grid.bracketed_paste {
+                    let bracketed = self.active_bracketed_paste();
+                    if bracketed {
                         let mut data = Vec::new();
                         data.extend_from_slice(b"\x1b[200~");
                         data.extend_from_slice(text.as_bytes());
@@ -183,26 +259,6 @@ impl App {
             Key::Character(s) if s.as_str() == "r" && ctrl && !shift => {
                 self.search.activate_reverse();
                 log::debug!("Reverse Search: Ctrl+R");
-                true
-            }
-            // Ctrl+Shift+T — New tab (TODO: full multi-PTY support)
-            Key::Character(s) if s.as_str() == "T" && ctrl && shift => {
-                log::debug!("New Tab: Ctrl+Shift+T (not fully implemented)");
-                true
-            }
-            // Ctrl+Shift+W — Close tab (TODO: full multi-PTY support)
-            Key::Character(s) if s.as_str() == "W" && ctrl && shift => {
-                log::debug!("Close Tab: Ctrl+Shift+W (not fully implemented)");
-                true
-            }
-            // Ctrl+PageDown — Next tab (TODO)
-            Key::Named(NamedKey::PageDown) if ctrl && !shift => {
-                log::debug!("Next Tab: Ctrl+PageDown (not fully implemented)");
-                true
-            }
-            // Ctrl+PageUp — Previous tab (TODO)
-            Key::Named(NamedKey::PageUp) if ctrl && !shift => {
-                log::debug!("Previous Tab: Ctrl+PageUp (not fully implemented)");
                 true
             }
             // Ctrl+Shift+A — Select all
@@ -258,6 +314,72 @@ impl App {
                 self.write_to_pty(&[0x05]);
                 true
             }
+            // Ctrl+Shift+T — New tab
+            Key::Character(s) if s.as_str() == "T" && ctrl && shift => {
+                let spawn_result = self.tab_manager.as_mut().map(|tm| tm.new_tab());
+                match spawn_result {
+                    Some(Ok(_)) => {
+                        let count = self.tab_manager.as_ref().map(|tm| tm.len()).unwrap_or(0);
+                        self.refresh_tab_bar();
+                        log::debug!("New tab created (count={})", count);
+                    }
+                    Some(Err(e)) => log::error!("Failed to spawn new tab: {e}"),
+                    None => {}
+                }
+                true
+            }
+            // Ctrl+Shift+W — Close current tab
+            Key::Character(s) if s.as_str() == "W" && ctrl && shift => {
+                let close_result = self.tab_manager.as_mut().map(|tm| tm.close_current());
+                match close_result {
+                    Some(None) => {
+                        // Last tab closed — signal the event loop to exit
+                        self.should_quit = true;
+                        log::debug!("Closed last tab — exiting");
+                    }
+                    Some(Some(_)) => {
+                        let remaining = self.tab_manager.as_ref().map(|tm| tm.len()).unwrap_or(0);
+                        self.refresh_tab_bar();
+                        log::debug!("Closed tab (remaining={})", remaining);
+                    }
+                    None => {}
+                }
+                true
+            }
+            // Ctrl+PageDown — Next tab
+            Key::Named(NamedKey::PageDown) if ctrl && !shift => {
+                if let Some(tm) = &mut self.tab_manager {
+                    tm.next();
+                }
+                let idx = self.tab_manager.as_ref().map(|tm| tm.active_index()).unwrap_or(0);
+                self.refresh_tab_bar();
+                log::debug!("Switched to next tab (index={})", idx);
+                true
+            }
+            // Ctrl+PageUp — Previous tab
+            Key::Named(NamedKey::PageUp) if ctrl && !shift => {
+                if let Some(tm) = &mut self.tab_manager {
+                    tm.prev();
+                }
+                let idx = self.tab_manager.as_ref().map(|tm| tm.active_index()).unwrap_or(0);
+                self.refresh_tab_bar();
+                log::debug!("Switched to prev tab (index={})", idx);
+                true
+            }
+            // Ctrl+Shift+1..9 — Switch to tab N
+            Key::Character(s) if ctrl && shift && matches!(s.as_str(), "1"|"2"|"3"|"4"|"5"|"6"|"7"|"8"|"9") => {
+                if let Ok(n) = s.parse::<usize>() {
+                    let len = self.tab_manager.as_ref().map(|tm| tm.len()).unwrap_or(0);
+                    if n >= 1 && n <= len {
+                        if let Some(tm) = &mut self.tab_manager {
+                            tm.switch_to(n - 1);
+                        }
+                        self.refresh_tab_bar();
+                        log::debug!("Switched to tab {}", n);
+                    }
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -272,30 +394,38 @@ impl App {
             }
             // Enter — Search for next match
             Key::Named(NamedKey::Enter) => {
-                let lines = self.grid.all_lines();
+                let lines = self.active_all_lines();
                 self.search.search(&lines);
                 if let Some(m) = self.search.next() {
-                    self.grid.mark_match_dirty(m.row, m.start_col, m.end_col);
+                    if let Some(tm) = &mut self.tab_manager {
+                        tm.active_mut().grid.mark_match_dirty(m.row, m.start_col, m.end_col);
+                    }
                 }
                 true
             }
             // F3 or Ctrl+G — Find next
             Key::Named(NamedKey::F3) => {
                 if let Some(m) = self.search.next() {
-                    self.grid.mark_match_dirty(m.row, m.start_col, m.end_col);
+                    if let Some(tm) = &mut self.tab_manager {
+                        tm.active_mut().grid.mark_match_dirty(m.row, m.start_col, m.end_col);
+                    }
                 }
                 true
             }
             Key::Character(s) if s.as_str() == "g" && self.modifiers.control_key() && !self.modifiers.shift_key() => {
                 if let Some(m) = self.search.next() {
-                    self.grid.mark_match_dirty(m.row, m.start_col, m.end_col);
+                    if let Some(tm) = &mut self.tab_manager {
+                        tm.active_mut().grid.mark_match_dirty(m.row, m.start_col, m.end_col);
+                    }
                 }
                 true
             }
             // Shift+F3 or Ctrl+Shift+G — Find previous
             Key::Character(s) if s.as_str() == "g" && self.modifiers.control_key() && self.modifiers.shift_key() => {
                 if let Some(m) = self.search.prev() {
-                    self.grid.mark_match_dirty(m.row, m.start_col, m.end_col);
+                    if let Some(tm) = &mut self.tab_manager {
+                        tm.active_mut().grid.mark_match_dirty(m.row, m.start_col, m.end_col);
+                    }
                 }
                 true
             }
@@ -306,7 +436,7 @@ impl App {
                 // Recompile and search
                 let query = self.search.query.clone();
                 self.search.update_query(&query);
-                let lines = self.grid.all_lines();
+                let lines = self.active_all_lines();
                 self.search.search(&lines);
                 true
             }
@@ -316,7 +446,7 @@ impl App {
                 // Recompile and search
                 let query = self.search.query.clone();
                 self.search.update_query(&query);
-                let lines = self.grid.all_lines();
+                let lines = self.active_all_lines();
                 self.search.search(&lines);
                 true
             }
@@ -334,10 +464,21 @@ impl App {
     }
 
     fn pixel_size(&self, atlas: &GlyphAtlas) -> (u32, u32) {
+        // Tab bar only shows with 2+ tabs; initial window has 1 tab so no offset.
         (
             self.size.cols as u32 * atlas.cell_width,
             self.size.rows as u32 * atlas.cell_height,
         )
+    }
+
+    /// Current tab bar height in pixels (0 if hidden or only one tab).
+    fn tab_bar_height(&self) -> u32 {
+        let tab_count = self.tab_manager.as_ref().map(|tm| tm.len()).unwrap_or(1);
+        if self.show_tab_bar && tab_count > 1 {
+            self.config.tabs.height
+        } else {
+            0
+        }
     }
 }
 
@@ -348,11 +489,12 @@ impl ApplicationHandler for App {
         }
 
         let font_bytes = render::font::embedded_font();
-        let atlas = GlyphAtlas::from_bytes(font_bytes, self.config.font.size);
+        let mut atlas = GlyphAtlas::from_bytes(font_bytes, self.config.font.size);
+        render::font::load_fallback_fonts(&mut atlas);
         let (pw, ph) = self.pixel_size(&atlas);
 
         let attrs = Window::default_attributes()
-            .with_title("terminal")
+            .with_title(&self.config.window.title)
             .with_inner_size(PhysicalSize::new(pw, ph))
             .with_position(PhysicalPosition::new(100, 100))
             .with_resizable(true)
@@ -363,11 +505,13 @@ impl ApplicationHandler for App {
 
         let pipeline = pollster::block_on(TerminalPipeline::new(Arc::clone(&window), &atlas, self.config.window.vsync));
 
-        match pty::spawn_pty(self.size, &self.config.shell) {
-            Ok((writer, _handle, rx)) => {
-                self.pty_writer = Some(writer);
-                self.pty_rx = Some(rx);
-                // _handle is kept alive — Drop sends SIGHUP + waitpid on exit
+        // Spawn the initial tab (which spawns the first PTY).
+        match TabManager::new(self.size, &self.config.shell, self.config.scrollback) {
+            Ok(mut tm) => {
+                // Mark all cells dirty so the first frame renders the full grid.
+                tm.active_mut().grid.mark_all_dirty();
+                self.tab_manager = Some(tm);
+                self.refresh_tab_bar();
             }
             Err(e) => {
                 log::error!("PTY open failed: {e}");
@@ -393,15 +537,20 @@ impl ApplicationHandler for App {
                     pipeline.resize(size.width, size.height);
                 }
                 if let Some(atlas) = &self.atlas {
+                    let tb_h = self.tab_bar_height();
                     let new_cols = (size.width / atlas.cell_width.max(1)) as u16;
-                    let new_rows = (size.height / atlas.cell_height.max(1)) as u16;
+                    let new_rows = ((size.height.saturating_sub(tb_h)) / atlas.cell_height.max(1)) as u16;
                     if new_cols > 0 && new_rows > 0 {
                         self.size = WinSize { cols: new_cols, rows: new_rows };
-                        self.grid.resize(self.size);
+                        if let Some(tm) = &mut self.tab_manager {
+                            tm.resize(self.size);
+                        }
                     }
                 }
-                if let Some(w) = &self.pty_writer {
-                    w.resize(self.size);
+
+                // Request redraw after resize
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
             }
 
@@ -411,16 +560,16 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_position = (position.x, position.y);
-                
+
                 // Report motion if mouse tracking is active
                 if let Some(atlas) = &self.atlas {
-                    let mode = self.grid.mouse_mode;
+                    let mode = self.active_mouse_mode();
                     let button_pressed = self.mouse_button_pressed.is_some();
-                    
+
                     if mouse::should_report_motion(mode, button_pressed) {
                         let col = (position.x / atlas.cell_width.max(1) as f64) as u32 + 1;
-                        let row = (position.y / atlas.cell_height.max(1) as f64) as u32 + 1;
-                        
+                        let row = ((position.y - self.tab_bar_height() as f64) / atlas.cell_height.max(1) as f64) as u32 + 1;
+
                         let event = mouse::MouseEvent {
                             button: self.mouse_button_pressed.unwrap_or(mouse::MouseButton::Left),
                             event_type: mouse::MouseEventType::Motion,
@@ -430,22 +579,83 @@ impl ApplicationHandler for App {
                             ctrl: self.modifiers.control_key(),
                             alt: self.modifiers.alt_key(),
                         };
-                        
-                        let encoded = event.encode(self.grid.mouse_encoding);
+
+                        let encoding = self.active_mouse_encoding();
+                        let encoded = event.encode(encoding);
                         self.write_to_pty(encoded.as_bytes());
                     } else if self.selection.selecting {
                         // Update selection during drag
                         let col = (position.x / atlas.cell_width.max(1) as f64) as usize;
-                        let row = (position.y / atlas.cell_height.max(1) as f64) as usize;
+                        let row = ((position.y - self.tab_bar_height() as f64) / atlas.cell_height.max(1) as f64) as usize;
+
+                        // Mark previously selected cells dirty
+                        let (old_start, old_end) = self.selection.normalized();
+                        if let Some(tm) = &mut self.tab_manager {
+                            let grid = &mut tm.active_mut().grid;
+                            for r in old_start.0..=old_end.0 {
+                                for c in 0..self.size.cols as usize {
+                                    if self.selection.contains(r, c) {
+                                        grid.mark_dirty(c, r);
+                                    }
+                                }
+                            }
+                        }
+
                         self.selection.update(row, col);
+
+                        // Mark newly selected cells dirty
+                        if let Some(tm) = &mut self.tab_manager {
+                            let grid = &mut tm.active_mut().grid;
+                            for r in old_start.0.min(row)..=old_end.0.max(row) {
+                                for c in 0..self.size.cols as usize {
+                                    if self.selection.contains(r, c) {
+                                        grid.mark_dirty(c, r);
+                                    }
+                                }
+                            }
+                        }
                     }
+                }
+
+                // Request redraw after mouse movement (selection update)
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                // Tab bar click handling — check before terminal mouse logic
+                if button == winit::event::MouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.show_tab_bar
+                {
+                    let tb_h = self.tab_bar_height();
+                    let (mx, my) = self.mouse_position;
+                    if my < tb_h as f64 {
+                        let cell_width = self.atlas.as_ref().map(|a| a.cell_width).unwrap_or(8);
+                        // Check close button first
+                        if let Some(idx) = self.tab_bar.close_button_at_position(mx, my, cell_width) {
+                            let close_result = self.tab_manager.as_mut().map(|tm| tm.close_tab(idx));
+                            if matches!(close_result, Some(None)) {
+                                self.should_quit = true;
+                            }
+                            self.refresh_tab_bar();
+                        } else if let Some(idx) = self.tab_bar.tab_at_position(mx, my, cell_width) {
+                            if let Some(tm) = &mut self.tab_manager {
+                                tm.switch_to(idx);
+                            }
+                            self.refresh_tab_bar();
+                        }
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                }
+
                 if let Some(atlas) = &self.atlas {
-                    let mode = self.grid.mouse_mode;
-                    
+                    let mode = self.active_mouse_mode();
+
                     if mouse::is_mouse_tracking_active(mode) {
                         let winit_button = match button {
                             winit::event::MouseButton::Left => Some(mouse::MouseButton::Left),
@@ -453,7 +663,7 @@ impl ApplicationHandler for App {
                             winit::event::MouseButton::Middle => Some(mouse::MouseButton::Middle),
                             _ => None,
                         };
-                        
+
                         let event_type = match state {
                             ElementState::Pressed => {
                                 self.mouse_button_pressed = winit_button;
@@ -464,10 +674,10 @@ impl ApplicationHandler for App {
                                 mouse::MouseEventType::Release
                             }
                         };
-                        
+
                         let col = (self.mouse_position.0 / atlas.cell_width.max(1) as f64) as u32 + 1;
-                        let row = (self.mouse_position.1 / atlas.cell_height.max(1) as f64) as u32 + 1;
-                        
+                        let row = ((self.mouse_position.1 - self.tab_bar_height() as f64) / atlas.cell_height.max(1) as f64) as u32 + 1;
+
                         let event = mouse::MouseEvent {
                             button: winit_button.unwrap_or(mouse::MouseButton::Left),
                             event_type,
@@ -477,18 +687,21 @@ impl ApplicationHandler for App {
                             ctrl: self.modifiers.control_key(),
                             alt: self.modifiers.alt_key(),
                         };
-                        
-                        let encoded = event.encode(self.grid.mouse_encoding);
+
+                        let encoding = self.active_mouse_encoding();
+                        let encoded = event.encode(encoding);
                         self.write_to_pty(encoded.as_bytes());
                     } else if button == winit::event::MouseButton::Left {
                         // Handle selection when mouse tracking is not active
                         let col = (self.mouse_position.0 / atlas.cell_width.max(1) as f64) as usize;
-                        let row = (self.mouse_position.1 / atlas.cell_height.max(1) as f64) as usize;
-                        
+                        let row = ((self.mouse_position.1 - self.tab_bar_height() as f64) / atlas.cell_height.max(1) as f64) as usize;
+
                         match state {
                             ElementState::Pressed => {
                                 // Check for hyperlink at click position
-                                let hyperlink_url = self.grid.get_hyperlink_at(col, row).map(|s| s.to_string());
+                                let hyperlink_url = self.tab_manager.as_ref()
+                                    .and_then(|tm| tm.active().grid.get_hyperlink_at(col, row))
+                                    .map(|s| s.to_string());
                                 if let Some(url) = hyperlink_url {
                                     log::debug!("Opening hyperlink: {}", url);
                                     // Open hyperlink in browser
@@ -509,7 +722,7 @@ impl ApplicationHandler for App {
                                 self.selection.end_selection();
                                 // Copy to clipboard if there's a selection
                                 if self.selection.active {
-                                    let lines = self.grid.all_lines();
+                                    let lines = self.active_all_lines();
                                     let text = self.selection.extract_text(&lines, self.size.cols as usize);
                                     if !text.is_empty() {
                                         self.clipboard.copy(&text);
@@ -519,21 +732,26 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+
+                // Request redraw after mouse button events
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(atlas) = &self.atlas {
-                    let mode = self.grid.mouse_mode;
-                    
+                    let mode = self.active_mouse_mode();
+
                     if mouse::is_mouse_tracking_active(mode) {
                         let (h, v) = match delta {
                             winit::event::MouseScrollDelta::LineDelta(h, v) => (h, v),
                             winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
                         };
-                        
+
                         let col = (self.mouse_position.0 / atlas.cell_width.max(1) as f64) as u32 + 1;
-                        let row = (self.mouse_position.1 / atlas.cell_height.max(1) as f64) as u32 + 1;
-                        
+                        let row = ((self.mouse_position.1 - self.tab_bar_height() as f64) / atlas.cell_height.max(1) as f64) as u32 + 1;
+
                         // Determine scroll direction
                         let button = if v > 0.0 {
                             Some(mouse::MouseButton::WheelUp)
@@ -546,7 +764,7 @@ impl ApplicationHandler for App {
                         } else {
                             None
                         };
-                        
+
                         if let Some(btn) = button {
                             let event = mouse::MouseEvent {
                                 button: btn,
@@ -557,11 +775,17 @@ impl ApplicationHandler for App {
                                 ctrl: self.modifiers.control_key(),
                                 alt: self.modifiers.alt_key(),
                             };
-                            
-                            let encoded = event.encode(self.grid.mouse_encoding);
+
+                            let encoding = self.active_mouse_encoding();
+                            let encoded = event.encode(encoding);
                             self.write_to_pty(encoded.as_bytes());
                         }
                     }
+                }
+
+                // Request redraw after mouse wheel
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
             }
 
@@ -572,6 +796,13 @@ impl ApplicationHandler for App {
                 // Handle keyboard shortcuts with modifiers
                 let text_str = text.as_ref().map(|s| s.to_string());
                 let handled = self.handle_shortcut(&logical_key, &text_str);
+
+                // Check if a shortcut requested app exit (e.g. closing the last tab)
+                if self.should_quit {
+                    event_loop.exit();
+                    return;
+                }
+
                 if !handled {
                     // Check for scrollback navigation (Shift+PageUp/Down)
                     let shift = self.modifiers.shift_key();
@@ -579,22 +810,31 @@ impl ApplicationHandler for App {
                         Key::Named(NamedKey::PageUp) if shift => {
                             // Scroll up in scrollback
                             let scroll_amount = self.size.rows as usize;
-                            self.grid.scrollback_offset = (self.grid.scrollback_offset + scroll_amount)
-                                .min(self.grid.scrollback.len());
-                            log::debug!("Scroll up: offset={}", self.grid.scrollback_offset);
+                            if let Some(tm) = &mut self.tab_manager {
+                                let grid = &mut tm.active_mut().grid;
+                                grid.scrollback_offset = (grid.scrollback_offset + scroll_amount)
+                                    .min(grid.scrollback.len());
+                                log::debug!("Scroll up: offset={}", grid.scrollback_offset);
+                            }
                         }
                         Key::Named(NamedKey::PageDown) if shift => {
                             // Scroll down in scrollback
                             let scroll_amount = self.size.rows as usize;
-                            self.grid.scrollback_offset = self.grid.scrollback_offset
-                                .saturating_sub(scroll_amount);
-                            log::debug!("Scroll down: offset={}", self.grid.scrollback_offset);
+                            if let Some(tm) = &mut self.tab_manager {
+                                let grid = &mut tm.active_mut().grid;
+                                grid.scrollback_offset = grid.scrollback_offset
+                                    .saturating_sub(scroll_amount);
+                                log::debug!("Scroll down: offset={}", grid.scrollback_offset);
+                            }
                         }
                         _ => {
                             // No shortcut matched, send to PTY
                             // Also reset scrollback offset on any key press
-                            if self.grid.scrollback_offset > 0 || self.grid.scroll_fraction > 0.0 {
-                                self.grid.reset_scroll();
+                            if let Some(tm) = &mut self.tab_manager {
+                                let grid = &mut tm.active_mut().grid;
+                                if grid.scrollback_offset > 0 || grid.scroll_fraction > 0.0 {
+                                    grid.reset_scroll();
+                                }
                             }
                             let bytes = encode_key(&logical_key);
                             if !bytes.is_empty() {
@@ -603,29 +843,57 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+
+                // Request redraw after keyboard input
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
 
             WindowEvent::RedrawRequested => {
-                self.drain_pty();
-
-                // Update cursor blink
+                // Update cursor blink (already handled in about_to_wait, but keep here for safety)
                 let blink_interval = std::time::Duration::from_millis(self.config.cursor_blink_ms);
+                let mut needs_redraw = false;
                 if self.config.cursor_blink_ms > 0 {
                     let now = std::time::Instant::now();
                     if now.duration_since(self.last_cursor_blink) >= blink_interval {
                         self.cursor_visible = !self.cursor_visible;
                         self.last_cursor_blink = now;
+                        needs_redraw = true;
                     }
                 } else {
                     self.cursor_visible = true;
                 }
 
-                if let (Some(pipeline), Some(atlas)) = (&mut self.pipeline, &mut self.atlas) {
-                    pipeline.render(&self.grid, atlas, self.cursor_visible);
+                // Compute tab bar height before borrowing tab_manager mutably.
+                let tb_height = self.tab_bar_height();
+                let tb_ref = if tb_height > 0 { Some(&self.tab_bar) } else { None };
+
+                if let (Some(pipeline), Some(atlas), Some(tm)) = (&mut self.pipeline, &mut self.atlas, &mut self.tab_manager) {
+                    let tab = tm.active_mut();
+                    pipeline.render(RenderParams {
+                        grid: &mut tab.grid,
+                        atlas,
+                        cursor_visible: self.cursor_visible,
+                        colors: &self.config.colors,
+                        selection: &self.selection,
+                        tab_bar: tb_ref,
+                        tab_bar_height: tb_height as f32,
+                    });
                 }
 
                 if let Some(w) = &self.window {
-                    w.request_redraw();
+                    // Update window title if OSC changed it
+                    if let Some(tm) = &self.tab_manager {
+                        let title = &tm.active().grid.palette.title;
+                        if !title.is_empty() {
+                            w.set_title(title);
+                        }
+                    }
+                    // Only request redraw if we have data or cursor blinked
+                    if needs_redraw {
+                        w.request_redraw();
+                    }
                 }
             }
 
@@ -633,7 +901,34 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {}
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Keep the event loop waking periodically so PTY data is drained promptly
+        // without busy-waiting.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(16),
+        ));
+
+        // Check for PTY data when about to wait — request redraw if data available
+        let had_data = self.drain_pty();
+        if had_data {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+        
+        // Check cursor blink timer
+        if self.config.cursor_blink_ms > 0 {
+            let now = std::time::Instant::now();
+            let blink_interval = std::time::Duration::from_millis(self.config.cursor_blink_ms);
+            if now.duration_since(self.last_cursor_blink) >= blink_interval {
+                self.cursor_visible = !self.cursor_visible;
+                self.last_cursor_blink = now;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +982,11 @@ fn main() {
     env_logger::init();
 
     let event_loop = EventLoop::new().expect("event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Wake periodically to drain PTY data. 16ms gives ~60Hz idle refresh rate
+    // without the busy-wait of ControlFlow::Poll.
+    event_loop.set_control_flow(ControlFlow::WaitUntil(
+        std::time::Instant::now() + std::time::Duration::from_millis(16),
+    ));
 
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("event loop run");

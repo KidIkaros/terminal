@@ -224,3 +224,25 @@ pub fn embedded_font() -> &'static [u8] {
     // Embed JetBrains Mono Regular
     include_bytes!("../../fonts/JetBrainsMono-Regular.ttf")
 }
+
+/// Load fallback fonts from the fonts directory or embedded resources.
+/// Currently tries to load a CJK fallback font for characters not in the primary font.
+pub fn load_fallback_fonts(atlas: &mut GlyphAtlas) {
+    // Try to load CJK fallback font
+    let cjk_font_paths = [
+        "fonts/NotoSansCJK-Regular.otf",
+        "fonts/NotoSansCJKsc-Regular.otf",
+        "fonts/NotoSansSC-Regular.otf",
+    ];
+    
+    for path in &cjk_font_paths {
+        if let Ok(bytes) = std::fs::read(path) {
+            atlas.add_fallback_font(&bytes);
+            log::info!("Loaded fallback font from {}", path);
+            return;
+        }
+    }
+    
+    // No CJK fallback font found - log warning but don't crash
+    log::warn!("No CJK fallback font found — CJK and emoji characters may not render correctly");
+}

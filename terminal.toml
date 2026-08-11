@@ -37,12 +37,9 @@ cursor_text = "#1E1E2E"
 selection_bg = "#585B70"
 selection_fg = "#CDD6F4"
 
-# Tab bar colors
-tab_bar_bg = "#181825"
-active_tab = "#89B4FA"
-inactive_tab = "#45475A"
-
-# ANSI color palette (16 colors)
+# Optional: override bold/dim colors
+# bold = "#FFFFFF"
+# dim = "#888888"
 ansi = [
     "#45475A",  # Black
     "#F38BA8",  # Red
@@ -87,3 +84,9 @@ cursor_blink_ms = 500
 
 # Cursor style: "block", "bar", or "underline"
 cursor_style = "block"
+
+[tabs]
+# Show the tab bar (visible automatically when more than one tab is open)
+show_tab_bar = true
+# Tab bar height in pixels
+height = 30

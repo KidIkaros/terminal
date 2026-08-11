@@ -19,8 +19,11 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::grid::{Color, Grid};
+use crate::config::ColorConfig;
+use crate::grid::{Color, ColorPalette, Grid};
 use crate::render::font::{ATLAS_SIZE, GlyphAtlas};
+use crate::selection::Selection;
+use crate::tab_bar::TabBar;
 
 // ---------------------------------------------------------------------------
 // Instance data uploaded to the GPU
@@ -56,62 +59,68 @@ struct Uniforms {
 // Color palette — xterm 256-color
 // ---------------------------------------------------------------------------
 
-/// Returns the sRGB color for a 256-color index.
-fn indexed_color(idx: u8) -> [f32; 3] {
-    // Standard 16 colors (matches most terminal themes)
-    const STANDARD: [[u8; 3]; 16] = [
-        [0x1e, 0x1e, 0x2e], // 0  black       (catppuccin-ish)
-        [0xf3, 0x85, 0x18], // 1  red
-        [0xa6, 0xe3, 0xa1], // 2  green
-        [0xf9, 0xe2, 0xaf], // 3  yellow
-        [0x89, 0xb4, 0xfa], // 4  blue
-        [0xf5, 0xc2, 0xe7], // 5  magenta
-        [0x94, 0xe2, 0xd5], // 6  cyan
-        [0xcd, 0xd6, 0xf4], // 7  white
-        [0x58, 0x5b, 0x70], // 8  bright black
-        [0xf3, 0x85, 0x18], // 9  bright red
-        [0xa6, 0xe3, 0xa1], // 10 bright green
-        [0xf9, 0xe2, 0xaf], // 11 bright yellow
-        [0x89, 0xb4, 0xfa], // 12 bright blue
-        [0xf5, 0xc2, 0xe7], // 13 bright magenta
-        [0x94, 0xe2, 0xd5], // 14 bright cyan
-        [0xcd, 0xd6, 0xf4], // 15 bright white
-    ];
+// ---------------------------------------------------------------------------
+// Color helpers
+// ---------------------------------------------------------------------------
 
-    if idx < 16 {
-        let [r, g, b] = STANDARD[idx as usize];
-        return [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
-    }
-
-    if idx < 232 {
-        // 6×6×6 color cube
-        let n = idx - 16;
-        let b = n % 6;
-        let g = (n / 6) % 6;
-        let r = n / 36;
-        let cube = |v: u8| if v == 0 { 0.0 } else { (55 + v * 40) as f32 / 255.0 };
-        return [cube(r), cube(g), cube(b)];
-    }
-
-    // Grayscale ramp 232–255
-    let l = 8 + (idx - 232) * 10;
-    [l as f32 / 255.0; 3]
+/// Parse a hex color string (#RRGGBB or #RRGGBBAA) into [f32; 4].
+fn parse_hex_color(s: &str) -> [f32; 4] {
+    let s = s.trim_start_matches('#');
+    let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(0);
+    let g = u8::from_str_radix(&s[2..4], 16).unwrap_or(0);
+    let b = u8::from_str_radix(&s[4..6], 16).unwrap_or(0);
+    let a = if s.len() >= 8 {
+        u8::from_str_radix(&s[6..8], 16).unwrap_or(255)
+    } else {
+        255
+    };
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0]
 }
 
-fn color_to_rgba(color: Color, default_fg: bool) -> [f32; 4] {
+/// Build a 256-entry color lookup table from config colors + palette.
+fn build_color_table(config: &ColorConfig, palette: &ColorPalette) -> Vec<[f32; 3]> {
+    let mut table = Vec::with_capacity(256);
+
+    // First 16 entries from config.ansi
+    for i in 0..16 {
+        if i < config.ansi.len() {
+            let [r, g, b, _] = parse_hex_color(&config.ansi[i]);
+            table.push([r, g, b]);
+        } else {
+            // Fallback to palette
+            let (r, g, b) = palette.get_color(i as u8).unwrap_or((0, 0, 0));
+            table.push([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]);
+        }
+    }
+
+    // Fill remaining entries from palette
+    for i in 16..256 {
+        let idx = i as u8;
+        let (r, g, b) = palette.get_color(idx).unwrap_or((0, 0, 0));
+        table.push([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]);
+    }
+
+    table
+}
+
+/// Convert a terminal Color to RGBA, using config colors for defaults.
+fn color_to_rgba(color: Color, is_fg: bool, config: &ColorConfig, palette: &ColorPalette) -> [f32; 4] {
     match color {
         Color::Default => {
-            if default_fg {
-                // Foreground: near-white
-                [0.808, 0.839, 0.957, 1.0] // #CDD6F4
+            if is_fg {
+                parse_hex_color(&config.foreground)
             } else {
-                // Background: dark
-                [0.118, 0.118, 0.180, 1.0] // #1E1E2E
+                parse_hex_color(&config.background)
             }
         }
         Color::Indexed(i) => {
-            let [r, g, b] = indexed_color(i);
-            [r, g, b, 1.0]
+            if let Some((r, g, b)) = palette.get_color(i) {
+                [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+            } else {
+                let table = build_color_table(config, palette);
+                let [r, g, b] = table[i as usize];
+                [r, g, b, 1.0]
+            }
         }
         Color::Rgb(r, g, b) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
     }
@@ -120,6 +129,17 @@ fn color_to_rgba(color: Color, default_fg: bool) -> [f32; 4] {
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
+
+/// Parameters for a single frame render.
+pub struct RenderParams<'a> {
+    pub grid: &'a mut Grid,
+    pub atlas: &'a mut GlyphAtlas,
+    pub cursor_visible: bool,
+    pub colors: &'a ColorConfig,
+    pub selection: &'a Selection,
+    pub tab_bar: Option<&'a TabBar>,
+    pub tab_bar_height: f32,
+}
 
 pub struct TerminalPipeline {
     pub device: Arc<wgpu::Device>,
@@ -437,63 +457,126 @@ impl TerminalPipeline {
     // Render frame
     // -----------------------------------------------------------------------
 
-    pub fn render(&mut self, grid: &Grid, atlas: &mut GlyphAtlas, cursor_visible: bool) {
+    pub fn render(&mut self, params: RenderParams<'_>) {
+        let RenderParams { grid, atlas, cursor_visible, colors, selection, tab_bar, tab_bar_height } = params;
         let cw = atlas.cell_width as f32;
         let ch = atlas.cell_height as f32;
         let baseline = atlas.baseline;
 
-        // Build instance list
-        let mut instances: Vec<GlyphInstance> = Vec::with_capacity(grid.cols * grid.rows * 2);
+        // Partial dirty tracking with LoadOp::Clear doesn't work: the whole
+        // frame is cleared, so unchanged cells would not be re-rendered. Render
+        // all cells every frame for correctness (dirty tracking can be
+        // re-introduced later with LoadOp::Load).
+        let _ = grid.take_dirty_cells(); // clear flags; kept for future use
+
+        // Build instance list — tab bar rects first, then all terminal cells + cursor
+        let mut instances: Vec<GlyphInstance> = Vec::with_capacity(grid.rows * grid.cols * 2 + 1);
+
+        // --- Tab bar background rectangles ---
+        if let Some(tb) = tab_bar {
+            let tab_width = 150.0f32;
+            let active_color = parse_hex_color(&colors.selection_bg);
+            let inactive_color = parse_hex_color(&colors.background);
+            let text_color = parse_hex_color(&colors.foreground);
+            for (i, tab) in tb.tabs.iter().enumerate() {
+                let x = i as f32 * tab_width;
+                let color = if tab.active { active_color } else { inactive_color };
+                instances.push(GlyphInstance {
+                    cell_pos: [x, 0.0],
+                    cell_size: [tab_width, tab_bar_height],
+                    atlas_uv_min: [0.0; 2],
+                    atlas_uv_max: [0.0; 2],
+                    fg_color: color,
+                    bg_color: color,
+                    mode: 0,
+                    _pad: [0; 3],
+                });
+
+                // Render tab title text using the glyph atlas
+                let mut text_x = x + 8.0;
+                let text_y = (tab_bar_height - ch) / 2.0;
+                for ch_title in tab.title.chars().take(18) {
+                    if ch_title == ' ' {
+                        text_x += cw / 2.0;
+                        continue;
+                    }
+                    let region = atlas.get_or_rasterize(ch_title, false, false);
+                    if let Some(r) = &region {
+                        let gx = text_x + r.metrics.xmin as f32;
+                        let gy = text_y + baseline as f32 - r.metrics.height as f32 - r.metrics.ymin as f32;
+                        instances.push(GlyphInstance {
+                            cell_pos: [gx, gy],
+                            cell_size: [r.metrics.width as f32, r.metrics.height as f32],
+                            atlas_uv_min: r.uv_min,
+                            atlas_uv_max: r.uv_max,
+                            fg_color: text_color,
+                            bg_color: color,
+                            mode: 1,
+                            _pad: [0; 3],
+                        });
+                        text_x += cw;
+                    }
+                }
+            }
+        }
 
         for row in 0..grid.rows {
             for col in 0..grid.cols {
                 let cell = grid.cell(col, row);
                 let px = col as f32 * cw;
-                let py = row as f32 * ch;
+                let py = tab_bar_height + row as f32 * ch;
 
-                let fg_raw = color_to_rgba(cell.fg, true);
-                let bg_raw = color_to_rgba(cell.bg, false);
+            let fg_raw = color_to_rgba(cell.fg, true, colors, &grid.palette);
+            let bg_raw = color_to_rgba(cell.bg, false, colors, &grid.palette);
 
-                let (fg, bg) = if cell.attrs.inverse {
-                    (bg_raw, fg_raw)
-                } else {
-                    (fg_raw, bg_raw)
-                };
+            let (mut fg, mut bg) = if cell.attrs.inverse {
+                (bg_raw, fg_raw)
+            } else {
+                (fg_raw, bg_raw)
+            };
 
-                // 1. Background rectangle
+            // Apply selection highlighting
+            if selection.contains(row, col) {
+                let sel_bg = parse_hex_color(&colors.selection_bg);
+                let sel_fg = parse_hex_color(&colors.selection_fg);
+                bg = sel_bg;
+                fg = sel_fg;
+            }
+
+            // 1. Background rectangle
+            instances.push(GlyphInstance {
+                cell_pos: [px, py],
+                cell_size: [cw, ch],
+                atlas_uv_min: [0.0; 2],
+                atlas_uv_max: [0.0; 2],
+                fg_color: bg,  // For background rect, use bg color
+                bg_color: bg,
+                mode: 0,
+                _pad: [0; 3],
+            });
+
+            // 2. Glyph (skip space and wide fillers)
+            if cell.wide_filler || cell.ch == ' ' {
+                continue;
+            }
+
+            let region = atlas.get_or_rasterize(cell.ch, cell.attrs.bold, cell.attrs.italic);
+            if let Some(r) = region {
+                // Position the glyph within the cell
+                let gx = px + r.metrics.xmin as f32;
+                let gy = py + baseline as f32 - r.metrics.height as f32 - r.metrics.ymin as f32;
+
                 instances.push(GlyphInstance {
-                    cell_pos: [px, py],
-                    cell_size: [cw, ch],
-                    atlas_uv_min: [0.0; 2],
-                    atlas_uv_max: [0.0; 2],
+                    cell_pos: [gx, gy],
+                    cell_size: [r.metrics.width as f32, r.metrics.height as f32],
+                    atlas_uv_min: r.uv_min,
+                    atlas_uv_max: r.uv_max,
                     fg_color: fg,
                     bg_color: bg,
-                    mode: 0,
+                    mode: 1,
                     _pad: [0; 3],
                 });
-
-                // 2. Glyph (skip space and wide fillers)
-                if cell.wide_filler || cell.ch == ' ' {
-                    continue;
-                }
-
-                let region = atlas.get_or_rasterize(cell.ch, cell.attrs.bold, cell.attrs.italic);
-                if let Some(r) = region {
-                    // Position the glyph within the cell
-                    let gx = px + r.metrics.xmin as f32;
-                    let gy = py + baseline as f32 - r.metrics.height as f32 - r.metrics.ymin as f32;
-
-                    instances.push(GlyphInstance {
-                        cell_pos: [gx, gy],
-                        cell_size: [r.metrics.width as f32, r.metrics.height as f32],
-                        atlas_uv_min: r.uv_min,
-                        atlas_uv_max: r.uv_max,
-                        fg_color: fg,
-                        bg_color: bg,
-                        mode: 1,
-                        _pad: [0; 3],
-                    });
-                }
+            }
             }
         }
 
@@ -502,14 +585,15 @@ impl TerminalPipeline {
             let col = grid.cursor.col.min(grid.cols - 1);
             let row = grid.cursor.row.min(grid.rows - 1);
             let px = col as f32 * cw;
-            let py = row as f32 * ch;
+            let py = tab_bar_height + row as f32 * ch;
+            let cursor_color = parse_hex_color(&colors.cursor);
             instances.push(GlyphInstance {
                 cell_pos: [px, py + ch - 2.0],
                 cell_size: [cw, 2.0],
                 atlas_uv_min: [0.0; 2],
                 atlas_uv_max: [0.0; 2],
-                fg_color: [0.537, 0.706, 0.980, 0.85],
-                bg_color: [0.537, 0.706, 0.980, 0.85],
+                fg_color: cursor_color,
+                bg_color: cursor_color,
                 mode: 0,
                 _pad: [0; 3],
             });
@@ -550,6 +634,8 @@ impl TerminalPipeline {
             label: Some("frame"),
         });
 
+        let bg_color = parse_hex_color(&colors.background);
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terminal_pass"),
@@ -558,7 +644,10 @@ impl TerminalPipeline {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.118, g: 0.118, b: 0.180, a: 1.0,
+                            r: bg_color[0] as f64,
+                            g: bg_color[1] as f64,
+                            b: bg_color[2] as f64,
+                            a: bg_color[3] as f64,
                         }),
                         store: wgpu::StoreOp::Store,
                     },

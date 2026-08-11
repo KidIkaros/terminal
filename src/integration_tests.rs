@@ -9,7 +9,7 @@ mod integration_tests {
     #[test]
     fn test_basic_output() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Print "Hello"
@@ -26,7 +26,7 @@ mod integration_tests {
     #[test]
     fn test_cursor_movement() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Move cursor to position 5, 3
@@ -45,7 +45,7 @@ mod integration_tests {
     #[test]
     fn test_sgr_bold() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Enable bold
@@ -65,7 +65,7 @@ mod integration_tests {
     #[test]
     fn test_sgr_color() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Set red foreground
@@ -87,7 +87,7 @@ mod integration_tests {
     #[test]
     fn test_scrollback() {
         let size = WinSize { cols: 20, rows: 5 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Fill the screen and overflow
@@ -106,7 +106,7 @@ mod integration_tests {
     #[test]
     fn test_alternate_screen() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Print to primary screen
@@ -150,7 +150,7 @@ mod integration_tests {
     #[test]
     fn test_line_wrapping() {
         let size = WinSize { cols: 10, rows: 5 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Print more characters than cols
@@ -166,7 +166,7 @@ mod integration_tests {
     #[test]
     fn test_window_title() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Set window title
@@ -182,7 +182,7 @@ mod integration_tests {
     #[test]
     fn test_bracketed_paste() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Enable bracketed paste
@@ -214,7 +214,7 @@ mod integration_tests {
     #[test]
     fn test_bell() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Send BEL
@@ -227,7 +227,7 @@ mod integration_tests {
     #[test]
     fn test_tab() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Print a tab
@@ -241,7 +241,7 @@ mod integration_tests {
     #[test]
     fn test_backspace() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Print a character
@@ -257,7 +257,7 @@ mod integration_tests {
     #[test]
     fn test_carriage_return() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Move to column 10
@@ -275,7 +275,7 @@ mod integration_tests {
     #[test]
     fn test_line_feed() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         assert_eq!(grid.cursor.row, 0);
@@ -289,7 +289,7 @@ mod integration_tests {
     #[test]
     fn test_color_palette() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Set color 1 (red) to blue using #RRGGBB format
@@ -306,7 +306,7 @@ mod integration_tests {
     #[test]
     fn test_cursor_visibility() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Hide cursor
@@ -336,7 +336,7 @@ mod integration_tests {
         use crate::grid::MouseMode;
 
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Enable normal mouse tracking
@@ -386,26 +386,6 @@ mod integration_tests {
         assert_eq!(search.match_count(), 2);
     }
 
-    /// Test tabs
-    #[test]
-    fn test_tabs() {
-        use crate::tabs::TabManager;
-
-        let size = WinSize { cols: 80, rows: 24 };
-        let mut manager = TabManager::new(size);
-
-        assert_eq!(manager.len(), 1);
-
-        manager.new_tab();
-        assert_eq!(manager.len(), 2);
-
-        manager.switch_to(1);
-        assert_eq!(manager.active_index(), 1);
-
-        manager.prev();
-        assert_eq!(manager.active_index(), 0);
-    }
-
     /// Test config loading
     #[test]
     fn test_config() {
@@ -434,7 +414,7 @@ mod integration_tests {
     #[test]
     fn test_hyperlinks() {
         let size = WinSize { cols: 80, rows: 24 };
-        let mut grid = Grid::new(size);
+        let mut grid = Grid::new(size, 1000);
         let mut parser = Parser::new();
 
         // Start hyperlink

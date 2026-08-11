@@ -41,6 +41,10 @@ pub struct Config {
     /// Cursor style.
     #[serde(default = "default_cursor_style")]
     pub cursor_style: CursorStyle,
+
+    /// Tab bar settings.
+    #[serde(default)]
+    pub tabs: TabsConfig,
 }
 
 /// Cursor style options.
@@ -130,6 +134,10 @@ pub struct WindowConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ColorConfig {
+    /// Theme name to load (overrides individual color settings if set).
+    #[serde(default)]
+    pub theme: Option<String>,
+
     /// Background color (#RRGGBB or #RRGGBBAA).
     #[serde(default = "default_bg")]
     pub background: String,
@@ -165,18 +173,6 @@ pub struct ColorConfig {
     /// Dim text color (optional, uses foreground if not set).
     #[serde(default)]
     pub dim: Option<String>,
-
-    /// Tab bar background color.
-    #[serde(default = "default_tab_bar_bg")]
-    pub tab_bar_bg: String,
-
-    /// Active tab color.
-    #[serde(default = "default_active_tab")]
-    pub active_tab: String,
-
-    /// Inactive tab color.
-    #[serde(default = "default_inactive_tab")]
-    pub inactive_tab: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -193,6 +189,31 @@ pub struct KeyBinding {
 
     /// Action to perform.
     pub action: String,
+}
+
+/// Tab bar configuration.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TabsConfig {
+    /// Show the tab bar when there is more than one tab.
+    #[serde(default = "default_true")]
+    pub show_tab_bar: bool,
+
+    /// Tab bar height in pixels.
+    #[serde(default = "default_tab_bar_height")]
+    pub height: u32,
+}
+
+fn default_tab_bar_height() -> u32 {
+    30
+}
+
+impl Default for TabsConfig {
+    fn default() -> Self {
+        TabsConfig {
+            show_tab_bar: true,
+            height: default_tab_bar_height(),
+        }
+    }
 }
 
 // Default value functions
@@ -264,18 +285,6 @@ fn default_selection_fg() -> String {
     "#CDD6F4".to_string()
 }
 
-fn default_tab_bar_bg() -> String {
-    "#181825".to_string()
-}
-
-fn default_active_tab() -> String {
-    "#89B4FA".to_string()
-}
-
-fn default_inactive_tab() -> String {
-    "#45475A".to_string()
-}
-
 /// Default ANSI color palette (Catppuccin Mocha).
 fn default_ansi_palette() -> Vec<String> {
     vec![
@@ -331,6 +340,7 @@ impl Default for WindowConfig {
 impl Default for ColorConfig {
     fn default() -> Self {
         ColorConfig {
+            theme: None,
             background: default_bg(),
             foreground: default_fg(),
             cursor: default_cursor_color(),
@@ -340,9 +350,6 @@ impl Default for ColorConfig {
             ansi: default_ansi_palette(),
             bold: None,
             dim: None,
-            tab_bar_bg: default_tab_bar_bg(),
-            active_tab: default_active_tab(),
-            inactive_tab: default_inactive_tab(),
         }
     }
 }
@@ -367,6 +374,7 @@ impl Default for Config {
             mouse_reporting: false,
             cursor_blink_ms: default_cursor_blink(),
             cursor_style: CursorStyle::default(),
+            tabs: TabsConfig::default(),
         }
     }
 }
