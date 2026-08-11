@@ -21,9 +21,10 @@ use wgpu::util::DeviceExt;
 
 use crate::config::ColorConfig;
 use crate::grid::{Color, ColorPalette, Grid};
-use crate::render::font::{ATLAS_SIZE, GlyphAtlas};
+use crate::render::font::{GlyphAtlas, ShapedGlyph, ATLAS_SIZE};
+use crate::search::{SearchMode, SearchState};
 use crate::selection::Selection;
-use crate::tab_bar::TabBar;
+use crate::tab_bar::{TabBar, TabBarTarget};
 
 // ---------------------------------------------------------------------------
 // Instance data uploaded to the GPU
@@ -63,7 +64,18 @@ struct Uniforms {
 // Color helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a hex color string (#RRGGBB or #RRGGBBAA) into [f32; 4].
+/// Convert an sRGB byte component to the linear value expected by an sRGB
+/// render target.
+fn srgb_to_linear(component: u8) -> f32 {
+    let value = component as f32 / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Parse a hex color string (#RRGGBB or #RRGGBBAA) into linear RGBA.
 fn parse_hex_color(s: &str) -> [f32; 4] {
     let s = s.trim_start_matches('#');
     let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(0);
@@ -74,7 +86,26 @@ fn parse_hex_color(s: &str) -> [f32; 4] {
     } else {
         255
     };
-    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0]
+    [
+        srgb_to_linear(r),
+        srgb_to_linear(g),
+        srgb_to_linear(b),
+        a as f32 / 255.0,
+    ]
+}
+
+fn adjust_surface_color(mut color: [f32; 4], hovered: bool, pressed: bool) -> [f32; 4] {
+    let factor = if pressed {
+        0.88
+    } else if hovered {
+        1.12
+    } else {
+        1.0
+    };
+    color[0] = (color[0] * factor).min(1.0);
+    color[1] = (color[1] * factor).min(1.0);
+    color[2] = (color[2] * factor).min(1.0);
+    color
 }
 
 /// Build a 256-entry color lookup table from config colors + palette.
@@ -89,7 +120,7 @@ fn build_color_table(config: &ColorConfig, palette: &ColorPalette) -> Vec<[f32; 
         } else {
             // Fallback to palette
             let (r, g, b) = palette.get_color(i as u8).unwrap_or((0, 0, 0));
-            table.push([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]);
+            table.push([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)]);
         }
     }
 
@@ -97,14 +128,38 @@ fn build_color_table(config: &ColorConfig, palette: &ColorPalette) -> Vec<[f32; 
     for i in 16..256 {
         let idx = i as u8;
         let (r, g, b) = palette.get_color(idx).unwrap_or((0, 0, 0));
-        table.push([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]);
+        table.push([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)]);
     }
 
     table
 }
 
 /// Convert a terminal Color to RGBA, using config colors for defaults.
-fn color_to_rgba(color: Color, is_fg: bool, config: &ColorConfig, palette: &ColorPalette) -> [f32; 4] {
+fn needs_full_redraw(
+    offscreen_initialized: bool,
+    cursor_visible: bool,
+    selection_active: bool,
+    search_active: bool,
+    tab_bar_present: bool,
+    scrolled: bool,
+    dirty_cells: usize,
+    total_cells: usize,
+) -> bool {
+    !offscreen_initialized
+        || cursor_visible
+        || selection_active
+        || search_active
+        || tab_bar_present
+        || scrolled
+        || dirty_cells > total_cells / 2
+}
+
+fn color_to_rgba(
+    color: Color,
+    is_fg: bool,
+    config: &ColorConfig,
+    palette: &ColorPalette,
+) -> [f32; 4] {
     match color {
         Color::Default => {
             if is_fg {
@@ -115,14 +170,14 @@ fn color_to_rgba(color: Color, is_fg: bool, config: &ColorConfig, palette: &Colo
         }
         Color::Indexed(i) => {
             if let Some((r, g, b)) = palette.get_color(i) {
-                [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+                [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0]
             } else {
                 let table = build_color_table(config, palette);
                 let [r, g, b] = table[i as usize];
                 [r, g, b, 1.0]
             }
         }
-        Color::Rgb(r, g, b) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
+        Color::Rgb(r, g, b) => [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0],
     }
 }
 
@@ -137,6 +192,7 @@ pub struct RenderParams<'a> {
     pub cursor_visible: bool,
     pub colors: &'a ColorConfig,
     pub selection: &'a Selection,
+    pub search: Option<&'a SearchState>,
     pub tab_bar: Option<&'a TabBar>,
     pub tab_bar_height: f32,
 }
@@ -155,21 +211,31 @@ pub struct TerminalPipeline {
     atlas_texture: wgpu::Texture,
     atlas_view: wgpu::TextureView,
 
+    /// Persistent terminal framebuffer. Unlike the swapchain surface, this
+    /// texture is guaranteed to retain prior contents between passes.
+    offscreen_texture: wgpu::Texture,
+    offscreen_view: wgpu::TextureView,
+    offscreen_initialized: bool,
+    composite_pipeline: wgpu::RenderPipeline,
+    composite_bind_group_layout: wgpu::BindGroupLayout,
+    composite_bind_group: wgpu::BindGroup,
+    composite_sampler: wgpu::Sampler,
+
     /// Unit square vertex buffer (6 vertices, two triangles).
     vertex_buf: wgpu::Buffer,
 
     /// Double-buffered instance buffers
     instance_bufs: [Option<wgpu::Buffer>; 2],
     instance_capacity: [usize; 2],
+    /// Reused CPU-side instance storage; avoids reallocating every frame.
+    instances: Vec<GlyphInstance>,
+    /// Number of terminal cells reported dirty by the most recent frame.
+    last_dirty_cells: usize,
     current_buffer: usize,
 }
 
 impl TerminalPipeline {
-    pub async fn new(
-        window: Arc<winit::window::Window>,
-        atlas: &GlyphAtlas,
-        vsync: bool,
-    ) -> Self {
+    pub async fn new(window: Arc<winit::window::Window>, atlas: &GlyphAtlas, vsync: bool) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -218,9 +284,9 @@ impl TerminalPipeline {
             width: size.width,
             height: size.height,
             present_mode: if vsync {
-                wgpu::PresentMode::Fifo  // VSync enabled
+                wgpu::PresentMode::Fifo // VSync enabled
             } else {
-                wgpu::PresentMode::Immediate  // No VSync (tearing possible)
+                wgpu::PresentMode::Immediate // No VSync (tearing possible)
             },
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -228,10 +294,30 @@ impl TerminalPipeline {
         };
         surface.configure(&device, &surface_config);
 
+        let offscreen_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terminal_offscreen"),
+            size: wgpu::Extent3d {
+                width: size.width.max(1),
+                height: size.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let offscreen_view = offscreen_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         // ---- Atlas texture ----
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph_atlas"),
-            size: wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -248,7 +334,11 @@ impl TerminalPipeline {
                 bytes_per_row: Some(ATLAS_SIZE),
                 rows_per_image: Some(ATLAS_SIZE),
             },
-            wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
         );
 
         let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -307,7 +397,10 @@ impl TerminalPipeline {
             label: Some("bg"),
             layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&atlas_view),
@@ -336,13 +429,41 @@ impl TerminalPipeline {
             array_stride: std::mem::size_of::<GlyphInstance>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[
-                wgpu::VertexAttribute { offset: 0,  shader_location: 1, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 8,  shader_location: 2, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 16, shader_location: 3, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 24, shader_location: 4, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 32, shader_location: 5, format: wgpu::VertexFormat::Float32x4 },
-                wgpu::VertexAttribute { offset: 48, shader_location: 6, format: wgpu::VertexFormat::Float32x4 },
-                wgpu::VertexAttribute { offset: 64, shader_location: 7, format: wgpu::VertexFormat::Uint32 },
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 24,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 32,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 48,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 64,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Uint32,
+                },
             ],
         };
 
@@ -402,6 +523,91 @@ impl TerminalPipeline {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("terminal_composite_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let composite_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("terminal_composite_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terminal_composite_bg"),
+            layout: &composite_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&offscreen_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&composite_sampler),
+                },
+            ],
+        });
+        let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("terminal_composite_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("composite.wgsl").into()),
+        });
+        let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terminal_composite_layout"),
+            bind_group_layouts: &[&composite_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terminal_composite_pipeline"),
+            layout: Some(&composite_layout),
+            vertex: wgpu::VertexState {
+                module: &composite_shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 8,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &composite_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         TerminalPipeline {
             device,
             queue,
@@ -413,9 +619,18 @@ impl TerminalPipeline {
             bind_group_layout,
             atlas_texture,
             atlas_view,
+            offscreen_texture,
+            offscreen_view,
+            offscreen_initialized: false,
+            composite_pipeline,
+            composite_bind_group_layout,
+            composite_bind_group,
+            composite_sampler,
             vertex_buf,
             instance_bufs: [None, None],
             instance_capacity: [0, 0],
+            instances: Vec::with_capacity(4096),
+            last_dirty_cells: 0,
             current_buffer: 0,
         }
     }
@@ -432,8 +647,50 @@ impl TerminalPipeline {
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
 
-        let uniforms = Uniforms { viewport: [width as f32, height as f32], _pad: [0.0; 2] };
-        self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        self.offscreen_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terminal_offscreen"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.offscreen_view = self
+            .offscreen_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.composite_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terminal_composite_bg"),
+            layout: &self.composite_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.offscreen_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.composite_sampler),
+                },
+            ],
+        });
+        self.offscreen_initialized = false;
+
+        let uniforms = Uniforms {
+            viewport: [width as f32, height as f32],
+            _pad: [0.0; 2],
+        };
+        self.queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    /// Number of terminal cells marked dirty during the last render call.
+    pub fn last_dirty_cells(&self) -> usize {
+        self.last_dirty_cells
     }
 
     // -----------------------------------------------------------------------
@@ -449,7 +706,11 @@ impl TerminalPipeline {
                 bytes_per_row: Some(ATLAS_SIZE),
                 rows_per_image: Some(ATLAS_SIZE),
             },
-            wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -474,7 +735,8 @@ impl TerminalPipeline {
     ) {
         let cw = atlas.cell_width as f32;
         let ch_h = atlas.cell_height as f32;
-        let region = atlas.get_or_rasterize(ch, false, false)
+        let region = atlas
+            .get_or_rasterize(ch, false, false)
             .or_else(|| atlas.get_or_rasterize('x', false, false));
         if let Some(r) = &region {
             let text_x = button_x + (button_w - cw) / 2.0;
@@ -494,20 +756,65 @@ impl TerminalPipeline {
         }
     }
 
+    fn add_button_surface(
+        instances: &mut Vec<GlyphInstance>,
+        rect: (f32, f32, f32, f32),
+        color: [f32; 4],
+    ) {
+        let (x, y, width, height) = rect;
+        instances.push(GlyphInstance {
+            cell_pos: [x, y],
+            cell_size: [width, height],
+            atlas_uv_min: [0.0; 2],
+            atlas_uv_max: [0.0; 2],
+            fg_color: color,
+            bg_color: color,
+            mode: 0,
+            _pad: [0; 3],
+        });
+    }
+
     pub fn render(&mut self, params: RenderParams<'_>) {
-        let RenderParams { grid, atlas, cursor_visible, colors, selection, tab_bar, tab_bar_height } = params;
+        let RenderParams {
+            grid,
+            atlas,
+            cursor_visible,
+            colors,
+            selection,
+            search,
+            tab_bar,
+            tab_bar_height,
+        } = params;
         let cw = atlas.cell_width as f32;
         let ch = atlas.cell_height as f32;
         let baseline = atlas.baseline;
 
-        // Partial dirty tracking with LoadOp::Clear doesn't work: the whole
-        // frame is cleared, so unchanged cells would not be re-rendered. Render
-        // all cells every frame for correctness (dirty tracking can be
-        // re-introduced later with LoadOp::Load).
-        let _ = grid.take_dirty_cells(); // clear flags; kept for future use
+        // Render the complete grid each frame. Swapchain surfaces are not
+        // guaranteed to preserve their previous contents between frames, so
+        // partial rendering with LoadOp::Load loses unchanged terminal cells.
+        // Keep the damage count for profiling and drive the guarded persistent
+        // target path. UI overlays, selection, scrollback, cursor visibility,
+        // and large damage regions use a correctness-first full redraw.
+        let dirty_cells = grid.take_dirty_cells();
+        self.last_dirty_cells = dirty_cells.len();
+        let full_redraw = needs_full_redraw(
+            self.offscreen_initialized,
+            cursor_visible,
+            selection.active,
+            search.is_some_and(|state| state.active),
+            tab_bar.is_some(),
+            grid.view_scrollback_lines() > 0,
+            dirty_cells.len(),
+            grid.rows * grid.cols,
+        );
+        let dirty_set: std::collections::HashSet<(usize, usize)> =
+            dirty_cells.into_iter().collect();
 
-        // Build instance list — tab bar rects first, then all terminal cells + cursor
-        let mut instances: Vec<GlyphInstance> = Vec::with_capacity(grid.rows * grid.cols * 2 + 1);
+        // Reuse instance storage — tab bar rects first, then terminal cells
+        // and cursor. Capacity grows only when a larger frame requires it.
+        let mut instances = std::mem::take(&mut self.instances);
+        instances.clear();
+        instances.reserve(grid.rows * grid.cols * 2 + 256);
 
         // --- Tab bar background rectangles ---
         if let Some(tb) = tab_bar {
@@ -532,7 +839,16 @@ impl TerminalPipeline {
 
             for (i, tab) in tb.tabs.iter().enumerate() {
                 let x = i as f32 * tab_width;
-                let color = if tab.active { active_color } else { inactive_color };
+                let target = TabBarTarget::Tab(i);
+                let color = adjust_surface_color(
+                    if tab.active {
+                        active_color
+                    } else {
+                        inactive_color
+                    },
+                    tb.is_hovered(target),
+                    tb.is_pressed(target),
+                );
                 instances.push(GlyphInstance {
                     cell_pos: [x, 0.0],
                     cell_size: [tab_width, tab_bar_height],
@@ -555,7 +871,9 @@ impl TerminalPipeline {
                     let region = atlas.get_or_rasterize(ch_title, false, false);
                     if let Some(r) = &region {
                         let gx = text_x + r.metrics.xmin as f32;
-                        let gy = text_y + baseline as f32 - r.metrics.height as f32 - r.metrics.ymin as f32;
+                        let gy = text_y + baseline as f32
+                            - r.metrics.height as f32
+                            - r.metrics.ymin as f32;
                         instances.push(GlyphInstance {
                             cell_pos: [gx, gy],
                             cell_size: [r.metrics.width as f32, r.metrics.height as f32],
@@ -572,95 +890,323 @@ impl TerminalPipeline {
 
                 // Close button (×) on the right of the tab
                 if let Some((cx, cy, cw_btn, ch_btn)) = tb.close_button_rect(i) {
-                    Self::add_glyph_button(&mut instances, atlas, baseline, '×', cx, cy, cw_btn, ch_btn, text_color, color);
+                    let close_target = TabBarTarget::Close(i);
+                    let close_color = adjust_surface_color(
+                        color,
+                        tb.is_hovered(close_target),
+                        tb.is_pressed(close_target),
+                    );
+                    Self::add_button_surface(&mut instances, (cx, cy, cw_btn, ch_btn), close_color);
+                    Self::add_glyph_button(
+                        &mut instances,
+                        atlas,
+                        baseline,
+                        '×',
+                        cx,
+                        cy,
+                        cw_btn,
+                        ch_btn,
+                        text_color,
+                        close_color,
+                    );
                 }
             }
 
             // New tab (+) and search (S) buttons, right-aligned
-            let (new_x, new_y, new_w, new_h) = tb.new_tab_button_rect(self.surface_config.width);
-            Self::add_glyph_button(&mut instances, atlas, baseline, '+', new_x, new_y, new_w, new_h, text_color, header_color);
+            let new_target = TabBarTarget::NewTab;
+            let new_rect = tb.new_tab_button_rect(self.surface_config.width);
+            let new_color = adjust_surface_color(
+                header_color,
+                tb.is_hovered(new_target),
+                tb.is_pressed(new_target),
+            );
+            Self::add_button_surface(&mut instances, new_rect, new_color);
+            Self::add_glyph_button(
+                &mut instances,
+                atlas,
+                baseline,
+                '+',
+                new_rect.0,
+                new_rect.1,
+                new_rect.2,
+                new_rect.3,
+                text_color,
+                new_color,
+            );
 
-            let (search_x, search_y, search_w, search_h) = tb.search_button_rect(self.surface_config.width);
-            Self::add_glyph_button(&mut instances, atlas, baseline, 'S', search_x, search_y, search_w, search_h, text_color, header_color);
+            let search_target = TabBarTarget::Search;
+            let search_rect = tb.search_button_rect(self.surface_config.width);
+            let search_color = adjust_surface_color(
+                header_color,
+                tb.is_hovered(search_target),
+                tb.is_pressed(search_target),
+            );
+            Self::add_button_surface(&mut instances, search_rect, search_color);
+            Self::add_glyph_button(
+                &mut instances,
+                atlas,
+                baseline,
+                'S',
+                search_rect.0,
+                search_rect.1,
+                search_rect.2,
+                search_rect.3,
+                text_color,
+                search_color,
+            );
         }
 
-        for row in 0..grid.rows {
-            for col in 0..grid.cols {
-                let cell = grid.cell(col, row);
-                let px = col as f32 * cw;
-                let py = tab_bar_height + row as f32 * ch;
+        if let Some(search) = search.filter(|search| search.active) {
+            let overlay_width = 320.0f32.min(self.surface_config.width as f32 - 16.0);
+            let overlay_height = 36.0;
+            let overlay_x = self.surface_config.width as f32 - overlay_width - 8.0;
+            let overlay_y = tab_bar_height + 8.0;
+            let overlay_bg = parse_hex_color("#313244");
+            let overlay_fg = parse_hex_color("#CDD6F4");
+            Self::add_button_surface(
+                &mut instances,
+                (overlay_x, overlay_y, overlay_width, overlay_height),
+                overlay_bg,
+            );
 
-            let fg_raw = color_to_rgba(cell.fg, true, colors, &grid.palette);
-            let bg_raw = color_to_rgba(cell.bg, false, colors, &grid.palette);
-
-            let (mut fg, mut bg) = if cell.attrs.inverse {
-                (bg_raw, fg_raw)
+            let direction = if search.mode == SearchMode::Reverse {
+                "reverse"
             } else {
-                (fg_raw, bg_raw)
+                "search"
             };
-
-            // Apply selection highlighting
-            if selection.contains(row, col) {
-                let sel_bg = parse_hex_color(&colors.selection_bg);
-                let sel_fg = parse_hex_color(&colors.selection_fg);
-                bg = sel_bg;
-                fg = sel_fg;
-            }
-
-            // 1. Background rectangle
-            instances.push(GlyphInstance {
-                cell_pos: [px, py],
-                cell_size: [cw, ch],
-                atlas_uv_min: [0.0; 2],
-                atlas_uv_max: [0.0; 2],
-                fg_color: bg,  // For background rect, use bg color
-                bg_color: bg,
-                mode: 0,
-                _pad: [0; 3],
-            });
-
-            // 2. Glyph (skip space and wide fillers)
-            if cell.wide_filler || cell.ch == ' ' {
-                continue;
-            }
-
-            let region = atlas.get_or_rasterize(cell.ch, cell.attrs.bold, cell.attrs.italic);
-            if let Some(r) = region {
-                // Position the glyph within the cell
-                let gx = px + r.metrics.xmin as f32;
-                let gy = py + baseline as f32 - r.metrics.height as f32 - r.metrics.ymin as f32;
-
+            let status = format!(
+                "/{}  {}  {}/{}",
+                search.query,
+                direction,
+                if search.matches.is_empty() {
+                    0
+                } else {
+                    search.current_match + 1
+                },
+                search.matches.len()
+            );
+            let mut text_x = overlay_x + 12.0;
+            let text_y = overlay_y + (overlay_height - ch) / 2.0;
+            for character in status.chars().take(40) {
+                let Some(region) = atlas.get_or_rasterize(character, false, false) else {
+                    continue;
+                };
                 instances.push(GlyphInstance {
-                    cell_pos: [gx, gy],
-                    cell_size: [r.metrics.width as f32, r.metrics.height as f32],
-                    atlas_uv_min: r.uv_min,
-                    atlas_uv_max: r.uv_max,
-                    fg_color: fg,
-                    bg_color: bg,
+                    cell_pos: [
+                        text_x + region.metrics.xmin as f32,
+                        text_y + baseline as f32
+                            - region.metrics.height as f32
+                            - region.metrics.ymin as f32,
+                    ],
+                    cell_size: [region.metrics.width as f32, region.metrics.height as f32],
+                    atlas_uv_min: region.uv_min,
+                    atlas_uv_max: region.uv_max,
+                    fg_color: overlay_fg,
+                    bg_color: overlay_bg,
                     mode: 1,
                     _pad: [0; 3],
                 });
-            }
+                text_x += cw;
             }
         }
 
-        // Cursor block (DECTCEM) - only render if cursor is enabled AND visible (blink)
+        // Scrollback view offset (T1-4): when the user has scrolled up, the
+        // top rows are served from the scrollback buffer and the live grid
+        // shifts down. `cell_at_view` handles the mapping; offset 0 keeps
+        // this an identity mapping.
+        let view_offset = grid.view_scrollback_lines();
+
+        for row in 0..grid.rows {
+            for col in 0..grid.cols {
+                if !full_redraw && !dirty_set.contains(&(row, col)) {
+                    continue;
+                }
+                let Some(cell) = grid.cell_at_view(col, row) else {
+                    continue;
+                };
+                let line_mode = grid.line_mode(row);
+                if line_mode == 6 && col % 2 == 1 {
+                    continue;
+                }
+                let render_cw = if line_mode == 6 { cw * 2.0 } else { cw };
+                let px = if line_mode == 6 {
+                    (col / 2) as f32 * render_cw
+                } else {
+                    col as f32 * cw
+                };
+                let py = tab_bar_height + row as f32 * ch;
+
+                let fg_raw = color_to_rgba(cell.fg, true, colors, &grid.palette);
+                let bg_raw = color_to_rgba(cell.bg, false, colors, &grid.palette);
+
+                // DECSCNM (?5) screen-reverse flips the whole display; combine
+                // with per-cell SGR inverse (T3-4).
+                let inverse = cell.attrs.inverse() != grid.screen_reverse;
+                let (mut fg, mut bg) = if inverse {
+                    (bg_raw, fg_raw)
+                } else {
+                    (fg_raw, bg_raw)
+                };
+
+                // Apply selection highlighting — selection coordinates address
+                // live grid rows, so shift by the view offset.
+                if row >= view_offset && selection.contains(row - view_offset, col) {
+                    let sel_bg = parse_hex_color(&colors.selection_bg);
+                    let sel_fg = parse_hex_color(&colors.selection_fg);
+                    bg = sel_bg;
+                    fg = sel_fg;
+                }
+
+                // 1. Background rectangle
+                instances.push(GlyphInstance {
+                    cell_pos: [px, py],
+                    cell_size: [render_cw, ch],
+                    atlas_uv_min: [0.0; 2],
+                    atlas_uv_max: [0.0; 2],
+                    fg_color: bg, // For background rect, use bg color
+                    bg_color: bg,
+                    mode: 0,
+                    _pad: [0; 3],
+                });
+
+                // 2. Glyph (skip space and wide fillers; a space may still
+                // carry combining marks that need rendering).
+                if cell.wide_filler || (cell.ch == ' ' && cell.combining.is_none()) {
+                    continue;
+                }
+
+                // T4-1: SGR style handling.
+                // invisible: render only the background, no glyph.
+                // dim: halve foreground intensity (xterm convention).
+                // blink: real terminals flash on a timer; we approximate by
+                //   rendering at half intensity so blinking text is at least
+                //   visually distinct. A time-based on/off toggle is future work.
+                if cell.attrs.invisible() {
+                    continue;
+                }
+                let glyph_fg = if cell.attrs.dim() || cell.attrs.blink() {
+                    [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, fg[3]]
+                } else {
+                    fg
+                };
+
+                let shaped_glyphs = if let Some(cluster_tail) = &cell.combining {
+                    let cluster = format!("{}{}", cell.ch, cluster_tail);
+                    atlas.shape_cluster(&cluster, cell.attrs.bold(), cell.attrs.italic())
+                } else if cell.ch != ' ' {
+                    atlas
+                        .get_or_rasterize(cell.ch, cell.attrs.bold(), cell.attrs.italic())
+                        .into_iter()
+                        .map(|region| ShapedGlyph {
+                            region,
+                            x_offset: 0.0,
+                            y_offset: 0.0,
+                            x_advance: 0.0,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for glyph in shaped_glyphs {
+                    let r = glyph.region;
+                    let gx = px + glyph.x_offset + r.metrics.xmin as f32;
+                    let gy = py + baseline as f32
+                        - glyph.y_offset
+                        - r.metrics.height as f32
+                        - r.metrics.ymin as f32;
+
+                    instances.push(GlyphInstance {
+                        cell_pos: [gx, gy],
+                        cell_size: [r.metrics.width as f32, r.metrics.height as f32],
+                        atlas_uv_min: r.uv_min,
+                        atlas_uv_max: r.uv_max,
+                        fg_color: glyph_fg,
+                        bg_color: bg,
+                        mode: 1,
+                        _pad: [0; 3],
+                    });
+                }
+
+                // Extended underline styles: single, double, curly, dotted,
+                // and dashed. Curly/dotted/dashed use lightweight geometry
+                // approximations while retaining the requested distinction.
+                let underline_color = glyph_fg;
+                let mut add_underline = |x: f32, y: f32, width: f32, height: f32| {
+                    instances.push(GlyphInstance {
+                        cell_pos: [x, y],
+                        cell_size: [width, height],
+                        atlas_uv_min: [0.0; 2],
+                        atlas_uv_max: [0.0; 2],
+                        fg_color: underline_color,
+                        bg_color: underline_color,
+                        mode: 0,
+                        _pad: [0; 3],
+                    });
+                };
+                match cell.attrs.underline_style() {
+                    1 => add_underline(px, py + ch - 2.0, render_cw, 2.0),
+                    2 => {
+                        add_underline(px, py + ch - 4.0, render_cw, 1.0);
+                        add_underline(px, py + ch - 1.0, render_cw, 1.0);
+                    }
+                    3 => {
+                        add_underline(px, py + ch - 3.0, render_cw * 0.5, 1.0);
+                        add_underline(px + render_cw * 0.5, py + ch - 2.0, render_cw * 0.5, 1.0);
+                    }
+                    4 => {
+                        add_underline(px, py + ch - 2.0, render_cw * 0.25, 2.0);
+                        add_underline(px + render_cw * 0.5, py + ch - 2.0, render_cw * 0.25, 2.0);
+                    }
+                    5 => add_underline(px, py + ch - 2.0, render_cw * 0.6, 2.0),
+                    _ => {}
+                }
+
+                // T4-1: strikethrough — thin rect through the vertical middle.
+                if cell.attrs.strikethrough() {
+                    instances.push(GlyphInstance {
+                        cell_pos: [px, py + ch * 0.4],
+                        cell_size: [cw, 2.0],
+                        atlas_uv_min: [0.0; 2],
+                        atlas_uv_max: [0.0; 2],
+                        fg_color: glyph_fg,
+                        bg_color: glyph_fg,
+                        mode: 0,
+                        _pad: [0; 3],
+                    });
+                }
+            }
+        }
+
+        // Cursor (DECTCEM) - only render if cursor is enabled AND visible (blink).
+        // When scrolled up, the live grid (and its cursor) shifts down by the
+        // view offset; hide the cursor entirely if that pushes it off-screen.
+        // DECSCUSR (T3-6): shape 0/1/2 = block, 3/4 = underline, 5/6 = bar.
         if grid.cursor_visible && cursor_visible {
             let col = grid.cursor.col.min(grid.cols - 1);
-            let row = grid.cursor.row.min(grid.rows - 1);
-            let px = col as f32 * cw;
-            let py = tab_bar_height + row as f32 * ch;
-            let cursor_color = parse_hex_color(&colors.cursor);
-            instances.push(GlyphInstance {
-                cell_pos: [px, py + ch - 2.0],
-                cell_size: [cw, 2.0],
-                atlas_uv_min: [0.0; 2],
-                atlas_uv_max: [0.0; 2],
-                fg_color: cursor_color,
-                bg_color: cursor_color,
-                mode: 0,
-                _pad: [0; 3],
-            });
+            let live_row = grid.cursor.row.min(grid.rows - 1);
+            let screen_row = live_row + view_offset;
+            if screen_row < grid.rows {
+                let px = col as f32 * cw;
+                let py = tab_bar_height + screen_row as f32 * ch;
+                let cursor_color = parse_hex_color(&colors.cursor);
+                // Geometry by DECSCUSR shape (0/1 fall back to block — the
+                // app side already gates blinking via cursor_visible).
+                let (rect_pos, rect_size) = match grid.cursor_shape {
+                    3 | 4 => ([px, py + ch - 2.0], [cw, 2.0]), // underline
+                    5 | 6 => ([px, py], [2.0, ch]),            // bar
+                    _ => ([px, py], [cw, ch]),                 // block
+                };
+                instances.push(GlyphInstance {
+                    cell_pos: rect_pos,
+                    cell_size: rect_size,
+                    atlas_uv_min: [0.0; 2],
+                    atlas_uv_max: [0.0; 2],
+                    fg_color: cursor_color,
+                    bg_color: cursor_color,
+                    mode: 0,
+                    _pad: [0; 3],
+                });
+            }
         }
 
         if atlas.take_dirty() {
@@ -689,30 +1235,39 @@ impl TerminalPipeline {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("surface error: {e:?}");
+                self.instances = instances;
                 return;
             }
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("frame"),
-        });
-
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         let bg_color = parse_hex_color(&colors.background);
+        let offscreen_load = if self.offscreen_initialized {
+            wgpu::LoadOp::Load
+        } else {
+            wgpu::LoadOp::Clear(wgpu::Color {
+                r: bg_color[0] as f64,
+                g: bg_color[1] as f64,
+                b: bg_color[2] as f64,
+                a: bg_color[3] as f64,
+            })
+        };
 
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terminal_pass"),
+                label: Some("terminal_offscreen_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.offscreen_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg_color[0] as f64,
-                            g: bg_color[1] as f64,
-                            b: bg_color[2] as f64,
-                            a: bg_color[3] as f64,
-                        }),
+                        load: offscreen_load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -731,10 +1286,76 @@ impl TerminalPipeline {
             }
         }
 
+        // Composite the persistent terminal framebuffer into the swapchain.
+        // The surface is always cleared; only the offscreen target relies on
+        // preserved contents between frames.
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("terminal_composite_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: bg_color[0] as f64,
+                            g: bg_color[1] as f64,
+                            b: bg_color[2] as f64,
+                            a: bg_color[3] as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rpass.set_pipeline(&self.composite_pipeline);
+            rpass.set_bind_group(0, &self.composite_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+            rpass.draw(0..6, 0..1);
+        }
+
+        self.offscreen_initialized = true;
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
-        
+
+        // Return CPU storage for reuse on the next frame.
+        self.instances = instances;
         // Swap buffers for next frame (double buffering)
         self.current_buffer = 1 - self.current_buffer;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_full_redraw;
+
+    #[test]
+    fn damage_path_requires_full_redraw_for_initial_frame_and_dynamic_overlays() {
+        assert!(needs_full_redraw(
+            false, false, false, false, false, false, 0, 100
+        ));
+        assert!(needs_full_redraw(
+            true, false, true, false, false, false, 1, 100
+        ));
+        assert!(needs_full_redraw(
+            true, false, false, true, false, false, 1, 100
+        ));
+        assert!(needs_full_redraw(
+            true, false, false, false, true, false, 1, 100
+        ));
+    }
+
+    #[test]
+    fn damage_path_allows_small_terminal_only_updates() {
+        assert!(!needs_full_redraw(
+            true, false, false, false, false, false, 1, 100
+        ));
+        assert!(needs_full_redraw(
+            true, false, false, false, false, false, 51, 100
+        ));
+        assert!(needs_full_redraw(
+            true, false, false, false, false, true, 1, 100
+        ));
     }
 }

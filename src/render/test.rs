@@ -2,7 +2,7 @@
 //!
 //! Runs the full terminal pipeline for one frame (no window, no event loop),
 //! saves the rendered output to a PNG file, and exits.
-//! 
+//!
 //! Usage:  cargo test headless_render -- --nocapture
 
 #[cfg(test)]
@@ -67,7 +67,11 @@ mod tests {
         // Render target texture
         let target_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("target"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -90,13 +94,18 @@ mod tests {
         let r = region.unwrap();
         assert!(r.metrics.width > 0, "glyph 'A' has zero width");
         assert!(r.metrics.height > 0, "glyph 'A' has zero height");
-        println!("Glyph 'A': {}x{} at UV({:.3},{:.3})-({:.3},{:.3})",
-            r.metrics.width, r.metrics.height,
-            r.uv_min[0], r.uv_min[1], r.uv_max[0], r.uv_max[1]);
+        println!(
+            "Glyph 'A': {}x{} at UV({:.3},{:.3})-({:.3},{:.3})",
+            r.metrics.width, r.metrics.height, r.uv_min[0], r.uv_min[1], r.uv_max[0], r.uv_max[1]
+        );
 
         // Save the atlas bitmap as a PGM file for visual inspection
         let pgm_path = "/tmp/terminal_atlas.pgm";
-        let mut pgm = format!("P5\n{} {}\n255\n", crate::render::font::ATLAS_SIZE, crate::render::font::ATLAS_SIZE);
+        let mut pgm = format!(
+            "P5\n{} {}\n255\n",
+            crate::render::font::ATLAS_SIZE,
+            crate::render::font::ATLAS_SIZE
+        );
         let header_bytes = pgm.into_bytes();
         let mut out = header_bytes;
         out.extend_from_slice(&atlas.bitmap);

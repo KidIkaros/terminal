@@ -63,7 +63,7 @@ impl ClipboardManager {
         if params.len() >= 2 {
             let board = &params[0];
             let data = &params[1];
-            
+
             // Check if it's clipboard buffer ('c') or primary ('p')
             if (board == b"c" || board == b"p") && data != b"?" {
                 if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) {

@@ -2,6 +2,15 @@
 
 use crate::grid::Color;
 
+/// Interactive target in the tab bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabBarTarget {
+    Tab(usize),
+    Close(usize),
+    NewTab,
+    Search,
+}
+
 /// A tab in the tab bar
 #[derive(Debug, Clone)]
 pub struct TabBarTab {
@@ -27,6 +36,10 @@ pub struct TabBar {
     pub inactive_color: Color,
     /// Text color
     pub text_color: Color,
+    /// Current pointer target, used for hover feedback.
+    pub hovered: Option<TabBarTarget>,
+    /// Current pressed target, used for tactile feedback.
+    pub pressed: Option<TabBarTarget>,
 }
 
 impl TabBar {
@@ -34,23 +47,27 @@ impl TabBar {
     pub fn new() -> Self {
         Self {
             tabs: Vec::new(),
-            height: 30, // Default height
-            bg_color: Color::Rgb(24, 24, 37), // #181825
+            height: 40,                              // Default height
+            bg_color: Color::Rgb(24, 24, 37),        // #181825
             active_color: Color::Rgb(137, 180, 250), // #89B4FA
-            inactive_color: Color::Rgb(69, 71, 90), // #45475A
-            text_color: Color::Rgb(205, 214, 244), // #CDD6F4
+            inactive_color: Color::Rgb(69, 71, 90),  // #45475A
+            text_color: Color::Rgb(205, 214, 244),   // #CDD6F4
+            hovered: None,
+            pressed: None,
         }
     }
 
     /// Update tabs from tab manager
     pub fn update_tabs(&mut self, titles: &[&str], active_index: usize) {
-        self.tabs = titles.iter().enumerate().map(|(i, &title)| {
-            TabBarTab {
+        self.tabs = titles
+            .iter()
+            .enumerate()
+            .map(|(i, &title)| TabBarTab {
                 title: title.to_string(),
                 active: i == active_index,
                 index: i,
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     /// Get tab bar height
@@ -59,9 +76,11 @@ impl TabBar {
     }
 
     /// Width reserved for each tab.
-    const TAB_WIDTH: u32 = 150;
-    /// Size of header buttons (new tab, search, close).
-    const BUTTON_SIZE: f32 = 24.0;
+    pub const TAB_WIDTH: u32 = 150;
+    /// Minimum logical hit area for toolbar and close controls.
+    pub const HIT_SIZE: f32 = 40.0;
+    /// Visible icon size inside each logical hit area.
+    pub const ICON_SIZE: f32 = 20.0;
     const BUTTON_MARGIN: f32 = 4.0;
 
     /// Check if a click is on a tab, return tab index
@@ -80,9 +99,10 @@ impl TabBar {
         if index >= self.tabs.len() {
             return None;
         }
-        let x = index as f32 * Self::TAB_WIDTH as f32 + (Self::TAB_WIDTH as f32 - Self::BUTTON_SIZE - Self::BUTTON_MARGIN);
-        let y = Self::BUTTON_MARGIN;
-        Some((x, y, Self::BUTTON_SIZE, Self::BUTTON_SIZE))
+        let x = index as f32 * Self::TAB_WIDTH as f32
+            + (Self::TAB_WIDTH as f32 - Self::HIT_SIZE - Self::BUTTON_MARGIN);
+        let y = 0.0;
+        Some((x, y, Self::HIT_SIZE, Self::HIT_SIZE))
     }
 
     /// Check if a click is on a close button
@@ -92,7 +112,11 @@ impl TabBar {
 
         if tab_index < self.tabs.len() {
             if let Some((cx, cy, cw, ch)) = self.close_button_rect(tab_index) {
-                if x >= cx as f64 && x <= (cx + cw) as f64 && y >= cy as f64 && y <= (cy + ch) as f64 {
+                if x >= cx as f64
+                    && x <= (cx + cw) as f64
+                    && y >= cy as f64
+                    && y <= (cy + ch) as f64
+                {
                     return Some(tab_index);
                 }
             }
@@ -102,9 +126,9 @@ impl TabBar {
 
     /// Position (x, y, w, h) for the right-aligned new-tab button.
     pub fn new_tab_button_rect(&self, screen_width: u32) -> (f32, f32, f32, f32) {
-        let x = screen_width as f32 - 2.0 * (Self::BUTTON_SIZE + Self::BUTTON_MARGIN);
-        let y = Self::BUTTON_MARGIN;
-        (x, y, Self::BUTTON_SIZE, Self::BUTTON_SIZE)
+        let x = screen_width as f32 - 2.0 * (Self::HIT_SIZE + Self::BUTTON_MARGIN);
+        let y = 0.0;
+        (x, y, Self::HIT_SIZE, Self::HIT_SIZE)
     }
 
     /// Check if a click is on the new-tab button.
@@ -115,15 +139,47 @@ impl TabBar {
 
     /// Position (x, y, w, h) for the right-aligned search button.
     pub fn search_button_rect(&self, screen_width: u32) -> (f32, f32, f32, f32) {
-        let x = screen_width as f32 - (Self::BUTTON_SIZE + Self::BUTTON_MARGIN);
-        let y = Self::BUTTON_MARGIN;
-        (x, y, Self::BUTTON_SIZE, Self::BUTTON_SIZE)
+        let x = screen_width as f32 - (Self::HIT_SIZE + Self::BUTTON_MARGIN);
+        let y = 0.0;
+        (x, y, Self::HIT_SIZE, Self::HIT_SIZE)
     }
 
     /// Check if a click is on the search button.
     pub fn search_button_at_position(&self, x: f64, y: f64, screen_width: u32) -> bool {
         let (bx, by, bw, bh) = self.search_button_rect(screen_width);
         x >= bx as f64 && x <= (bx + bw) as f64 && y >= by as f64 && y <= (by + bh) as f64
+    }
+
+    /// Resolve a pointer position to exactly one non-overlapping target.
+    pub fn target_at_position(&self, x: f64, y: f64, screen_width: u32) -> Option<TabBarTarget> {
+        if let Some(index) = self.close_button_at_position(x, y, 0) {
+            return Some(TabBarTarget::Close(index));
+        }
+        if self.new_tab_button_at_position(x, y, screen_width) {
+            return Some(TabBarTarget::NewTab);
+        }
+        if self.search_button_at_position(x, y, screen_width) {
+            return Some(TabBarTarget::Search);
+        }
+        self.tab_at_position(x, y, 0).map(TabBarTarget::Tab)
+    }
+
+    /// Update hover state from pointer movement.
+    pub fn update_hover(&mut self, x: f64, y: f64, screen_width: u32) {
+        self.hovered = self.target_at_position(x, y, screen_width);
+    }
+
+    /// Update pressed state on pointer press/release.
+    pub fn update_pressed(&mut self, target: Option<TabBarTarget>) {
+        self.pressed = target;
+    }
+
+    pub fn is_hovered(&self, target: TabBarTarget) -> bool {
+        self.hovered == Some(target)
+    }
+
+    pub fn is_pressed(&self, target: TabBarTarget) -> bool {
+        self.pressed == Some(target)
     }
 
     /// Generate vertex data for rendering
@@ -172,10 +228,24 @@ pub struct TabBarVertex {
     pub color: [f32; 4],
 }
 
+fn srgb_to_linear(component: u8) -> f32 {
+    let value = component as f32 / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 pub fn color_to_floats(color: &Color) -> [f32; 4] {
     match color {
         Color::Default => [0.0, 0.0, 0.0, 1.0],
-        Color::Rgb(r, g, b) => [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],
+        Color::Rgb(r, g, b) => [
+            srgb_to_linear(*r),
+            srgb_to_linear(*g),
+            srgb_to_linear(*b),
+            1.0,
+        ],
         Color::Indexed(i) => {
             // Simple fallback for indexed colors
             match i {
@@ -206,7 +276,7 @@ mod tests {
     #[test]
     fn test_tab_bar_new() {
         let tab_bar = TabBar::new();
-        assert_eq!(tab_bar.height, 30);
+        assert_eq!(tab_bar.height, 40);
         assert!(tab_bar.tabs.is_empty());
     }
 
@@ -225,12 +295,51 @@ mod tests {
         let mut tab_bar = TabBar::new();
         let titles = vec!["Tab 1", "Tab 2"];
         tab_bar.update_tabs(&titles, 0);
-        
+
         // Click on first tab
         assert_eq!(tab_bar.tab_at_position(50.0, 10.0, 8), Some(0));
         // Click on second tab
         assert_eq!(tab_bar.tab_at_position(200.0, 10.0, 8), Some(1));
         // Click outside tabs
         assert_eq!(tab_bar.tab_at_position(500.0, 10.0, 8), None);
+    }
+
+    #[test]
+    fn test_toolbar_hit_areas_are_large_and_non_overlapping() {
+        let tab_bar = TabBar::new();
+        let width = 720;
+        let new_rect = tab_bar.new_tab_button_rect(width);
+        let search_rect = tab_bar.search_button_rect(width);
+        assert_eq!(new_rect.2, TabBar::HIT_SIZE);
+        assert_eq!(new_rect.3, TabBar::HIT_SIZE);
+        assert_eq!(search_rect.2, TabBar::HIT_SIZE);
+        assert_eq!(search_rect.3, TabBar::HIT_SIZE);
+        assert!(new_rect.0 + new_rect.2 < search_rect.0);
+    }
+
+    #[test]
+    fn test_target_priority_keeps_close_button_separate() {
+        let mut tab_bar = TabBar::new();
+        tab_bar.update_tabs(&["Terminal"], 0);
+        let (x, y, _, _) = tab_bar.close_button_rect(0).unwrap();
+        assert_eq!(
+            tab_bar.target_at_position(x as f64 + 2.0, y as f64 + 2.0, 720),
+            Some(TabBarTarget::Close(0))
+        );
+        assert_eq!(
+            tab_bar.target_at_position(20.0, 20.0, 720),
+            Some(TabBarTarget::Tab(0))
+        );
+    }
+
+    #[test]
+    fn test_hover_and_pressed_state() {
+        let mut tab_bar = TabBar::new();
+        tab_bar.update_hover(700.0, 20.0, 720);
+        assert_eq!(tab_bar.hovered, Some(TabBarTarget::Search));
+        tab_bar.update_pressed(Some(TabBarTarget::Search));
+        assert!(tab_bar.is_pressed(TabBarTarget::Search));
+        tab_bar.update_pressed(None);
+        assert!(!tab_bar.is_pressed(TabBarTarget::Search));
     }
 }

@@ -28,43 +28,135 @@ impl LigatureDetector {
     /// Create a new ligature detector with common programming ligatures
     pub fn new() -> Self {
         let mut ligatures = Vec::new();
-        
+
         // Arrow ligatures
-        ligatures.push(Ligature { sequence: "=>".to_string(), glyph: Some('⇒'), width: 2 });
-        ligatures.push(Ligature { sequence: "->".to_string(), glyph: Some('→'), width: 2 });
-        ligatures.push(Ligature { sequence: "<-".to_string(), glyph: Some('←'), width: 2 });
-        ligatures.push(Ligature { sequence: "<->".to_string(), glyph: Some('↔'), width: 3 });
-        ligatures.push(Ligature { sequence: "=>>".to_string(), glyph: Some('↠'), width: 3 });
-        ligatures.push(Ligature { sequence: "<<-".to_string(), glyph: Some('↞'), width: 3 });
-        
+        ligatures.push(Ligature {
+            sequence: "=>".to_string(),
+            glyph: Some('⇒'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "->".to_string(),
+            glyph: Some('→'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "<-".to_string(),
+            glyph: Some('←'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "<->".to_string(),
+            glyph: Some('↔'),
+            width: 3,
+        });
+        ligatures.push(Ligature {
+            sequence: "=>>".to_string(),
+            glyph: Some('↠'),
+            width: 3,
+        });
+        ligatures.push(Ligature {
+            sequence: "<<-".to_string(),
+            glyph: Some('↞'),
+            width: 3,
+        });
+
         // Comparison ligatures
-        ligatures.push(Ligature { sequence: "==".to_string(), glyph: Some('≡'), width: 2 });
-        ligatures.push(Ligature { sequence: "!=".to_string(), glyph: Some('≠'), width: 2 });
-        ligatures.push(Ligature { sequence: "<=".to_string(), glyph: Some('≤'), width: 2 });
-        ligatures.push(Ligature { sequence: ">=".to_string(), glyph: Some('≥'), width: 2 });
-        ligatures.push(Ligature { sequence: "=/=".to_string(), glyph: Some('≢'), width: 3 });
-        ligatures.push(Ligature { sequence: "!==".to_string(), glyph: Some('≢'), width: 3 });
-        
+        ligatures.push(Ligature {
+            sequence: "==".to_string(),
+            glyph: Some('≡'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "!=".to_string(),
+            glyph: Some('≠'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "<=".to_string(),
+            glyph: Some('≤'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: ">=".to_string(),
+            glyph: Some('≥'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "=/=".to_string(),
+            glyph: Some('≢'),
+            width: 3,
+        });
+        ligatures.push(Ligature {
+            sequence: "!==".to_string(),
+            glyph: Some('≢'),
+            width: 3,
+        });
+
         // Logical ligatures
-        ligatures.push(Ligature { sequence: "&&".to_string(), glyph: Some('∧'), width: 2 });
-        ligatures.push(Ligature { sequence: "||".to_string(), glyph: Some('∨'), width: 2 });
-        ligatures.push(Ligature { sequence: "!!".to_string(), glyph: Some('‼'), width: 2 });
-        
+        ligatures.push(Ligature {
+            sequence: "&&".to_string(),
+            glyph: Some('∧'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "||".to_string(),
+            glyph: Some('∨'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "!!".to_string(),
+            glyph: Some('‼'),
+            width: 2,
+        });
+
         // Miscellaneous
-        ligatures.push(Ligature { sequence: "::".to_string(), glyph: Some('∷'), width: 2 });
-        ligatures.push(Ligature { sequence: "..".to_string(), glyph: Some('…'), width: 2 });
-        ligatures.push(Ligature { sequence: "...".to_string(), glyph: Some('⋯'), width: 3 });
-        ligatures.push(Ligature { sequence: "::=".to_string(), glyph: Some('⩴'), width: 3 });
-        ligatures.push(Ligature { sequence: ":=".to_string(), glyph: Some('≔'), width: 2 });
-        
+        ligatures.push(Ligature {
+            sequence: "::".to_string(),
+            glyph: Some('∷'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "..".to_string(),
+            glyph: Some('…'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "...".to_string(),
+            glyph: Some('⋯'),
+            width: 3,
+        });
+        ligatures.push(Ligature {
+            sequence: "::=".to_string(),
+            glyph: Some('⩴'),
+            width: 3,
+        });
+        ligatures.push(Ligature {
+            sequence: ":=".to_string(),
+            glyph: Some('≔'),
+            width: 2,
+        });
+
         // Comment ligatures
-        ligatures.push(Ligature { sequence: "//".to_string(), glyph: Some('⫽'), width: 2 });
-        ligatures.push(Ligature { sequence: "/*".to_string(), glyph: None, width: 2 });
-        ligatures.push(Ligature { sequence: "*/".to_string(), glyph: None, width: 2 });
-        
+        ligatures.push(Ligature {
+            sequence: "//".to_string(),
+            glyph: Some('⫽'),
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "/*".to_string(),
+            glyph: None,
+            width: 2,
+        });
+        ligatures.push(Ligature {
+            sequence: "*/".to_string(),
+            glyph: None,
+            width: 2,
+        });
+
         // Sort by length (longest first) to match longer ligatures first
         ligatures.sort_by(|a, b| b.width.cmp(&a.width));
-        
+
         Self {
             ligatures,
             cache: HashMap::new(),
@@ -111,7 +203,7 @@ mod tests {
     #[test]
     fn test_ligature_detector() {
         let mut detector = LigatureDetector::new();
-        
+
         let chars: Vec<char> = "=>".chars().collect();
         let ligature = detector.detect(&chars, 0);
         assert!(ligature.is_some());
@@ -123,7 +215,7 @@ mod tests {
     #[test]
     fn test_no_ligature() {
         let mut detector = LigatureDetector::new();
-        
+
         let chars: Vec<char> = "ab".chars().collect();
         let ligature = detector.detect(&chars, 0);
         assert!(ligature.is_none());
@@ -132,7 +224,7 @@ mod tests {
     #[test]
     fn test_longest_ligature_first() {
         let mut detector = LigatureDetector::new();
-        
+
         // "=>" should match before "=="
         let chars: Vec<char> = "=>".chars().collect();
         let ligature = detector.detect(&chars, 0);

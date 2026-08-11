@@ -98,13 +98,13 @@ impl Default for ImageStore {
 /// Parse Kitty graphics protocol command
 pub fn parse_kitty_command(params: &str) -> HashMap<String, String> {
     let mut result = HashMap::new();
-    
+
     for part in params.split(',') {
         if let Some((key, value)) = part.split_once('=') {
             result.insert(key.to_string(), value.to_string());
         }
     }
-    
+
     result
 }
 
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn test_image_store() {
         let mut store = ImageStore::new();
-        
+
         let image = TerminalImage {
             id: 0,
             data: vec![0; 100],
@@ -136,13 +136,13 @@ mod tests {
             rows: 3,
             placement: ImagePlacement::Cursor,
         };
-        
+
         let id = store.add_image(image);
         assert_eq!(id, 1);
-        
+
         let retrieved = store.get_image(id);
         assert!(retrieved.is_some());
-        
+
         store.remove_image(id);
         assert!(store.get_image(id).is_none());
     }
@@ -151,7 +151,7 @@ mod tests {
     fn test_parse_kitty_command() {
         let params = "a=T,i=1,t=f,s=1024,v=768";
         let result = parse_kitty_command(params);
-        
+
         assert_eq!(result.get("a"), Some(&"T".to_string()));
         assert_eq!(result.get("i"), Some(&"1".to_string()));
         assert_eq!(result.get("t"), Some(&"f".to_string()));

@@ -45,6 +45,10 @@ pub struct Config {
     /// Tab bar settings.
     #[serde(default)]
     pub tabs: TabsConfig,
+
+    /// Reduce cursor and UI motion for accessibility.
+    #[serde(default)]
+    pub reduced_motion: bool,
 }
 
 /// Cursor style options.
@@ -375,6 +379,7 @@ impl Default for Config {
             cursor_blink_ms: default_cursor_blink(),
             cursor_style: CursorStyle::default(),
             tabs: TabsConfig::default(),
+            reduced_motion: false,
         }
     }
 }
@@ -414,12 +419,12 @@ impl Config {
     pub fn save(&self, path: impl Into<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
         let path = path.into();
         let content = toml::to_string_pretty(self)?;
-        
+
         // Create parent directory if needed
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         std::fs::write(&path, content)?;
         log::info!("Saved config to {}", path.display());
         Ok(())
@@ -465,6 +470,7 @@ mod tests {
         assert_eq!(config.window.rows, 24);
         assert_eq!(config.scrollback, 10000);
         assert!(!config.mouse_reporting);
+        assert!(!config.reduced_motion);
     }
 
     #[test]
@@ -512,14 +518,14 @@ foreground = 'FFFFFF'
     fn test_save_and_load() {
         let dir = std::env::temp_dir().join("terminal_config_test");
         let _ = std::fs::remove_dir_all(&dir);
-        
+
         let path = dir.join("test.toml");
         let config = Config::default();
         config.save(&path).unwrap();
-        
+
         let loaded = Config::from_file(&path).unwrap();
         assert_eq!(config.font.size, loaded.font.size);
-        
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -41,6 +41,7 @@ impl MouseEvent {
         match encoding {
             MouseEncoding::X10 => self.encode_x10(),
             MouseEncoding::SGR => self.encode_sgr(),
+            MouseEncoding::Urxvt => self.encode_urxvt(),
         }
     }
 
@@ -63,9 +64,15 @@ impl MouseEvent {
         }
 
         // Add modifier flags
-        if self.shift { cb += 4; }
-        if self.ctrl { cb += 8; }
-        if self.alt { cb += 16; }
+        if self.shift {
+            cb += 4;
+        }
+        if self.ctrl {
+            cb += 8;
+        }
+        if self.alt {
+            cb += 16;
+        }
 
         // Release encodes as button 3 in legacy mode
         let cb_final = if self.event_type == MouseEventType::Release {
@@ -101,9 +108,15 @@ impl MouseEvent {
         }
 
         // Add modifier flags
-        if self.shift { cb += 4; }
-        if self.ctrl { cb += 8; }
-        if self.alt { cb += 16; }
+        if self.shift {
+            cb += 4;
+        }
+        if self.ctrl {
+            cb += 8;
+        }
+        if self.alt {
+            cb += 16;
+        }
 
         let final_char = if self.event_type == MouseEventType::Release {
             'm'
@@ -113,6 +126,49 @@ impl MouseEvent {
 
         // SGR uses 1-based coordinates
         format!("\x1b[<{};{};{}{}", cb, self.col, self.row, final_char)
+    }
+
+    /// urxvt encoding (DECSET 1015): `CSI Cb ; Cx ; Cy M` — decimal
+    /// coordinates, no `<` prefix, no 32-offset (T3-19).
+    fn encode_urxvt(&self) -> String {
+        let mut cb: u32 = match self.button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            MouseButton::WheelUp => 64,
+            MouseButton::WheelDown => 65,
+            MouseButton::WheelLeft => 66,
+            MouseButton::WheelRight => 67,
+            MouseButton::Other(b) => b as u32,
+        };
+
+        if self.event_type == MouseEventType::Motion {
+            cb += 32;
+        }
+        if self.shift {
+            cb += 4;
+        }
+        if self.ctrl {
+            cb += 8;
+        }
+        if self.alt {
+            cb += 16;
+        }
+
+        let final_char = if self.event_type == MouseEventType::Release {
+            'm'
+        } else {
+            'M'
+        };
+
+        // urxvt uses 1-based coordinates
+        format!(
+            "\x1b[{};{};{}{}",
+            cb,
+            self.col + 1,
+            self.row + 1,
+            final_char
+        )
     }
 }
 

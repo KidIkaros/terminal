@@ -58,7 +58,7 @@ mod integration_tests {
         parser.advance(&mut grid, b'A');
 
         let cell = grid.cell(0, 0);
-        assert!(cell.attrs.bold);
+        assert!(cell.attrs.bold());
     }
 
     /// Test colors
@@ -438,7 +438,7 @@ mod integration_tests {
 
         // Check that the cells have hyperlink IDs
         let cell = grid.cell(0, 0);
-        assert!(cell.hyperlink_id.is_some());
+        assert!(cell.hyperlink_id != 0);
     }
 
     /// Test OSC 52 (clipboard)
@@ -455,9 +455,31 @@ mod integration_tests {
 
     /// Test mouse event encoding
     #[test]
+    fn test_batch_parser_matches_byte_parser() {
+        let size = WinSize { cols: 12, rows: 3 };
+        let payload = b"alpha beta\ngamma\rdelta\n\x1b[31mred\x1b[0m";
+
+        let mut byte_grid = Grid::new(size, 32);
+        let mut byte_parser = Parser::new();
+        for &byte in payload {
+            byte_parser.advance(&mut byte_grid, byte);
+        }
+
+        let mut batch_grid = Grid::new(size, 32);
+        let mut batch_parser = Parser::new();
+        batch_parser.advance_bytes(&mut batch_grid, payload);
+
+        assert_eq!(batch_grid.cursor.col, byte_grid.cursor.col);
+        assert_eq!(batch_grid.cursor.row, byte_grid.cursor.row);
+        assert_eq!(batch_grid.all_lines(), byte_grid.all_lines());
+        assert_eq!(batch_grid.scrollback.len(), byte_grid.scrollback.len());
+        assert_eq!(batch_grid.cell(0, 2).ch, byte_grid.cell(0, 2).ch);
+    }
+
+    #[test]
     fn test_mouse_encoding() {
         use crate::grid::MouseEncoding;
-        use crate::mouse::{MouseEvent, MouseEventType, MouseButton};
+        use crate::mouse::{MouseButton, MouseEvent, MouseEventType};
 
         let event = MouseEvent {
             button: MouseButton::Left,

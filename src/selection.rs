@@ -286,10 +286,7 @@ mod tests {
         sel.update(1, 3);
         sel.end_selection();
 
-        let lines = vec![
-            "Hello, World!".to_string(),
-            "Goodbye, World!".to_string(),
-        ];
+        let lines = vec!["Hello, World!".to_string(), "Goodbye, World!".to_string()];
 
         let text = sel.extract_text(&lines, 13);
         assert_eq!(text, "llo, World!\nGood");

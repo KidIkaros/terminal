@@ -24,13 +24,16 @@ pub struct Tab {
 
 impl Tab {
     /// Create a new tab with the given size and scrollback, spawning a PTY.
+    /// The `wake` callback is invoked by the reader thread on each data chunk
+    /// (T5-2) so the event loop can drain promptly.
     pub fn spawn(
         title: &str,
         size: WinSize,
         scrollback: usize,
-        shell: &str,
+        argv: &[String],
+        wake: pty::WakeCallback,
     ) -> Result<Self, pty::PtyError> {
-        let (writer, handle, rx) = pty::spawn_pty(size, shell)?;
+        let (writer, handle, rx) = pty::spawn_pty(size, argv, wake)?;
         Ok(Self {
             title: title.to_string(),
             grid: Grid::new(size, scrollback),
@@ -68,16 +71,23 @@ pub struct TabManager {
     scrollback: usize,
     /// Shell path for new tabs.
     shell: String,
+    /// Wake callback cloned for each new tab's reader thread (T5-2).
+    wake_factory: Box<dyn Fn() -> pty::WakeCallback + Send + Sync>,
 }
 
 impl TabManager {
     /// Create a new tab manager with an initial tab (spawns its PTY).
+    /// `wake_factory` produces a fresh wake callback for each tab's reader
+    /// thread (T5-2).
     pub fn new(
         initial_size: WinSize,
         shell: &str,
         scrollback: usize,
+        wake_factory: Box<dyn Fn() -> pty::WakeCallback + Send + Sync>,
     ) -> Result<Self, pty::PtyError> {
-        let mut first = Tab::spawn("Terminal", initial_size, scrollback, shell)?;
+        let argv = vec![shell.to_string()];
+        let wake = wake_factory();
+        let mut first = Tab::spawn("Terminal", initial_size, scrollback, &argv, wake)?;
         first.active = true;
         Ok(Self {
             tabs: vec![first],
@@ -85,6 +95,30 @@ impl TabManager {
             default_size: initial_size,
             scrollback,
             shell: shell.to_string(),
+            wake_factory,
+        })
+    }
+
+    /// Like `new` but runs `command` via `sh -c` in the initial tab instead
+    /// of the default shell. Subsequent tabs (Ctrl+T) still use `shell`.
+    pub fn new_with_command(
+        initial_size: WinSize,
+        shell: &str,
+        scrollback: usize,
+        command: &str,
+        wake_factory: Box<dyn Fn() -> pty::WakeCallback + Send + Sync>,
+    ) -> Result<Self, pty::PtyError> {
+        let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
+        let wake = wake_factory();
+        let mut first = Tab::spawn("Terminal", initial_size, scrollback, &argv, wake)?;
+        first.active = true;
+        Ok(Self {
+            tabs: vec![first],
+            active_index: 0,
+            default_size: initial_size,
+            scrollback,
+            shell: shell.to_string(),
+            wake_factory,
         })
     }
 
@@ -121,7 +155,9 @@ impl TabManager {
     /// Create a new tab (spawns a PTY) and return its index.
     pub fn new_tab(&mut self) -> Result<usize, pty::PtyError> {
         let title = format!("Terminal {}", self.tabs.len() + 1);
-        let tab = Tab::spawn(&title, self.default_size, self.scrollback, &self.shell)?;
+        let wake = (self.wake_factory)();
+        let argv = vec![self.shell.clone()];
+        let tab = Tab::spawn(&title, self.default_size, self.scrollback, &argv, wake)?;
         self.tabs.push(tab);
         let new_index = self.tabs.len() - 1;
         self.switch_to(new_index);
@@ -240,6 +276,7 @@ mod tests {
             default_size: size,
             scrollback: 1000,
             shell: "/bin/bash".to_string(),
+            wake_factory: Box::new(|| Box::new(|| {}) as pty::WakeCallback),
         }
     }
 
@@ -292,8 +329,16 @@ mod tests {
     #[test]
     fn test_switch_tabs() {
         let mut manager = make_manager();
-        manager.tabs.push(Tab::without_pty("T2", manager.default_size, manager.scrollback));
-        manager.tabs.push(Tab::without_pty("T3", manager.default_size, manager.scrollback));
+        manager.tabs.push(Tab::without_pty(
+            "T2",
+            manager.default_size,
+            manager.scrollback,
+        ));
+        manager.tabs.push(Tab::without_pty(
+            "T3",
+            manager.default_size,
+            manager.scrollback,
+        ));
 
         manager.switch_to(2);
         assert_eq!(manager.active_index(), 2);
@@ -319,9 +364,16 @@ mod tests {
     #[test]
     fn test_resize_all_tabs() {
         let mut manager = make_manager();
-        manager.tabs.push(Tab::without_pty("T2", manager.default_size, manager.scrollback));
+        manager.tabs.push(Tab::without_pty(
+            "T2",
+            manager.default_size,
+            manager.scrollback,
+        ));
 
-        let new_size = WinSize { cols: 120, rows: 40 };
+        let new_size = WinSize {
+            cols: 120,
+            rows: 40,
+        };
         manager.resize(new_size);
 
         assert_eq!(manager.default_size, new_size);

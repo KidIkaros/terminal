@@ -37,12 +37,21 @@ pub struct GlyphMetrics {
     pub xmin: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ShapedGlyph {
+    pub region: AtlasRegion,
+    pub x_offset: f32,
+    pub y_offset: f32,
+    pub x_advance: f32,
+}
+
 pub const ATLAS_SIZE: u32 = 1024;
 
 pub struct GlyphAtlas {
     font: Font,
-    /// Fallback fonts for CJK, emoji, etc.
+    /// Fallback fonts for CJK, emoji, etc., loaded on first glyph miss.
     fallback_fonts: Vec<Font>,
+    fallback_attempted: bool,
     pub font_size: f32,
     pub cell_width: u32,
     pub cell_height: u32,
@@ -83,6 +92,7 @@ impl GlyphAtlas {
         GlyphAtlas {
             font,
             fallback_fonts: Vec::new(),
+            fallback_attempted: false,
             font_size,
             cell_width,
             cell_height,
@@ -105,12 +115,7 @@ impl GlyphAtlas {
 
     /// Look up a glyph in the cache, rasterizing and packing it if absent.
     /// Returns `None` if the glyph is a space or if the atlas is full.
-    pub fn get_or_rasterize(
-        &mut self,
-        ch: char,
-        bold: bool,
-        italic: bool,
-    ) -> Option<AtlasRegion> {
+    pub fn get_or_rasterize(&mut self, ch: char, bold: bool, italic: bool) -> Option<AtlasRegion> {
         // Space and control chars produce no glyph
         if ch == ' ' || (ch as u32) < 0x20 {
             return None;
@@ -124,6 +129,7 @@ impl GlyphAtlas {
         // Try primary font first
         let (metrics, bitmap) = self.font.rasterize(ch, self.font_size);
         if metrics.width == 0 || metrics.height == 0 {
+            self.ensure_fallback_fonts();
             // Try fallback fonts
             for fallback in &self.fallback_fonts {
                 let (m, b) = fallback.rasterize(ch, self.font_size);
@@ -196,10 +202,62 @@ impl GlyphAtlas {
             self.shelf_h = gh;
         }
 
-        let region = AtlasRegion { uv_min, uv_max, metrics: glyph_metrics };
+        let region = AtlasRegion {
+            uv_min,
+            uv_max,
+            metrics: glyph_metrics,
+        };
         self.cache.insert(key, region);
         self.dirty = true;
         Some(region)
+    }
+
+    /// Shape a cluster with RustyBuzz and rasterize the resulting glyph IDs.
+    /// This provides real ligature/mark positioning for the embedded primary
+    /// font; fallback shaping remains a later multi-font extension.
+    pub fn shape_cluster(&mut self, text: &str, bold: bool, italic: bool) -> Vec<ShapedGlyph> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let Some(face) = rustybuzz::Face::from_slice(embedded_font(), 0) else {
+            return Vec::new();
+        };
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        let shaped = rustybuzz::shape(&face, &[], buffer);
+        shaped
+            .glyph_infos()
+            .iter()
+            .zip(shaped.glyph_positions())
+            .filter_map(|(info, position)| {
+                let glyph_index = u16::try_from(info.glyph_id).ok()?;
+                let (metrics, bitmap) = self.font.rasterize_indexed(glyph_index, self.font_size);
+                if metrics.width == 0 || metrics.height == 0 {
+                    return None;
+                }
+                let region = self.pack_glyph(
+                    char::from_u32(info.glyph_id).unwrap_or(' '),
+                    bold,
+                    italic,
+                    metrics,
+                    bitmap,
+                )?;
+                Some(ShapedGlyph {
+                    region,
+                    x_offset: position.x_offset as f32 / 64.0,
+                    y_offset: position.y_offset as f32 / 64.0,
+                    x_advance: position.x_advance as f32 / 64.0,
+                })
+            })
+            .collect()
+    }
+
+    fn ensure_fallback_fonts(&mut self) {
+        if self.fallback_attempted {
+            return;
+        }
+        self.fallback_attempted = true;
+        load_fallback_fonts(self);
     }
 
     /// Returns true if new glyphs have been rasterized since last upload,
@@ -234,7 +292,7 @@ pub fn load_fallback_fonts(atlas: &mut GlyphAtlas) {
         "fonts/NotoSansCJKsc-Regular.otf",
         "fonts/NotoSansSC-Regular.otf",
     ];
-    
+
     for path in &cjk_font_paths {
         if let Ok(bytes) = std::fs::read(path) {
             atlas.add_fallback_font(&bytes);
@@ -242,7 +300,28 @@ pub fn load_fallback_fonts(atlas: &mut GlyphAtlas) {
             return;
         }
     }
-    
+
     // No CJK fallback font found - log warning but don't crash
     log::warn!("No CJK fallback font found — CJK and emoji characters may not render correctly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shaping_returns_positioned_glyphs_for_complex_text() {
+        let mut atlas = GlyphAtlas::from_bytes(embedded_font(), 15.0);
+        let shaped = atlas.shape_cluster("e\u{301}", false, false);
+        assert!(!shaped.is_empty());
+        assert!(shaped.iter().any(|glyph| glyph.region.metrics.width > 0));
+    }
+
+    #[test]
+    fn fallback_fonts_are_lazy_until_a_missing_glyph_is_requested() {
+        let mut atlas = GlyphAtlas::from_bytes(embedded_font(), 15.0);
+        assert!(!atlas.fallback_attempted);
+        atlas.ensure_fallback_fonts();
+        assert!(atlas.fallback_attempted);
+    }
 }

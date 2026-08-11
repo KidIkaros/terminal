@@ -252,7 +252,7 @@ mod tests {
         let mut state = SearchState::new();
         state.activate();
         assert!(state.active);
-        
+
         state.deactivate();
         assert!(!state.active);
         assert!(state.query.is_empty());
@@ -284,10 +284,7 @@ mod tests {
         state.activate();
         state.update_query("hello");
 
-        let lines = vec![
-            "HELLO world".to_string(),
-            "Hello there".to_string(),
-        ];
+        let lines = vec!["HELLO world".to_string(), "Hello there".to_string()];
 
         state.search(&lines);
         assert_eq!(state.matches.len(), 2);
