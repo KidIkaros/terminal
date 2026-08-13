@@ -1118,7 +1118,22 @@ impl TerminalPipeline {
                 if !full_redraw && !self.dirty_mask[row * grid.cols + col] {
                     continue;
                 }
-                let Some(cell) = grid.cell_at_view(col, row) else {
+
+                // Inline cell_at_view to avoid calling view_scrollback_lines()
+                // on every cell. view_offset was computed once above.
+                let screen_row = row;
+                let cell = if screen_row < view_offset {
+                    let sb_idx = grid.scrollback.len() - view_offset + screen_row;
+                    grid.scrollback.get(sb_idx).and_then(|line| line.get(col))
+                } else {
+                    let live_row = screen_row - view_offset;
+                    if live_row < grid.rows {
+                        Some(grid.cell(col, live_row))
+                    } else {
+                        None
+                    }
+                };
+                let Some(cell) = cell else {
                     continue;
                 };
                 let line_mode = grid.line_mode(row);
