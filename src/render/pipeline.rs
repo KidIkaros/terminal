@@ -154,11 +154,14 @@ fn needs_full_redraw(
         || dirty_cells > total_cells / 2
 }
 
+type Color3 = [f32; 3];
+
 fn color_to_rgba(
     color: Color,
     is_fg: bool,
     config: &ColorConfig,
     palette: &ColorPalette,
+    cached_table: &[Color3],
 ) -> [f32; 4] {
     match color {
         Color::Default => {
@@ -171,10 +174,11 @@ fn color_to_rgba(
         Color::Indexed(i) => {
             if let Some((r, g, b)) = palette.get_color(i) {
                 [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0]
+            } else if (i as usize) < cached_table.len() {
+                let c = cached_table[i as usize];
+                [c[0], c[1], c[2], 1.0]
             } else {
-                let table = build_color_table(config, palette);
-                let [r, g, b] = table[i as usize];
-                [r, g, b, 1.0]
+                [0.0, 0.0, 0.0, 1.0]
             }
         }
         Color::Rgb(r, g, b) => [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0],
@@ -192,7 +196,7 @@ pub struct RenderParams<'a> {
     pub cursor_visible: bool,
     pub colors: &'a ColorConfig,
     pub selection: &'a Selection,
-    pub search: Option<&'a SearchState>,
+    pub search: Option<&'a mut SearchState>,
     pub tab_bar: Option<&'a mut TabBar>,
     pub tab_bar_height: f32,
 }
@@ -235,6 +239,10 @@ pub struct TerminalPipeline {
     dirty_mask: Vec<bool>,
     /// Number of terminal cells reported dirty by the most recent frame.
     last_dirty_cells: usize,
+    /// Cached 256-entry color lookup table. Rebuilt only when theme changes.
+    /// Previously build_color_table was called per-cell for Color::Indexed,
+    /// allocating a 256-entry Vec every time. Now cached globally.
+    color_table: Vec<[f32; 3]>,
     current_buffer: usize,
 }
 
@@ -657,6 +665,7 @@ impl TerminalPipeline {
             instances: Vec::with_capacity(4096),
             dirty_mask: Vec::new(),
             last_dirty_cells: 0,
+            color_table: Vec::with_capacity(256),
             current_buffer: 0,
         }
     }
@@ -845,6 +854,13 @@ impl TerminalPipeline {
         let ch = atlas.cell_height as f32;
         let baseline = atlas.baseline;
 
+        // Rebuild cached color table if empty (first render or after theme change).
+        // Previously build_color_table allocated 256 entries per cell every frame
+        // for Color::Indexed colors that missed the palette fast path.
+        if self.color_table.len() != 256 {
+            self.color_table = build_color_table(colors, &grid.palette);
+        }
+
         // Capture tab_bar dirty flag and take the mutable ref out of the Option
         // so we can use it for both the needs_full_redraw check and rendering.
         let tab_bar_changed = tab_bar.as_ref().map(|tb| tb.dirty).unwrap_or(false);
@@ -861,7 +877,7 @@ impl TerminalPipeline {
             self.offscreen_initialized,
             cursor_visible,
             selection.active,
-            search.is_some_and(|state| state.active),
+            search.as_ref().is_some_and(|state| state.active),
             tab_bar_changed,
             grid.view_scrollback_lines() > 0,
             dirty_cells.len(),
@@ -1065,22 +1081,7 @@ impl TerminalPipeline {
                 overlay_bg,
             );
 
-            let direction = if search.mode == SearchMode::Reverse {
-                "reverse"
-            } else {
-                "search"
-            };
-            let status = format!(
-                "/{}  {}  {}/{}",
-                search.query,
-                direction,
-                if search.matches.is_empty() {
-                    0
-                } else {
-                    search.current_match + 1
-                },
-                search.matches.len()
-            );
+            let status = search.status_text();
             let mut text_x = overlay_x + 12.0;
             let text_y = overlay_y + (overlay_height - ch) / 2.0;
             for character in status.chars().take(40) {
@@ -1132,8 +1133,8 @@ impl TerminalPipeline {
                 };
                 let py = tab_bar_height + row as f32 * ch;
 
-                let fg_raw = color_to_rgba(cell.fg, true, colors, &grid.palette);
-                let bg_raw = color_to_rgba(cell.bg, false, colors, &grid.palette);
+                let fg_raw = color_to_rgba(cell.fg, true, colors, &grid.palette, &self.color_table);
+                let bg_raw = color_to_rgba(cell.bg, false, colors, &grid.palette, &self.color_table);
 
                 // DECSCNM (?5) screen-reverse flips the whole display; combine
                 // with per-cell SGR inverse (T3-4).

@@ -1178,7 +1178,7 @@ impl ApplicationHandler<UserEvent> for App {
                         cursor_visible: self.cursor_visible,
                         colors: &self.config.colors,
                         selection: &self.selection,
-                        search: Some(&self.search),
+                        search: Some(&mut self.search),
                         tab_bar: tb_ref,
                         tab_bar_height: tb_height as f32,
                     });

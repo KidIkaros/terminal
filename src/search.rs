@@ -38,6 +38,11 @@ pub struct SearchState {
     pub mode: SearchMode,
     /// Search history for reverse search
     pub search_history: Vec<String>,
+    /// Cached status text — recomputed when query/matches/mode change.
+    /// Avoids format!() allocation on the 60fps render path.
+    pub(crate) status_cache: Option<String>,
+    /// Cache invalidation key: (mode, current_match, match_count, query_len).
+    status_key: Option<(u8, usize, usize, usize)>,
 }
 
 impl SearchState {
@@ -52,6 +57,8 @@ impl SearchState {
             regex_mode: false,
             mode: SearchMode::Forward,
             search_history: Vec::new(),
+            status_cache: None,
+            status_key: None,
         }
     }
 
@@ -217,6 +224,34 @@ impl SearchState {
     /// Get total number of matches
     pub fn match_count(&self) -> usize {
         self.matches.len()
+    }
+
+    /// Cached search status text — avoids format!() allocation every frame.
+    /// Invalidates when query, match count, current match index, or mode changes.
+    /// ponytail: only 4 bools + 2 usize stored, compared by value, no hashing.
+    pub fn status_text(&mut self) -> &str {
+        use std::fmt::Write;
+
+        let mode_byte = self.mode as u8;
+        let current = if self.matches.is_empty() {
+            0usize
+        } else {
+            self.current_match + 1
+        };
+        let total = self.matches.len();
+        let query_len = self.query.len();
+
+        let key = (mode_byte, current, total, query_len);
+        if Some(&key) == self.status_key.as_ref() {
+            return self.status_cache.as_deref().unwrap_or("");
+        }
+
+        let direction = if self.mode == SearchMode::Reverse { "reverse" } else { "search" };
+        let mut buf = String::new();
+        let _ = write!(buf, "/{}  {}  {}/{}", self.query, direction, current, total);
+        self.status_cache = Some(buf);
+        self.status_key = Some(key);
+        self.status_cache.as_deref().unwrap_or("")
     }
 
     /// Get current match index (1-based for display)
