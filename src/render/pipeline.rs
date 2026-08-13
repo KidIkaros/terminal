@@ -22,7 +22,7 @@ use wgpu::util::DeviceExt;
 use crate::config::ColorConfig;
 use crate::grid::{Color, ColorPalette, Grid};
 use crate::render::font::{GlyphAtlas, ShapedGlyph, ATLAS_SIZE};
-use crate::search::{SearchMode, SearchState};
+use crate::search::SearchState;
 use crate::selection::Selection;
 use crate::tab_bar::{TabBar, TabBarTarget};
 
@@ -233,6 +233,8 @@ pub struct TerminalPipeline {
     /// Double-buffered instance buffers
     instance_bufs: [Option<wgpu::Buffer>; 2],
     instance_capacity: [usize; 2],
+    /// Staging belt for efficient per-frame buffer uploads without reallocation
+    staging_belt: wgpu::util::StagingBelt,
     /// Reused CPU-side instance storage; avoids reallocating every frame.
     instances: Vec<GlyphInstance>,
     /// Reused per-frame dirty-cell bitmask (row-major), avoiding HashSet alloc.
@@ -662,6 +664,7 @@ impl TerminalPipeline {
             vertex_buf,
             instance_bufs: [None, None],
             instance_capacity: [0, 0],
+            staging_belt: wgpu::util::StagingBelt::new(256 * 1024),
             instances: Vec::with_capacity(4096),
             dirty_mask: Vec::new(),
             last_dirty_cells: 0,
@@ -1342,28 +1345,7 @@ impl TerminalPipeline {
         }
 
         // Upload instance buffer using double buffering.
-        // COPY_SRC not needed; MAP_WRITE enables direct CPU mapping for larger buffers.
-        let buf_idx = self.current_buffer;
-        // Partition instances by mode to avoid GPU branch divergence:
-        // mode=0 (background rects) don't need texture lookup; mode=1 (glyphs) do.
-        // Sorting is O(n) here since instances are mostly pre-grouped by cell.
-        let bg_count = Self::partition_instances_by_mode(&mut instances);
-        let inst_count = instances.len();
-        let inst_bytes = bytemuck::cast_slice::<GlyphInstance, u8>(&instances);
-        if inst_count > self.instance_capacity[buf_idx] {
-            self.instance_bufs[buf_idx] = Some(self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("instance_buf"),
-                    contents: inst_bytes,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                },
-            ));
-            self.instance_capacity[buf_idx] = inst_count;
-        } else if let Some(buf) = &self.instance_bufs[buf_idx] {
-            self.queue.write_buffer(buf, 0, inst_bytes);
-        }
-
-        // Draw
+        // --- Frame acquisition ---
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(e) => {
@@ -1376,11 +1358,13 @@ impl TerminalPipeline {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Create command encoder first — StagingBelt needs it for copy commands
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+
         let bg_color = cached_bg;
         let clear_color = wgpu::Color {
             r: bg_color[0] as f64,
@@ -1388,6 +1372,39 @@ impl TerminalPipeline {
             b: bg_color[2] as f64,
             a: bg_color[3] as f64,
         };
+
+        // Upload instance buffer using double buffering.
+        // Use StagingBelt to avoid per-frame staging buffer allocation that
+        // wgpu's Queue::write_buffer performs internally.
+        let buf_idx = self.current_buffer;
+        let bg_count = Self::partition_instances_by_mode(&mut instances);
+        let inst_count = instances.len();
+
+        if inst_count > self.instance_capacity[buf_idx] {
+            // Buffer too small — recreate via create_buffer_init (one-time copy)
+            let inst_bytes = bytemuck::cast_slice::<GlyphInstance, u8>(&instances);
+            self.instance_bufs[buf_idx] = Some(self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("instance_buf"),
+                    contents: inst_bytes,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                },
+            ));
+            self.instance_capacity[buf_idx] = inst_count;
+        } else if let Some(buf) = &self.instance_bufs[buf_idx] {
+            // Reuse existing buffer — upload via StagingBelt (no reallocation)
+            let inst_bytes = bytemuck::cast_slice::<GlyphInstance, u8>(&instances);
+            let size = wgpu::BufferSize::new(inst_bytes.len() as wgpu::BufferAddress)
+                .expect("inst_bytes len > 0");
+            let mut view = self.staging_belt.write_buffer(
+                &mut encoder,
+                buf,
+                0,
+                size,
+                &self.device,
+            );
+            view.copy_from_slice(inst_bytes);
+        }
 
         if let Some(offscreen_view) = &self.offscreen_view {
             // --- Two-pass path: offscreen render + composite (fallback) ---
@@ -1489,8 +1506,12 @@ impl TerminalPipeline {
 
             self.offscreen_initialized = true;
         }
+        // Finish staging belt uploads, then submit the command encoder.
+        self.staging_belt.finish();
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        // Recall staging belt buffers for reuse next frame (after GPU finishes copy).
+        self.staging_belt.recall();
 
         // Return CPU storage for reuse on the next frame.
         self.instances = instances;
