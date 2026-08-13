@@ -1163,7 +1163,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Compute tab bar height before borrowing tab_manager mutably.
                 let tb_height = self.tab_bar_height();
                 let tb_ref = if tb_height > 0 {
-                    Some(&self.tab_bar)
+                    Some(&mut self.tab_bar)
                 } else {
                     None
                 };

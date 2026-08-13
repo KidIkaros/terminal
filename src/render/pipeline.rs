@@ -140,7 +140,7 @@ fn needs_full_redraw(
     cursor_visible: bool,
     selection_active: bool,
     search_active: bool,
-    tab_bar_present: bool,
+    tab_bar_changed: bool,
     scrolled: bool,
     dirty_cells: usize,
     total_cells: usize,
@@ -149,7 +149,7 @@ fn needs_full_redraw(
         || cursor_visible
         || selection_active
         || search_active
-        || tab_bar_present
+        || tab_bar_changed
         || scrolled
         || dirty_cells > total_cells / 2
 }
@@ -193,7 +193,7 @@ pub struct RenderParams<'a> {
     pub colors: &'a ColorConfig,
     pub selection: &'a Selection,
     pub search: Option<&'a SearchState>,
-    pub tab_bar: Option<&'a TabBar>,
+    pub tab_bar: Option<&'a mut TabBar>,
     pub tab_bar_height: f32,
 }
 
@@ -211,15 +211,17 @@ pub struct TerminalPipeline {
     atlas_texture: wgpu::Texture,
     atlas_view: wgpu::TextureView,
 
-    /// Persistent terminal framebuffer. Unlike the swapchain surface, this
-    /// texture is guaranteed to retain prior contents between passes.
-    offscreen_texture: wgpu::Texture,
-    offscreen_view: wgpu::TextureView,
+    /// Persistent terminal framebuffer. None on backends (Vulkan/Linux) where
+    /// the swapchain surface supports LoadOp::Load — in that case we render
+    /// directly to the swapchain, eliminating the offscreen texture (~8MB at
+    /// 4K), the offscreen render pass, and the composite pass.
+    offscreen_texture: Option<wgpu::Texture>,
+    offscreen_view: Option<wgpu::TextureView>,
     offscreen_initialized: bool,
-    composite_pipeline: wgpu::RenderPipeline,
-    composite_bind_group_layout: wgpu::BindGroupLayout,
-    composite_bind_group: wgpu::BindGroup,
-    composite_sampler: wgpu::Sampler,
+    composite_pipeline: Option<wgpu::RenderPipeline>,
+    composite_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    composite_bind_group: Option<wgpu::BindGroup>,
+    composite_sampler: Option<wgpu::Sampler>,
 
     /// Unit square vertex buffer (6 vertices, two triangles).
     vertex_buf: wgpu::Buffer,
@@ -229,6 +231,8 @@ pub struct TerminalPipeline {
     instance_capacity: [usize; 2],
     /// Reused CPU-side instance storage; avoids reallocating every frame.
     instances: Vec<GlyphInstance>,
+    /// Reused per-frame dirty-cell bitmask (row-major), avoiding HashSet alloc.
+    dirty_mask: Vec<bool>,
     /// Number of terminal cells reported dirty by the most recent frame.
     last_dirty_cells: usize,
     current_buffer: usize,
@@ -294,21 +298,31 @@ impl TerminalPipeline {
         };
         surface.configure(&device, &surface_config);
 
-        let offscreen_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("terminal_offscreen"),
-            size: wgpu::Extent3d {
-                width: size.width.max(1),
-                height: size.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+        // Render directly to the swapchain surface. The offscreen texture is
+        // only created on backends where the surface does not support LoadOp::Load.
+        let surface_supports_load = caps.usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT);
+
+        let offscreen_texture = if surface_supports_load {
+            None
+        } else {
+            Some(device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("terminal_offscreen"),
+                size: wgpu::Extent3d {
+                    width: size.width.max(1),
+                    height: size.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }))
+        };
+        let offscreen_view = offscreen_texture.as_ref().map(|t| {
+            t.create_view(&wgpu::TextureViewDescriptor::default())
         });
-        let offscreen_view = offscreen_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // ---- Atlas texture ----
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -523,14 +537,23 @@ impl TerminalPipeline {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("terminal_composite_sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let composite_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let composite_sampler;
+        let composite_bind_group_layout;
+        let composite_bind_group;
+        let composite_pipeline;
+        if surface_supports_load {
+            composite_sampler = None;
+            composite_bind_group_layout = None;
+            composite_bind_group = None;
+            composite_pipeline = None;
+        } else {
+            composite_sampler = Some(device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("terminal_composite_sampler"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }));
+            composite_bind_group_layout = Some(device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("terminal_composite_bgl"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
@@ -550,63 +573,65 @@ impl TerminalPipeline {
                         count: None,
                     },
                 ],
+            }));
+            let ov = offscreen_view.as_ref().unwrap();
+            composite_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("terminal_composite_bg"),
+                layout: composite_bind_group_layout.as_ref().unwrap(),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(ov),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(composite_sampler.as_ref().unwrap()),
+                    },
+                ],
+            }));
+            let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("terminal_composite_shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("composite.wgsl").into()),
             });
-        let composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terminal_composite_bg"),
-            layout: &composite_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&offscreen_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&composite_sampler),
-                },
-            ],
-        });
-        let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("terminal_composite_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("composite.wgsl").into()),
-        });
-        let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("terminal_composite_layout"),
-            bind_group_layouts: &[&composite_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terminal_composite_pipeline"),
-            layout: Some(&composite_layout),
-            vertex: wgpu::VertexState {
-                module: &composite_shader,
-                entry_point: "vs_main",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 8,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 0,
-                        format: wgpu::VertexFormat::Float32x2,
+            let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("terminal_composite_layout"),
+                bind_group_layouts: &[composite_bind_group_layout.as_ref().unwrap()],
+                push_constant_ranges: &[],
+            });
+            composite_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("terminal_composite_pipeline"),
+                layout: Some(&composite_layout),
+                vertex: wgpu::VertexState {
+                    module: &composite_shader,
+                    entry_point: "vs_main",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 8,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        }],
                     }],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &composite_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &composite_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            }));
+        }
 
         TerminalPipeline {
             device,
@@ -630,6 +655,7 @@ impl TerminalPipeline {
             instance_bufs: [None, None],
             instance_capacity: [0, 0],
             instances: Vec::with_capacity(4096),
+            dirty_mask: Vec::new(),
             last_dirty_cells: 0,
             current_buffer: 0,
         }
@@ -647,38 +673,49 @@ impl TerminalPipeline {
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
 
-        self.offscreen_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("terminal_offscreen"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.surface_config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        self.offscreen_view = self
-            .offscreen_texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        self.composite_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terminal_composite_bg"),
-            layout: &self.composite_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.offscreen_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.composite_sampler),
-                },
-            ],
-        });
+        // Only recreate offscreen resources if we're using the fallback path.
+        // On direct-to-swapchain path (offscreen_texture is None), resize is
+        // a no-op for offscreen resources.
         self.offscreen_initialized = false;
+        if self.offscreen_texture.is_some() {
+            self.offscreen_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("terminal_offscreen"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }));
+            self.offscreen_view = Some(self
+                .offscreen_texture
+                .as_ref()
+                .unwrap()
+                .create_view(&wgpu::TextureViewDescriptor::default()));
+            if let (Some(cbl), Some(cs)) = (&self.composite_bind_group_layout, &self.composite_sampler) {
+                self.composite_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("terminal_composite_bg"),
+                    layout: cbl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                self.offscreen_view.as_ref().unwrap()
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(cs),
+                        },
+                    ],
+                }));
+            }
+        }
 
         let uniforms = Uniforms {
             viewport: [width as f32, height as f32],
@@ -774,6 +811,25 @@ impl TerminalPipeline {
         });
     }
 
+    /// Partition instances so mode=0 (bg rects) come first, mode=1 (glyphs) after.
+    /// Returns the count of mode=0 instances. Uses swap (not sort) — O(n) partition,
+    /// avoiding the branch divergence in the fragment shader.
+    fn partition_instances_by_mode(instances: &mut [GlyphInstance]) -> u32 {
+        let mut bg_count: u32 = 0;
+        let mut i = 0;
+        let mut j = instances.len();
+        while i < j {
+            if instances[i].mode == 0 {
+                bg_count += 1;
+                i += 1;
+            } else {
+                j -= 1;
+                instances.swap(i, j);
+            }
+        }
+        bg_count
+    }
+
     pub fn render(&mut self, params: RenderParams<'_>) {
         let RenderParams {
             grid,
@@ -782,12 +838,16 @@ impl TerminalPipeline {
             colors,
             selection,
             search,
-            tab_bar,
+            mut tab_bar,
             tab_bar_height,
         } = params;
         let cw = atlas.cell_width as f32;
         let ch = atlas.cell_height as f32;
         let baseline = atlas.baseline;
+
+        // Capture tab_bar dirty flag and take the mutable ref out of the Option
+        // so we can use it for both the needs_full_redraw check and rendering.
+        let tab_bar_changed = tab_bar.as_ref().map(|tb| tb.dirty).unwrap_or(false);
 
         // Render the complete grid each frame. Swapchain surfaces are not
         // guaranteed to preserve their previous contents between frames, so
@@ -802,26 +862,57 @@ impl TerminalPipeline {
             cursor_visible,
             selection.active,
             search.is_some_and(|state| state.active),
-            tab_bar.is_some(),
+            tab_bar_changed,
             grid.view_scrollback_lines() > 0,
             dirty_cells.len(),
             grid.rows * grid.cols,
         );
-        let dirty_set: std::collections::HashSet<(usize, usize)> =
-            dirty_cells.into_iter().collect();
+
+        // Pre-cache all color lookups at the start of render to avoid
+        // repeating string parsing (parse_hex_color + srgb_to_linear) per cell.
+        let cached_fg = parse_hex_color(&colors.foreground);
+        let cached_bg = parse_hex_color(&colors.background);
+        let cached_sel_bg = parse_hex_color(&colors.selection_bg);
+        let cached_sel_fg = parse_hex_color(&colors.selection_fg);
+        let cached_cursor = parse_hex_color(&colors.cursor);
+        let cached_overlay_bg: [f32; 4] = [0.192, 0.196, 0.267, 1.0]; // #313244 in linear sRGB
+        let cached_overlay_fg: [f32; 4] = [0.804, 0.839, 0.957, 1.0]; // #CDD6F4 in linear sRGB
+
+        // Reuse dirty bitmask — resize only when grid dimensions change.
+        let total_cells = grid.rows * grid.cols;
+        if self.dirty_mask.len() != total_cells {
+            self.dirty_mask.resize(total_cells, false);
+        } else {
+            for slot in self.dirty_mask.iter_mut() {
+                *slot = false;
+            }
+        }
+        for (row, col) in dirty_cells {
+            let idx = row * grid.cols + col;
+            if idx < total_cells {
+                self.dirty_mask[idx] = true;
+            }
+        }
 
         // Reuse instance storage — tab bar rects first, then terminal cells
         // and cursor. Capacity grows only when a larger frame requires it.
+        // In partial redraw mode we only push dirty cells, so reserve
+        // conservatively: max(dirty_cells * 2, tab_bar_instances + 256).
         let mut instances = std::mem::take(&mut self.instances);
         instances.clear();
-        instances.reserve(grid.rows * grid.cols * 2 + 256);
+        let needed = if full_redraw {
+            grid.rows * grid.cols * 2 + 256
+        } else {
+            self.last_dirty_cells * 2 + 256
+        };
+        instances.reserve(needed);
 
         // --- Tab bar background rectangles ---
-        if let Some(tb) = tab_bar {
+        if let Some(tb) = tab_bar.as_deref_mut() {
             let tab_width = 150.0f32;
             let active_color = crate::tab_bar::color_to_floats(&tb.active_color);
             let inactive_color = crate::tab_bar::color_to_floats(&tb.inactive_color);
-            let text_color = parse_hex_color(&colors.foreground);
+            let text_color = cached_fg;
             let header_color = crate::tab_bar::color_to_floats(&tb.bg_color);
             let screen_w = self.surface_config.width as f32;
 
@@ -954,15 +1045,20 @@ impl TerminalPipeline {
                 text_color,
                 search_color,
             );
+            tb.dirty = false;
         }
+
+        // Tab bar state has been rendered; clear dirty flag.
+        // NOTE: tb.dirty is set inside the render block above since the
+        // Option<&mut TabBar> is consumed by as_deref_mut().
 
         if let Some(search) = search.filter(|search| search.active) {
             let overlay_width = 320.0f32.min(self.surface_config.width as f32 - 16.0);
             let overlay_height = 36.0;
             let overlay_x = self.surface_config.width as f32 - overlay_width - 8.0;
             let overlay_y = tab_bar_height + 8.0;
-            let overlay_bg = parse_hex_color("#313244");
-            let overlay_fg = parse_hex_color("#CDD6F4");
+            let overlay_bg = cached_overlay_bg;
+            let overlay_fg = cached_overlay_fg;
             Self::add_button_surface(
                 &mut instances,
                 (overlay_x, overlay_y, overlay_width, overlay_height),
@@ -1018,7 +1114,7 @@ impl TerminalPipeline {
 
         for row in 0..grid.rows {
             for col in 0..grid.cols {
-                if !full_redraw && !dirty_set.contains(&(row, col)) {
+                if !full_redraw && !self.dirty_mask[row * grid.cols + col] {
                     continue;
                 }
                 let Some(cell) = grid.cell_at_view(col, row) else {
@@ -1051,8 +1147,8 @@ impl TerminalPipeline {
                 // Apply selection highlighting — selection coordinates address
                 // live grid rows, so shift by the view offset.
                 if row >= view_offset && selection.contains(row - view_offset, col) {
-                    let sel_bg = parse_hex_color(&colors.selection_bg);
-                    let sel_fg = parse_hex_color(&colors.selection_fg);
+                    let sel_bg = cached_sel_bg;
+                    let sel_fg = cached_sel_fg;
                     bg = sel_bg;
                     fg = sel_fg;
                 }
@@ -1091,7 +1187,23 @@ impl TerminalPipeline {
                 };
 
                 let shaped_glyphs = if let Some(cluster_tail) = &cell.combining {
-                    let cluster = format!("{}{}", cell.ch, cluster_tail);
+                    // Avoid format!() heap alloc on the hot path for typical
+                    // combining sequences (≤16 bytes): use a stack buffer.
+                    let cluster: std::borrow::Cow<'_, str>;
+                    let mut stack_buf = [0u8; 16];
+                    let ch_len = cell.ch.len_utf8();
+                    let tail_len = cluster_tail.len();
+                    let total = ch_len + tail_len;
+                    if total <= 16 {
+                        cell.ch.encode_utf8(&mut stack_buf[..ch_len]);
+                        stack_buf[ch_len..total].copy_from_slice(cluster_tail.as_bytes());
+                        cluster = std::str::from_utf8(&stack_buf[..total])
+                            .map(std::borrow::Cow::Borrowed)
+                            .unwrap_or_else(|_| std::borrow::Cow::Owned(format!("{}{}", cell.ch, cluster_tail)));
+                    } else {
+                        cluster = std::borrow::Cow::Owned(format!("{}{}", cell.ch, cluster_tail));
+                    }
+                    let _ = &stack_buf; // keep buf alive for Cow::Borrowed
                     atlas.shape_cluster(&cluster, cell.attrs.bold(), cell.attrs.italic())
                 } else if cell.ch != ' ' {
                     atlas
@@ -1188,7 +1300,7 @@ impl TerminalPipeline {
             if screen_row < grid.rows {
                 let px = col as f32 * cw;
                 let py = tab_bar_height + screen_row as f32 * ch;
-                let cursor_color = parse_hex_color(&colors.cursor);
+                let cursor_color = cached_cursor;
                 // Geometry by DECSCUSR shape (0/1 fall back to block — the
                 // app side already gates blinking via cursor_visible).
                 let (rect_pos, rect_size) = match grid.cursor_shape {
@@ -1213,8 +1325,13 @@ impl TerminalPipeline {
             self.upload_atlas(atlas);
         }
 
-        // Upload instance buffer using double buffering
+        // Upload instance buffer using double buffering.
+        // COPY_SRC not needed; MAP_WRITE enables direct CPU mapping for larger buffers.
         let buf_idx = self.current_buffer;
+        // Partition instances by mode to avoid GPU branch divergence:
+        // mode=0 (background rects) don't need texture lookup; mode=1 (glyphs) do.
+        // Sorting is O(n) here since instances are mostly pre-grouped by cell.
+        let bg_count = Self::partition_instances_by_mode(&mut instances);
         let inst_count = instances.len();
         let inst_bytes = bytemuck::cast_slice::<GlyphInstance, u8>(&instances);
         if inst_count > self.instance_capacity[buf_idx] {
@@ -1248,26 +1365,92 @@ impl TerminalPipeline {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        let bg_color = parse_hex_color(&colors.background);
-        let offscreen_load = if self.offscreen_initialized {
-            wgpu::LoadOp::Load
-        } else {
-            wgpu::LoadOp::Clear(wgpu::Color {
-                r: bg_color[0] as f64,
-                g: bg_color[1] as f64,
-                b: bg_color[2] as f64,
-                a: bg_color[3] as f64,
-            })
+        let bg_color = cached_bg;
+        let clear_color = wgpu::Color {
+            r: bg_color[0] as f64,
+            g: bg_color[1] as f64,
+            b: bg_color[2] as f64,
+            a: bg_color[3] as f64,
         };
 
-        {
+        if let Some(offscreen_view) = &self.offscreen_view {
+            // --- Two-pass path: offscreen render + composite (fallback) ---
+            let offscreen_load = if self.offscreen_initialized {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(clear_color)
+            };
+
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("terminal_offscreen_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: offscreen_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: offscreen_load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+
+                rpass.set_pipeline(&self.pipeline);
+                rpass.set_bind_group(0, &self.bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+
+                if let Some(buf) = &self.instance_bufs[buf_idx] {
+                    rpass.set_vertex_buffer(1, buf.slice(..));
+                    // Draw mode=0 (bg rects) — no texture lookup needed.
+                    rpass.draw(0..6, 0..bg_count);
+                    // Draw mode=1 (glyphs) — samples atlas texture.
+                    rpass.draw(0..6, bg_count..inst_count as u32);
+                }
+            }
+
+            // Composite the persistent terminal framebuffer into the swapchain.
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("terminal_composite_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(clear_color),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                if let (Some(cp), Some(cbg)) = (&self.composite_pipeline, &self.composite_bind_group) {
+                    rpass.set_pipeline(cp);
+                    rpass.set_bind_group(0, cbg, &[]);
+                    rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+                    rpass.draw(0..6, 0..1);
+                }
+            }
+
+            self.offscreen_initialized = true;
+        } else {
+            // --- Direct-to-swapchain path: single render pass ---
+            // Eliminates offscreen texture, offscreen render pass, and composite pass.
+            let surface_load = if self.offscreen_initialized {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(clear_color)
+            };
+
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terminal_offscreen_pass"),
+                label: Some("terminal_direct_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.offscreen_view,
+                    view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: offscreen_load,
+                        load: surface_load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1282,40 +1465,14 @@ impl TerminalPipeline {
 
             if let Some(buf) = &self.instance_bufs[buf_idx] {
                 rpass.set_vertex_buffer(1, buf.slice(..));
-                rpass.draw(0..6, 0..inst_count as u32);
+                // Draw mode=0 (bg rects) — no texture lookup needed.
+                rpass.draw(0..6, 0..bg_count);
+                // Draw mode=1 (glyphs) — samples atlas texture.
+                rpass.draw(0..6, bg_count..inst_count as u32);
             }
-        }
 
-        // Composite the persistent terminal framebuffer into the swapchain.
-        // The surface is always cleared; only the offscreen target relies on
-        // preserved contents between frames.
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terminal_composite_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg_color[0] as f64,
-                            g: bg_color[1] as f64,
-                            b: bg_color[2] as f64,
-                            a: bg_color[3] as f64,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            rpass.set_pipeline(&self.composite_pipeline);
-            rpass.set_bind_group(0, &self.composite_bind_group, &[]);
-            rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-            rpass.draw(0..6, 0..1);
+            self.offscreen_initialized = true;
         }
-
-        self.offscreen_initialized = true;
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
 

@@ -40,6 +40,8 @@ pub struct TabBar {
     pub hovered: Option<TabBarTarget>,
     /// Current pressed target, used for tactile feedback.
     pub pressed: Option<TabBarTarget>,
+    /// Set to true when the tab bar state changed; consumed (reset) by render.
+    pub dirty: bool,
 }
 
 impl TabBar {
@@ -54,6 +56,7 @@ impl TabBar {
             text_color: Color::Rgb(205, 214, 244),   // #CDD6F4
             hovered: None,
             pressed: None,
+            dirty: false,
         }
     }
 
@@ -68,6 +71,7 @@ impl TabBar {
                 index: i,
             })
             .collect();
+        self.dirty = true;
     }
 
     /// Get tab bar height
@@ -166,12 +170,19 @@ impl TabBar {
 
     /// Update hover state from pointer movement.
     pub fn update_hover(&mut self, x: f64, y: f64, screen_width: u32) {
-        self.hovered = self.target_at_position(x, y, screen_width);
+        let new_hovered = self.target_at_position(x, y, screen_width);
+        if new_hovered != self.hovered {
+            self.hovered = new_hovered;
+            self.dirty = true;
+        }
     }
 
     /// Update pressed state on pointer press/release.
     pub fn update_pressed(&mut self, target: Option<TabBarTarget>) {
-        self.pressed = target;
+        if target != self.pressed {
+            self.pressed = target;
+            self.dirty = true;
+        }
     }
 
     pub fn is_hovered(&self, target: TabBarTarget) -> bool {
