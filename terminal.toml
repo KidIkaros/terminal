@@ -22,7 +22,6 @@ decorations = true
 always_on_top = false
 vsync = true
 blur = false
-rounded_corners = false
 
 [colors]
 # Use a built-in theme name or customize colors directly.

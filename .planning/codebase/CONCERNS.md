@@ -37,14 +37,22 @@ The following items from the 2026-08-10 audit are no longer concerns:
   (plain drag = char, Alt+drag = block, Shift+drag = line).
 - **Smooth scrollback** — fractional-line scroll animation instead of row jumps.
 - **Kitty graphics protocol** — `ESC _ G` with raw RGB (`f=24`) / RGBA (`f=32`)
-  and chunked `m=1`/`m=0` transfers; images reuse the sixel placement path.
+  / PNG (`f=100`) and chunked `m=1`/`m=0` transfers; images reuse the sixel
+  placement path. Image-id round-trips (`a=t`/`a=p`/`a=d`/`a=q`) let caching
+  tools (ranger, image.nvim) store, re-place, query and delete images.
+- **Inline video playback** — opt-in `--features video`: `terminal --video
+  clip.mp4` decodes on a background thread via the `asciline` library and
+  renders frames through the kitty-graphics pipeline (letterboxed, real-time
+  paced).
 
 ## Remaining tech debt / gaps
 
-- **Kitty graphics PNG (`f=100`) is not decoded.** A PNG decoder dependency
-  (`png`/`image`) is needed; raw RGB/RGBA covers `chafa`/`timg` but not
-  `kitten icat`. File/shared-memory transmission (`t=f`/`t=s`) and image-id
-  round-trips (`a=t`/`a=p`/`a=d`) are also deferred.
+- **Kitty graphics file/shared-memory transmission** (`t=f`/`t=s`) and
+  animation (`a=f`) are not implemented — only direct (`t=d`) data. Covers
+  `chafa`/`timg`/`kitten icat` (PNG is decoded), but not file-backed transfers.
+- **Inline video is opt-in and ffmpeg-bound.** The `video` feature pulls in
+  asciline's dependency tree (tokio/axum/rayon/…) and requires ffmpeg/ffprobe
+  on PATH at runtime; the default build stays lean.
 - **Cluster shaping uses the primary face only.** `shape_cluster` shapes
   combining clusters against the primary font bytes; bold/italic/fallback
   variants are not shaped. Acceptable for monospace terminals.

@@ -20,7 +20,10 @@
 - VT completeness: 34/34 conformance cases (DECSLRM, DECSCA, DECCOLM, DECSTR,
   DECIC/DECDC, DECFRA/DECERA, CHT/CBT, sixel, OSC 8/9/52, …)
 - Sixel graphics + cross-validation against `chafa`
-- Kitty graphics protocol (`ESC G`): raw RGB/RGBA with chunked transfer (PNG deferred)
+- Kitty graphics protocol (`ESC G`): raw RGB/RGBA/PNG with chunked transfer +
+  image-id round-trips (`a=t`/`a=p`/`a=d`/`a=q`)
+- Inline video playback (opt-in `--features video`): asciline decoder on a
+  background thread, frames render via the kitty-graphics path (`--video FILE`)
 - Padding + window opacity, double/triple-click selection, config hot-reload
   (SIGHUP), italic synthesis, smooth scrollback animation
 - Performance: ~48 MiB/s headless parse, bounded PTY drain, dirty-cell tracking,
@@ -30,7 +33,7 @@
 ## Remaining (see CONCERNS.md for details)
 
 - [ ] Multi-page glyph atlas for full CJK/emoji coverage
-- [ ] Kitty graphics PNG (`f=100`) decoding; file/shared-memory transmission
+- [ ] Kitty graphics file/shared-memory transmission (`t=f`/`t=s`); animation
 - [ ] Parse thread / grid snapshot (only if profiling shows frame hitches)
 
 ---

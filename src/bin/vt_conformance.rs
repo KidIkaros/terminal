@@ -120,6 +120,43 @@ fn kitty_keyboard_protocol() -> Result<(), String> {
     expect(grid.kitty_flags == 0, "pop did not restore flags")
 }
 
+fn kitty_graphics_roundtrip() -> Result<(), String> {
+    use base64::Engine as _;
+    let mut grid = Grid::new(WinSize { cols: 40, rows: 12 }, 32);
+    // Transmit-only (a=t) stores under id 5 and replies OK; no display.
+    let raw = [255u8, 0, 0, 255];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+    feed(
+        &mut grid,
+        format!("\x1b_Ga=t,i=5,f=32,s=1,v=1;{b64}\x1b\\").as_bytes(),
+    );
+    expect(grid.sixel_images.is_empty(), "a=t must not display")?;
+    expect(
+        grid.take_responses() == vec![b"\x1b_Gi=5;OK\x1b\\".to_vec()],
+        "a=t OK reply mismatch",
+    )?;
+    // Put (a=p) displays the stored image and replies OK.
+    feed(&mut grid, b"\x1b_Ga=p,i=5;\x1b\\");
+    expect(grid.sixel_images.len() == 1, "a=p did not display")?;
+    expect(
+        grid.sixel_images[0].image_id == 5,
+        "placement image_id mismatch",
+    )?;
+    expect(
+        grid.take_responses() == vec![b"\x1b_Gi=5;OK\x1b\\".to_vec()],
+        "a=p OK reply mismatch",
+    )?;
+    // Unknown put replies ENOENT.
+    feed(&mut grid, b"\x1b_Ga=p,i=999;\x1b\\");
+    expect(
+        grid.take_responses() == vec![b"\x1b_Gi=999;ENOENT:no such image\x1b\\".to_vec()],
+        "a=p ENOENT reply mismatch",
+    )?;
+    // Delete evicts the image and its placement.
+    feed(&mut grid, b"\x1b_Ga=d,d=I,i=5;\x1b\\");
+    expect(grid.sixel_images.is_empty(), "a=d did not evict placement")
+}
+
 fn osc_and_limits() -> Result<(), String> {
     let mut grid = Grid::new(WinSize { cols: 12, rows: 3 }, 32);
     let mut input = b"\x1b]2;headless-title\x07".to_vec();
@@ -718,6 +755,10 @@ fn cases() -> Vec<Case> {
         Case {
             name: "kitty_keyboard_protocol",
             run: kitty_keyboard_protocol,
+        },
+        Case {
+            name: "kitty_graphics_roundtrip",
+            run: kitty_graphics_roundtrip,
         },
     ]
 }

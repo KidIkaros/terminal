@@ -184,13 +184,10 @@ pub struct WindowConfig {
     #[serde(default = "default_true")]
     pub vsync: bool,
 
-    /// Background blur (Linux Wayland only).
+    /// Background blur behind translucent windows (Wayland/macOS; no-op on
+    /// X11).
     #[serde(default)]
     pub blur: bool,
-
-    /// Rounded corners.
-    #[serde(default)]
-    pub rounded_corners: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -416,7 +413,6 @@ impl Default for WindowConfig {
             always_on_top: false,
             vsync: true,
             blur: false,
-            rounded_corners: false,
         }
     }
 }

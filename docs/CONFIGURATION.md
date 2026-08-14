@@ -44,6 +44,8 @@ padding = 0               # Window padding in pixels
 opacity = 1.0             # Window opacity (0.0 - 1.0)
 decorations = true        # Show window decorations
 always_on_top = false     # Keep window on top
+vsync = true              # Vertical sync
+blur = false              # Background blur (Wayland/macOS; no-op on X11)
 ```
 
 ### Options
@@ -57,6 +59,8 @@ always_on_top = false     # Keep window on top
 | `opacity` | float | `1.0` | Window opacity (0.0 = transparent, 1.0 = opaque) |
 | `decorations` | bool | `true` | Show window title bar and borders |
 | `always_on_top` | bool | `false` | Keep window above other windows |
+| `vsync` | bool | `true` | Vertical sync (screen-tearing vs. latency) |
+| `blur` | bool | `false` | Background blur behind translucent windows (Wayland/macOS; no-op on X11) |
 
 ## Color Configuration
 

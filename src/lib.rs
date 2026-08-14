@@ -18,5 +18,8 @@ pub mod tab_bar;
 pub mod tabs;
 pub mod theme;
 
+#[cfg(feature = "video")]
+pub mod video;
+
 #[cfg(test)]
 mod integration_tests;

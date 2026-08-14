@@ -262,6 +262,11 @@ pub struct TerminalPipeline {
     sixel_bind_group_layout: wgpu::BindGroupLayout,
     sixel_images: Vec<SixelGpuImage>,
     sixel_sampler: wgpu::Sampler,
+
+    /// Inline video frame (feature `video`), re-uploaded when its version
+    /// changes. Drawn fullscreen over the terminal content.
+    video_image: Option<SixelGpuImage>,
+    video_version: u64,
 }
 
 /// A decoded sixel image uploaded to the GPU, ready to draw. Positions are
@@ -827,6 +832,8 @@ impl TerminalPipeline {
             sixel_pipeline,
             sixel_bind_group_layout,
             sixel_images: Vec::new(),
+            video_image: None,
+            video_version: 0,
             sixel_sampler,
         }
     }
@@ -1073,6 +1080,147 @@ impl TerminalPipeline {
         }
     }
 
+    /// Upload (or clear) the inline video frame texture. Re-uploads only when
+    /// `grid.video_frame_version` changes, so steady frames are free.
+    fn upload_video_frame(&mut self, grid: &Grid) {
+        let Some(frame) = &grid.video_frame else {
+            self.video_image = None;
+            self.video_version = 0;
+            return;
+        };
+        if self.video_version == grid.video_frame_version && self.video_image.is_some() {
+            return;
+        }
+        self.video_version = grid.video_frame_version;
+        let w = frame.width.max(1);
+        let h = frame.height.max(1);
+
+        // Reuse the existing texture when the size matches; recreate otherwise.
+        if let Some(img) = &self.video_image {
+            if img.pixel_w == w && img.pixel_h == h {
+                self.queue.write_texture(
+                    img.texture.as_image_copy(),
+                    &frame.rgba,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                return;
+            }
+        }
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("video_frame_texture"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            &frame.rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("video_frame_bg"),
+            layout: &self.sixel_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sixel_sampler),
+                },
+            ],
+        });
+        let instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("video_frame_instance_buf"),
+            size: std::mem::size_of::<GlyphInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.video_image = Some(SixelGpuImage {
+            texture,
+            view,
+            bind_group,
+            instance_buf,
+            id: u64::MAX,
+            pixel_w: w,
+            pixel_h: h,
+        });
+    }
+
+    /// Draw the inline video frame fullscreen over the terminal content.
+    fn draw_video_frame(
+        &mut self,
+        rpass: &mut wgpu::RenderPass<'_>,
+        cw: f32,
+        ch: f32,
+        tab_bar_height: f32,
+        pad: f32,
+        grid: &Grid,
+    ) {
+        let Some(img) = &self.video_image else { return };
+        if grid.video_frame.is_none() {
+            return;
+        }
+        // Center the frame (its native pixel size) in the cell-grid area,
+        // letterboxing to preserve the source aspect ratio.
+        let vw = img.pixel_w as f32;
+        let vh = img.pixel_h as f32;
+        let area_w = grid.cols as f32 * cw;
+        let area_h = grid.rows as f32 * ch;
+        let instance = GlyphInstance {
+            cell_pos: [
+                pad + (area_w - vw) / 2.0,
+                tab_bar_height + pad + (area_h - vh) / 2.0,
+            ],
+            cell_size: [vw, vh],
+            atlas_uv_min: [0.0, 0.0],
+            atlas_uv_max: [1.0, 1.0],
+            fg_color: [1.0, 1.0, 1.0, 1.0],
+            bg_color: [0.0, 0.0, 0.0, 0.0],
+            mode: 0,
+            _pad: [0; 3],
+        };
+        self.queue
+            .write_buffer(&img.instance_buf, 0, bytemuck::bytes_of(&instance));
+        rpass.set_bind_group(0, &img.bind_group, &[]);
+        rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+        rpass.set_vertex_buffer(1, img.instance_buf.slice(..));
+        rpass.draw(0..6, 0..1);
+    }
+
     // -----------------------------------------------------------------------
     // Render frame
     // -----------------------------------------------------------------------
@@ -1189,8 +1337,10 @@ impl TerminalPipeline {
         // Keep the damage count for profiling and drive the guarded persistent
         // target path. UI overlays, selection, scrollback, cursor visibility,
         // and large damage regions use a correctness-first full redraw.
-        // Upload any sixel images the grid decoded since the last frame.
+        // Upload any sixel images the grid decoded since the last frame, and
+        // the inline video frame (re-uploaded only when its version changes).
         self.upload_sixel_images(grid);
+        self.upload_video_frame(grid);
 
         let dirty_cells = grid.take_dirty_cells();
         self.last_dirty_cells = dirty_cells.len();
@@ -1813,6 +1963,7 @@ impl TerminalPipeline {
                 });
                 rpass.set_pipeline(&self.sixel_pipeline);
                 self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, pad, grid);
+                self.draw_video_frame(&mut rpass, cw, ch, tab_bar_height, pad, grid);
             }
 
             // Composite the persistent terminal framebuffer into the swapchain.
@@ -1851,31 +2002,35 @@ impl TerminalPipeline {
                 wgpu::LoadOp::Clear(clear_color)
             };
 
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terminal_direct_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: surface_load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+            // Scope the pass so `rpass` drops before the sixel pass begins
+            // (an encoder may only have one live render pass at a time).
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("terminal_direct_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: surface_load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
 
-            rpass.set_pipeline(&self.pipeline);
-            rpass.set_bind_group(0, &self.bind_group, &[]);
-            rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+                rpass.set_pipeline(&self.pipeline);
+                rpass.set_bind_group(0, &self.bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
 
-            if let Some(buf) = &self.instance_bufs[buf_idx] {
-                rpass.set_vertex_buffer(1, buf.slice(..));
-                // Draw mode=0 (bg rects) — no texture lookup needed.
-                rpass.draw(0..6, 0..bg_count);
-                // Draw mode=1 (glyphs) — samples atlas texture.
-                rpass.draw(0..6, bg_count..inst_count as u32);
+                if let Some(buf) = &self.instance_bufs[buf_idx] {
+                    rpass.set_vertex_buffer(1, buf.slice(..));
+                    // Draw mode=0 (bg rects) — no texture lookup needed.
+                    rpass.draw(0..6, 0..bg_count);
+                    // Draw mode=1 (glyphs) — samples atlas texture.
+                    rpass.draw(0..6, bg_count..inst_count as u32);
+                }
             }
 
             // Sixel images over the terminal content.
@@ -1896,6 +2051,7 @@ impl TerminalPipeline {
                 });
                 rpass.set_pipeline(&self.sixel_pipeline);
                 self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, pad, grid);
+                self.draw_video_frame(&mut rpass, cw, ch, tab_bar_height, pad, grid);
             }
 
             self.offscreen_initialized = true;

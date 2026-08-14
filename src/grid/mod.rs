@@ -629,10 +629,26 @@ pub struct Grid {
     dcs_sixel: bool,
     /// In-progress kitty graphics transmission (chunked `m=1`).
     kitty_gfx: Option<KittyGfxPending>,
+    /// Images transmitted but not yet (or already) displayed, keyed by the
+    /// client-assigned `i=<id>` (kitty graphics `a=t`).
+    kitty_images: Vec<KittyImage>,
+    /// Inline video frame (feature `video`), drawn by the renderer over the
+    /// terminal content. `None` when no video is playing.
+    pub video_frame: Option<crate::sixel::SixelImage>,
+    /// Monotonic version, bumped whenever `video_frame` changes, so the
+    /// renderer can re-upload the texture only when a new frame arrives.
+    pub video_frame_version: u64,
     /// Cell size in pixels (set by the app after font load; used for the
     /// post-image cursor advance).
     pub cell_w: u32,
     pub cell_h: u32,
+}
+
+/// A stored kitty graphics image awaiting display (`a=t`, then `a=p`).
+struct KittyImage {
+    /// Client-assigned image id (`i=<id>`, 1..=u32::MAX).
+    id: u32,
+    image: crate::sixel::SixelImage,
 }
 
 /// In-progress kitty graphics (APC `G`) transmission. Chunked transfers
@@ -643,6 +659,11 @@ struct KittyGfxPending {
     format: u32,
     width: u32,
     height: u32,
+    /// Client-assigned image id (`i=<id>`), 0 when none.
+    image_id: u32,
+    /// True for `a=t` (transmit + store + respond), false for `a=T`
+    /// (transmit + display immediately).
+    transmit_only: bool,
     /// Accumulated base64 payload (decoded at finalize).
     data: Vec<u8>,
 }
@@ -656,6 +677,21 @@ fn parse_ascii_u32(bytes: &[u8]) -> u32 {
             acc
         }
     })
+}
+
+/// Decode a PNG payload into `(width, height, RGBA8)` pixels. The
+/// transformations expand palette/grayscale to RGB, add an alpha channel, and
+/// strip 16-bit depth so the output is always straight RGBA8.
+fn decode_png_rgba(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(bytes);
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let rgba = buf[..info.buffer_size()].to_vec();
+    Some((info.width, info.height, rgba))
 }
 
 /// Default horizontal tab stops: every 8 columns (VT100 power-up state).
@@ -830,6 +866,9 @@ impl Grid {
             sixel_images: Vec::new(),
             dcs_sixel: false,
             kitty_gfx: None,
+            kitty_images: Vec::new(),
+            video_frame: None,
+            video_frame_version: 0,
             cell_w: 8,
             cell_h: 16,
             clipboard_query_requested: false,
@@ -955,6 +994,7 @@ impl Grid {
             col,
             row,
             image,
+            image_id: 0,
         });
         // Keep the placement list within the renderer's GPU texture budget
         // (oldest evicted first — a refcount/free, no per-cell work).
@@ -983,6 +1023,8 @@ impl Grid {
         let mut format = 32u32;
         let mut width = 0u32;
         let mut height = 0u32;
+        let mut image_id = 0u32;
+        let mut delete = 0u8;
         let mut more_chunks = false;
         for kv in control.split(|&b| b == b',') {
             let Some(eq) = kv.iter().position(|&b| b == b'=') else {
@@ -994,78 +1036,77 @@ impl Grid {
                 b"f" => format = parse_ascii_u32(v),
                 b"s" => width = parse_ascii_u32(v),
                 b"v" => height = parse_ascii_u32(v),
+                b"i" => image_id = parse_ascii_u32(v),
+                b"d" => delete = v.first().copied().unwrap_or(0),
                 b"m" => more_chunks = parse_ascii_u32(v) == 1,
                 _ => {}
             }
         }
 
-        // `a=T` starts a new transmission; continuation chunks carry only
-        // `m=`. Only transmit-and-place is implemented (a=t/a=C/a=d/a=q are
-        // ignored for now).
-        if action == b'T' {
-            self.kitty_gfx = Some(KittyGfxPending {
-                format,
-                width,
-                height,
-                data: payload.to_vec(),
-            });
-            if !more_chunks {
-                let done = self.kitty_gfx.take().expect("pending");
-                self.finalize_kitty(done);
+        match action {
+            // Transmit: `a=T` displays immediately, `a=t` stores under the
+            // client id and replies OK (the caching flow used by ranger,
+            // image.nvim, etc.).
+            b'T' | b't' => {
+                self.kitty_gfx = Some(KittyGfxPending {
+                    format,
+                    width,
+                    height,
+                    image_id,
+                    transmit_only: action == b't',
+                    data: payload.to_vec(),
+                });
+                if !more_chunks {
+                    let done = self.kitty_gfx.take().expect("pending");
+                    self.finalize_kitty(done);
+                }
             }
-        } else if self.kitty_gfx.is_some() {
-            let pending = self.kitty_gfx.as_mut().expect("checked");
-            pending.data.extend_from_slice(payload);
-            if !more_chunks {
-                let done = self.kitty_gfx.take().expect("pending");
-                self.finalize_kitty(done);
+            // Put: display a previously transmitted image at the cursor.
+            b'p' => self.place_kitty_image(image_id),
+            // Query (test-load, do not store). Direct transmission is always
+            // accepted, so acknowledge unconditionally.
+            b'q' => self.respond_kitty(image_id, true),
+            // Delete: `d=A` clears everything, otherwise delete `i=<id>`.
+            b'd' => {
+                if delete == b'A' {
+                    self.sixel_images.clear();
+                    self.kitty_images.clear();
+                    self.mark_all_dirty();
+                } else {
+                    self.delete_kitty_image(image_id);
+                }
+            }
+            // Continuation chunk (carries only `m=`) or unknown action.
+            _ => {
+                if self.kitty_gfx.is_some() {
+                    let pending = self.kitty_gfx.as_mut().expect("checked");
+                    pending.data.extend_from_slice(payload);
+                    if !more_chunks {
+                        let done = self.kitty_gfx.take().expect("pending");
+                        self.finalize_kitty(done);
+                    }
+                }
             }
         }
     }
 
-    /// Decode a completed kitty graphics transmission and place it at the
-    /// cursor (reusing the sixel placement/render path).
-    fn finalize_kitty(&mut self, pending: KittyGfxPending) {
-        use base64::Engine as _;
-        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&pending.data) else {
-            log::debug!("Kitty graphics: base64 decode failed");
-            return;
-        };
-        let rgba = match pending.format {
-            24 => {
-                // RGB24 (3 bytes/px) → RGBA8, opaque alpha.
-                let mut out =
-                    Vec::with_capacity(pending.width as usize * pending.height as usize * 4);
-                for chunk in raw.chunks_exact(3) {
-                    out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
-                }
-                out
-            }
-            32 => raw, // RGBA8 (4 bytes/px) — the default, stored as-is.
-            100 => {
-                // PNG requires a decoder dependency; deferred for now.
-                log::debug!("Kitty graphics: PNG (f=100) not yet supported");
-                return;
-            }
-            other => {
-                log::debug!("Kitty graphics: unsupported format {other}");
-                return;
-            }
-        };
-        let expected = pending.width as usize * pending.height as usize * 4;
-        if rgba.len() != expected {
-            log::debug!(
-                "Kitty graphics: size mismatch ({} vs {expected})",
-                rgba.len()
-            );
-            return;
-        }
+    /// Queue a kitty graphics acknowledgement: `ESC _ G i=<id>;OK ST` on
+    /// success, `...;ENOENT:<msg>` on failure.
+    fn respond_kitty(&mut self, image_id: u32, ok: bool) {
+        let status = if ok { "OK" } else { "ENOENT:no such image" };
+        let reply = format!("\x1b_Gi={image_id};{status}\x1b\\");
+        self.respond(reply.as_bytes());
+    }
 
-        let image = crate::sixel::SixelImage {
-            width: pending.width,
-            height: pending.height,
-            rgba,
+    /// Display a previously transmitted kitty image (`a=p,i=<id>`) at the
+    /// cursor, cloning the stored pixels into a fresh placement.
+    fn place_kitty_image(&mut self, image_id: u32) {
+        let Some(stored) = self.kitty_images.iter().find(|k| k.id == image_id) else {
+            log::debug!("Kitty graphics: put for unknown id {image_id}");
+            self.respond_kitty(image_id, false);
+            return;
         };
+        let image = stored.image.clone();
         let col = self.cursor.col;
         let row = self.cursor.row;
         let id = self.next_sixel_id;
@@ -1075,6 +1116,113 @@ impl Grid {
             col,
             row,
             image,
+            image_id,
+        });
+        while self.sixel_images.len() > crate::sixel::MAX_LIVE_SIXELS {
+            self.sixel_images.remove(0);
+        }
+        self.mark_all_dirty();
+        self.respond_kitty(image_id, true);
+        log::debug!("Kitty graphics: placed stored image #{id} at ({col},{row})");
+    }
+
+    /// Delete a stored kitty image and any placements that came from it
+    /// (`a=d,i=<id>`).
+    fn delete_kitty_image(&mut self, image_id: u32) {
+        self.kitty_images.retain(|k| k.id != image_id);
+        self.sixel_images.retain(|p| p.image_id != image_id);
+        self.mark_all_dirty();
+    }
+
+    /// Decode a completed kitty graphics transmission, then either store it
+    /// under its client id (`a=t`) or place it at the cursor (`a=T`). Both
+    /// reuse the sixel placement/render path.
+    fn finalize_kitty(&mut self, pending: KittyGfxPending) {
+        use base64::Engine as _;
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&pending.data) else {
+            log::debug!("Kitty graphics: base64 decode failed");
+            if pending.transmit_only {
+                self.respond_kitty(pending.image_id, false);
+            }
+            return;
+        };
+        let (width, height, rgba) = match pending.format {
+            24 => {
+                // RGB24 (3 bytes/px) → RGBA8, opaque alpha.
+                let mut out =
+                    Vec::with_capacity(pending.width as usize * pending.height as usize * 4);
+                for chunk in raw.chunks_exact(3) {
+                    out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+                }
+                (pending.width, pending.height, out)
+            }
+            32 => (pending.width, pending.height, raw), // RGBA8 — the default.
+            100 => match decode_png_rgba(&raw) {
+                Some(decoded) => decoded,
+                None => {
+                    log::debug!("Kitty graphics: PNG (f=100) decode failed");
+                    if pending.transmit_only {
+                        self.respond_kitty(pending.image_id, false);
+                    }
+                    return;
+                }
+            },
+            other => {
+                log::debug!("Kitty graphics: unsupported format {other}");
+                if pending.transmit_only {
+                    self.respond_kitty(pending.image_id, false);
+                }
+                return;
+            }
+        };
+        let expected = width as usize * height as usize * 4;
+        if rgba.len() != expected {
+            log::debug!(
+                "Kitty graphics: size mismatch ({} vs {expected})",
+                rgba.len()
+            );
+            if pending.transmit_only {
+                self.respond_kitty(pending.image_id, false);
+            }
+            return;
+        }
+
+        let image = crate::sixel::SixelImage {
+            width,
+            height,
+            rgba,
+        };
+
+        if pending.transmit_only {
+            // Store under the client id (replacing any prior image with the
+            // same id) and acknowledge; no display.
+            if let Some(existing) = self
+                .kitty_images
+                .iter_mut()
+                .find(|k| k.id == pending.image_id)
+            {
+                existing.image = image;
+            } else {
+                self.kitty_images.push(KittyImage {
+                    id: pending.image_id,
+                    image,
+                });
+            }
+            self.respond_kitty(pending.image_id, true);
+            return;
+        }
+
+        // `a=T`: place at the cursor.
+        let col = self.cursor.col;
+        let row = self.cursor.row;
+        let id = self.next_sixel_id;
+        self.next_sixel_id = self.next_sixel_id.wrapping_add(1);
+        self.sixel_images.push(crate::sixel::SixelPlacement {
+            id,
+            col,
+            row,
+            image,
+            image_id: pending.image_id,
         });
         while self.sixel_images.len() > crate::sixel::MAX_LIVE_SIXELS {
             self.sixel_images.remove(0);
@@ -1093,6 +1241,14 @@ impl Grid {
     pub fn set_cell_size(&mut self, w: u32, h: u32) {
         self.cell_w = w.max(1);
         self.cell_h = h.max(1);
+    }
+
+    /// Set (or clear) the inline video frame. `None` stops playback. Bumping
+    /// `video_frame_version` lets the renderer re-upload only on change.
+    pub fn set_video_frame(&mut self, frame: Option<crate::sixel::SixelImage>) {
+        self.video_frame = frame;
+        self.video_frame_version = self.video_frame_version.wrapping_add(1);
+        self.mark_all_dirty();
     }
 
     /// DECRPM mode value for DECRQM reports: 1 = set, 2 = reset,
@@ -4014,6 +4170,77 @@ mod tests {
     }
 
     #[test]
+    fn test_kitty_graphics_png() {
+        use base64::Engine as _;
+        let mut g = make_grid(80, 24);
+        // Encode a 2x1 RGB PNG with the `png` crate, then transmit it as f=100.
+        let mut png_bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png_bytes, 2, 1);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().expect("png header");
+            writer
+                .write_image_data(&[255, 0, 0, 0, 255, 0])
+                .expect("png data");
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let mut seq = format!("\x1b_Ga=T,f=100;{b64}").into_bytes();
+        seq.extend_from_slice(b"\x1b\\");
+        feed(&mut g, &seq);
+
+        assert_eq!(g.sixel_images.len(), 1);
+        let p = &g.sixel_images[0];
+        assert_eq!((p.image.width, p.image.height), (2, 1));
+        assert_eq!(p.image.rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn test_kitty_graphics_transmit_put_delete() {
+        use base64::Engine as _;
+        let mut g = make_grid(80, 24);
+        let raw = [255u8, 0, 0, 255]; // 1x1 RGBA red
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+
+        // Transmit only (a=t,i=7): stores the image, replies OK, no placement.
+        let mut seq = format!("\x1b_Ga=t,i=7,f=32,s=1,v=1;{b64}").into_bytes();
+        seq.extend_from_slice(b"\x1b\\");
+        feed(&mut g, &seq);
+        assert_eq!(g.sixel_images.len(), 0);
+        assert_eq!(g.kitty_images.len(), 1);
+        assert_eq!(g.take_responses(), vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]);
+
+        // Put (a=p,i=7): displays the stored image and replies OK.
+        let mut seq = b"\x1b_Ga=p,i=7;\x1b\\".to_vec();
+        feed(&mut g, &seq);
+        assert_eq!(g.sixel_images.len(), 1);
+        assert_eq!(g.sixel_images[0].image_id, 7);
+        assert_eq!(g.take_responses(), vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]);
+
+        // Put an unknown id replies ENOENT and places nothing.
+        feed(&mut g, b"\x1b_Ga=p,i=999;\x1b\\");
+        assert_eq!(g.sixel_images.len(), 1);
+        assert_eq!(
+            g.take_responses(),
+            vec![b"\x1b_Gi=999;ENOENT:no such image\x1b\\".to_vec()]
+        );
+
+        // Delete (a=d,i=7) removes the stored image and its placement.
+        feed(&mut g, b"\x1b_Ga=d,d=I,i=7;\x1b\\");
+        assert!(g.kitty_images.is_empty());
+        assert!(g.sixel_images.is_empty());
+    }
+
+    #[test]
+    fn test_kitty_graphics_query() {
+        let mut g = make_grid(80, 24);
+        feed(&mut g, b"\x1b_Ga=q,i=1;\x1b\\");
+        assert_eq!(g.take_responses(), vec![b"\x1b_Gi=1;OK\x1b\\".to_vec()]);
+        assert!(g.kitty_images.is_empty());
+        assert!(g.sixel_images.is_empty());
+    }
+
+    #[test]
     fn test_print_multiple_chars() {
         let mut g = make_grid(10, 5);
         feed(&mut g, b"Hello");
@@ -5653,6 +5880,7 @@ mod tests {
                 height: 8,
                 rgba: vec![0u8; 8 * 8 * 4],
             },
+            image_id: 0,
         }
     }
 

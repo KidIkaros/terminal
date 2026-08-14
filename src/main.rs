@@ -118,6 +118,20 @@ struct App {
     initial_command: Option<String>,
     startup_started: std::time::Instant,
     first_frame_logged: bool,
+
+    /// Video path passed via `--video`; playback starts once the window and
+    /// font are ready.
+    #[cfg(feature = "video")]
+    video_path: Option<String>,
+    /// Live decode stream once started.
+    #[cfg(feature = "video")]
+    video_stream: Option<terminal::video::VideoStream>,
+    /// Wall-clock time of the next video frame to display (real-time pacing;
+    /// the bounded decode channel applies backpressure to ffmpeg).
+    #[cfg(feature = "video")]
+    video_next_frame: std::time::Instant,
+    #[cfg(feature = "video")]
+    video_frame_interval: std::time::Duration,
 }
 
 impl App {
@@ -174,6 +188,14 @@ impl App {
             initial_command,
             startup_started: std::time::Instant::now(),
             first_frame_logged: false,
+            #[cfg(feature = "video")]
+            video_path: None,
+            #[cfg(feature = "video")]
+            video_stream: None,
+            #[cfg(feature = "video")]
+            video_next_frame: std::time::Instant::now(),
+            #[cfg(feature = "video")]
+            video_frame_interval: std::time::Duration::from_millis(33),
         }
     }
 
@@ -793,6 +815,91 @@ impl App {
         deadline
     }
 
+    /// Start inline video playback if `--video` was passed (feature `video`).
+    /// Decodes at the source's native aspect ratio, scaled to fit the
+    /// terminal's pixel area, and paces frames at the source fps.
+    #[cfg(feature = "video")]
+    fn start_video_if_requested(&mut self, cell_w: u32, cell_h: u32) {
+        if self.video_stream.is_some() {
+            return;
+        }
+        let Some(path) = self.video_path.clone() else {
+            return;
+        };
+        // Target area in pixels (the cell-grid region), capped so huge windows
+        // don't spawn oversized decodes.
+        let area_w = (self.size.cols as u32).saturating_mul(cell_w.max(1)).max(2);
+        let area_h = (self.size.rows as u32).saturating_mul(cell_h.max(1)).max(2);
+        let fps = terminal::video::probe(&path).map(|i| i.fps).unwrap_or(30.0);
+        // Decode dims preserve the source aspect ratio (letterboxed on draw).
+        let (cols, rows) = match terminal::video::probe(&path) {
+            Ok(info) if info.width > 0 && info.height > 0 => {
+                let scale = (area_w as f64 / info.width as f64)
+                    .min(area_h as f64 / info.height as f64)
+                    .min(1.0);
+                let mut w = (info.width as f64 * scale).round() as u32;
+                let mut h = (info.height as f64 * scale).round() as u32;
+                // Clamp the long side so a portrait source still fits.
+                if w.max(h) > area_w.max(area_h) {
+                    let s = area_w.max(area_h) as f64 / w.max(h) as f64;
+                    w = (w as f64 * s).round() as u32;
+                    h = (h as f64 * s).round() as u32;
+                }
+                (w.max(2), h.max(2))
+            }
+            _ => (area_w, area_h),
+        };
+        self.video_frame_interval = std::time::Duration::from_secs_f64(1.0 / fps.max(1.0));
+        self.video_next_frame = std::time::Instant::now();
+        match terminal::video::start(path, cols, rows) {
+            Ok(stream) => {
+                log::info!("video: started {cols}x{rows} @ {fps:.1} fps");
+                self.video_stream = Some(stream);
+            }
+            Err(e) => log::error!("video: {e}"),
+        }
+    }
+
+    /// Pull and display the next video frame when it's due, and clear the
+    /// overlay at end-of-stream (feature `video`). Returns true when a frame
+    /// was drawn.
+    #[cfg(feature = "video")]
+    fn poll_video(&mut self) -> bool {
+        let Some(stream) = &self.video_stream else {
+            return false;
+        };
+        if std::time::Instant::now() < self.video_next_frame {
+            return false;
+        }
+        match stream.try_recv() {
+            Ok(frame) => {
+                let img = terminal::sixel::SixelImage {
+                    width: frame.width,
+                    height: frame.height,
+                    rgba: frame.rgba,
+                };
+                if let Some(tm) = &mut self.tab_manager {
+                    tm.active_mut().grid.set_video_frame(Some(img));
+                }
+                self.video_next_frame += self.video_frame_interval;
+                true
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                // Decoder hasn't produced the frame yet; retry shortly.
+                self.video_next_frame = std::time::Instant::now();
+                false
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                // EOF: clear the overlay and stop.
+                if let Some(tm) = &mut self.tab_manager {
+                    tm.active_mut().grid.set_video_frame(None);
+                }
+                self.video_stream = None;
+                true
+            }
+        }
+    }
+
     /// Reload configuration from disk (Ctrl+Shift+R / SIGHUP). Applies the
     /// settings that can change live (theme/colors, opacity, padding, blink,
     /// bell, security). Font, shell, and scrollback require a restart and are
@@ -895,7 +1002,10 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(PhysicalSize::new(pw, ph))
             .with_position(PhysicalPosition::new(100, 100))
             .with_resizable(true)
-            .with_transparent(self.config.window.opacity < 1.0);
+            .with_transparent(self.config.window.opacity < 1.0)
+            // Background blur behind translucent windows (Wayland/macOS;
+            // a no-op on X11, where the compositor owns the effect).
+            .with_blur(self.config.window.blur);
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.window = Some(Arc::clone(&window));
@@ -962,6 +1072,9 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
+
+        #[cfg(feature = "video")]
+        self.start_video_if_requested(atlas.cell_width, atlas.cell_height);
 
         self.pipeline = Some(pipeline);
         self.atlas = Some(atlas);
@@ -1720,6 +1833,18 @@ impl ApplicationHandler<UserEvent> for App {
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
 
+        // Inline video playback: pull a frame when due, and wake in time for
+        // the next one (this overrides blink pacing while video is fullscreen).
+        #[cfg(feature = "video")]
+        if self.video_stream.is_some() {
+            if self.poll_video() {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.video_next_frame));
+        }
+
         // Drain any PTY data that arrived between events (safety net for
         // data that came in after the last user_event but before we sleep).
         let (had_data, _more_pending) = self.drain_pty();
@@ -2163,10 +2288,13 @@ fn app_cursor_remap(bytes: &mut Vec<u8>) {
 fn main() {
     env_logger::init();
 
-    // Minimal CLI parsing: `terminal [-e command] [--cols N] [--rows N]`
+    // Minimal CLI parsing: `terminal [-e command] [--cols N] [--rows N]
+    // [--video FILE]`
     let mut initial_command: Option<String> = None;
     let mut override_cols: Option<u16> = None;
     let mut override_rows: Option<u16> = None;
+    #[cfg(feature = "video")]
+    let mut video_path: Option<String> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -2187,6 +2315,13 @@ fn main() {
                 i += 1;
                 if i < args.len() {
                     override_rows = args[i].parse().ok();
+                }
+            }
+            #[cfg(feature = "video")]
+            "--video" => {
+                i += 1;
+                if i < args.len() {
+                    video_path = Some(args[i].clone());
                 }
             }
             _ => {}
@@ -2210,6 +2345,10 @@ fn main() {
     if let Some(rows) = override_rows {
         app.size.rows = rows;
         app.config.window.rows = rows;
+    }
+    #[cfg(feature = "video")]
+    {
+        app.video_path = video_path;
     }
     event_loop.run_app(&mut app).expect("event loop run");
 }

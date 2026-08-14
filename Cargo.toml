@@ -10,6 +10,12 @@ keywords = ["terminal", "emulator", "gpu", "wgpu"]
 categories = ["command-line-utilities"]
 rust-version = "1.70"
 
+[features]
+default = []
+# Inline video playback (asciiline decode → kitty graphics path). Requires
+# ffmpeg/ffprobe on PATH at runtime; pulls in asciline's dependency tree.
+video = ["dep:asciline"]
+
 [[bin]]
 name = "terminal"
 path = "src/main.rs"
@@ -46,6 +52,13 @@ arboard = "3.6"
 
 # Base64 encoding for OSC52
 base64 = "0.22"
+
+# PNG decoding for the kitty graphics protocol (f=100)
+png = "0.17"
+
+# Inline video playback (optional, feature "video"). Used only for its
+# decoder (`video::FrameReader` / `probe_video`), which spawns ffmpeg.
+asciline = { git = "https://github.com/KidIkaros/asciline-rust", rev = "eb13a47d1a51b9028c67ee53e20acea45d053df1", optional = true }
 
 # Configuration file (TOML)
 toml = "0.8"

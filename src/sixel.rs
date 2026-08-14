@@ -70,6 +70,10 @@ pub struct SixelPlacement {
     pub row: usize,
     /// The decoded image.
     pub image: SixelImage,
+    /// Kitty-graphics image id this placement came from (`a=p` / `a=T` with
+    /// `i=`); 0 for sixel placements and id-less kitty images. Used so
+    /// `a=d,i=<id>` can evict both the stored image and its placements.
+    pub image_id: u32,
 }
 
 /// Cap a single `!N` repeat count so a corrupted payload cannot spin; the
