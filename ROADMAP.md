@@ -2,7 +2,36 @@
 
 **Project:** GPU-accelerated terminal emulator in Rust
 **Created:** 2026-08-10
-**Current State:** MVP with 71 tests, core functionality working
+**Current State:** Feature-complete daily driver (updated 2026-08-14)
+
+> **Status note:** Phases 1–5 below are implemented. The checklist items
+> marked as plans were written before the work landed; see the summary below
+> for what's actually done vs. remaining.
+
+## Implemented
+
+- Clipboard (Ctrl+Shift+C/V, OSC 52 with security policy), mouse tracking
+  (1000/1002/1003/1006), bracketed paste
+- Keyboard: kitty keyboard protocol (CSI u), modifyOtherKeys, app cursor keys,
+  custom keybindings
+- Configuration (TOML) + 16 built-in themes + font selection
+  (family via fontconfig, path/bold/italic paths)
+- Tabs (with PTY backpressure), regex search, scrollback, selection
+- VT completeness: 34/34 conformance cases (DECSLRM, DECSCA, DECCOLM, DECSTR,
+  DECIC/DECDC, DECFRA/DECERA, CHT/CBT, sixel, OSC 8/9/52, …)
+- Sixel graphics + cross-validation against `chafa`
+- Kitty graphics protocol (`ESC G`): raw RGB/RGBA with chunked transfer (PNG deferred)
+- Padding + window opacity, double/triple-click selection, config hot-reload
+  (SIGHUP), italic synthesis, smooth scrollback animation
+- Performance: ~48 MiB/s headless parse, bounded PTY drain, dirty-cell tracking,
+  StagingBelt uploads, coalesced wake events
+- Bell (visual flash / audible), cursor + SGR text blink
+
+## Remaining (see CONCERNS.md for details)
+
+- [ ] Multi-page glyph atlas for full CJK/emoji coverage
+- [ ] Kitty graphics PNG (`f=100`) decoding; file/shared-memory transmission
+- [ ] Parse thread / grid snapshot (only if profiling shows frame hitches)
 
 ---
 
@@ -211,9 +240,9 @@ shell = "/bin/bash"
 **Effort:** 2-3 days
 
 ### 4.3 Image Rendering
-- [ ] Kitty graphics protocol (ESC G)
-- [ ] Sixel graphics (ESC ? P q)
-- [ ] Inline images in terminal output
+- [x] Kitty graphics protocol (ESC G) — raw RGB/RGBA, chunked; PNG deferred
+- [x] Sixel graphics (ESC ? P q)
+- [x] Inline images in terminal output
 
 **Files:** New `image.rs`, `render/`
 **Effort:** 3-5 days

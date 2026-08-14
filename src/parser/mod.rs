@@ -38,6 +38,9 @@ pub enum Action {
     },
     /// OSC (Operating System Command) string complete.
     OscDispatch { params: Vec<Vec<u8>> },
+    /// APC (Application Program Command) string complete — used by the kitty
+    /// graphics protocol (`ESC _ G ... ST`).
+    ApcDispatch { data: Vec<u8> },
     /// DCS hook (start of DCS passthrough).
     Hook {
         params: Vec<Vec<u16>>,
@@ -131,6 +134,9 @@ const MAX_INTERMEDIATES: usize = 2;
 /// Maximum OSC string length. xterm-class allows ~100KB; the old 1024 cap
 /// silently truncated long titles and OSC 52 clipboard payloads (T3-18).
 const MAX_OSC_LEN: usize = 100_000;
+/// Kitty graphics APC payloads carry base64 image data, so they need a larger
+/// cap than OSC strings (a 640x480 image is ~300KB of base64).
+const MAX_APC_LEN: usize = 2_000_000;
 
 pub struct Parser {
     state: State,
@@ -148,6 +154,9 @@ pub struct Parser {
     // OSC accumulator
     osc_buf: Vec<u8>,
     osc_params: Vec<usize>, // byte offsets of ';' separators
+
+    // APC accumulator (kitty graphics protocol, `ESC _ G ... ST`)
+    apc_buf: Vec<u8>,
 
     // UTF-8 multibyte accumulator
     utf8_buf: [u8; 4],
@@ -168,6 +177,7 @@ impl Default for Parser {
             ignore: false,
             osc_buf: Vec::with_capacity(256),
             osc_params: Vec::with_capacity(16),
+            apc_buf: Vec::with_capacity(256),
             utf8_buf: [0; 4],
             utf8_len: 0,
             utf8_remaining: 0,
@@ -261,7 +271,7 @@ impl Parser {
             State::DcsIntermediate => self.dcs_intermediate(performer, byte),
             State::DcsIgnore => self.dcs_ignore(byte),
             State::DcsPassthrough => self.dcs_passthrough(performer, byte),
-            State::SosPmApcString => { /* absorb */ }
+            State::SosPmApcString => self.sos_pm_apc_string(performer, byte),
             State::Utf8 => unreachable!(),
         }
     }
@@ -453,6 +463,45 @@ impl Parser {
         }
     }
 
+    /// SOS/PM/APC string state. Only APC (`ESC _`, the kitty graphics
+    /// protocol) is dispatched; SOS/PM payloads are absorbed. Termination and
+    /// accumulation mirror `osc_string`.
+    fn sos_pm_apc_string(&mut self, performer: &mut impl Perform, byte: u8) {
+        match byte {
+            0x07 => {
+                // BEL terminates the string.
+                self.dispatch_apc(performer);
+                self.transition(State::Ground);
+            }
+            0x1b => {
+                // ESC cancels the string but it is complete (first byte of
+                // `ESC \` ST): dispatch then continue as a fresh ESC.
+                self.dispatch_apc(performer);
+                self.transition(State::Escape);
+            }
+            0x18 | 0x1a => {
+                // CAN/SUB abort without dispatching.
+                performer.perform(Action::Execute(byte));
+                self.transition(State::Ground);
+            }
+            0x20..=0xff => {
+                if self.apc_buf.len() < MAX_APC_LEN {
+                    self.apc_buf.push(byte);
+                }
+            }
+            _ => {} // other C0 controls are ignored
+        }
+    }
+
+    fn dispatch_apc(&mut self, performer: &mut impl Perform) {
+        if self.apc_buf.is_empty() {
+            return;
+        }
+        performer.perform(Action::ApcDispatch {
+            data: std::mem::take(&mut self.apc_buf),
+        });
+    }
+
     fn dcs_entry(&mut self, performer: &mut impl Perform, byte: u8) {
         match byte {
             0x20..=0x2f => {
@@ -539,6 +588,7 @@ impl Parser {
         match self.state {
             State::OscString => self.dispatch_osc(performer),
             State::DcsPassthrough => performer.perform(Action::Unhook),
+            State::SosPmApcString => self.dispatch_apc(performer),
             _ => {}
         }
     }
@@ -671,6 +721,9 @@ impl Parser {
             State::OscString => {
                 self.osc_buf.clear();
                 self.osc_params.clear();
+            }
+            State::SosPmApcString => {
+                self.apc_buf.clear();
             }
             _ => {}
         }

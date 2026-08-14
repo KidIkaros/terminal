@@ -42,6 +42,10 @@ pub struct Config {
     #[serde(default = "default_text_blink")]
     pub text_blink_ms: u64,
 
+    /// Feedback style for the BEL control character.
+    #[serde(default)]
+    pub bell: BellStyle,
+
     /// Cursor style.
     #[serde(default = "default_cursor_style")]
     pub cursor_style: CursorStyle,
@@ -98,6 +102,24 @@ pub enum CursorStyle {
 impl Default for CursorStyle {
     fn default() -> Self {
         CursorStyle::Block
+    }
+}
+
+/// Feedback style for the BEL (0x07) control character.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BellStyle {
+    /// Briefly tint the window (visual flash).
+    Flash,
+    /// Emit an audible beep through the host terminal.
+    Audible,
+    /// No feedback.
+    None,
+}
+
+impl Default for BellStyle {
+    fn default() -> Self {
+        BellStyle::Flash
     }
 }
 
@@ -264,8 +286,12 @@ fn default_scrollback() -> usize {
     10000
 }
 
+/// Family name of the font embedded in the binary. Used to decide whether a
+/// configured `family` should trigger a system fontconfig lookup.
+pub const EMBEDDED_FONT_FAMILY: &str = "JetBrains Mono";
+
 fn default_font_family() -> String {
-    "JetBrains Mono".to_string()
+    EMBEDDED_FONT_FAMILY.to_string()
 }
 
 fn default_font_size() -> f32 {
@@ -435,6 +461,7 @@ impl Default for Config {
             cursor_style: CursorStyle::default(),
             tabs: TabsConfig::default(),
             reduced_motion: false,
+            bell: BellStyle::default(),
             security: SecurityConfig::default(),
         }
     }
@@ -527,6 +554,15 @@ mod tests {
         assert_eq!(config.scrollback, 10000);
         assert!(!config.mouse_reporting);
         assert!(!config.reduced_motion);
+        assert_eq!(config.bell, BellStyle::Flash);
+    }
+
+    #[test]
+    fn test_parse_bell_style() {
+        let config: Config = toml::from_str("bell = \"audible\"\n").unwrap();
+        assert_eq!(config.bell, BellStyle::Audible);
+        let config: Config = toml::from_str("bell = \"none\"\n").unwrap();
+        assert_eq!(config.bell, BellStyle::None);
     }
 
     #[test]

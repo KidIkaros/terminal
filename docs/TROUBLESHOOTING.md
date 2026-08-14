@@ -144,6 +144,14 @@ This guide helps you solve common issues with the terminal.
    TERMINAL_RENDER_TRACE=1 RUST_LOG=info terminal
    ```
 
+6. **Tune the drain budget:**
+   Under vsync the sustained `cat bigfile` rate is bounded by
+   `budget × refresh_rate` (256 KiB × 60 Hz ≈ 15 MiB/s). If large dumps feel
+   slow and input latency matters less, raise the per-frame cap:
+   ```bash
+   TERMINAL_DRAIN_BUDGET=1048576 terminal   # 1 MiB per frame
+   ```
+
 ### Mouse Not Working
 
 **Symptom:** Mouse clicks don't position cursor or select text.

@@ -17,6 +17,8 @@ use terminal::tab_bar::TabBar;
 use terminal::tabs::TabManager;
 use terminal::theme::Theme;
 // Re-import modules so bare paths like `grid::MouseMode` resolve.
+#[cfg(unix)]
+use nix::libc;
 use terminal::{
     clipboard, config, grid, mouse, parser, pty, render, search, selection, tab_bar, tabs, theme,
 };
@@ -34,12 +36,27 @@ use winit::{
 enum UserEvent {
     /// PTY data is available on the channel — drain and redraw.
     PtyData,
+    /// SIGHUP received — reload the configuration.
+    ReloadConfig,
+}
+
+/// Set by the SIGHUP signal handler; a relay thread posts it to the event
+/// loop as a `ReloadConfig` event (the handler itself only sets an atomic).
+#[cfg(unix)]
+static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn on_sighup(_sig: libc::c_int) {
+    RELOAD_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 /// Maximum bytes parsed from a tab's PTY channel per drain call. Output
 /// bursts larger than this are spread across multiple frames so a single
 /// drain can't stall the render loop.
 const DRAIN_BUDGET_BYTES: usize = 256 * 1024;
+
+/// Duration of the visual-bell window tint.
+const BELL_FLASH_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
 
 // ---------------------------------------------------------------------------
 // Application (winit ApplicationHandler)
@@ -64,6 +81,10 @@ struct App {
     // Mouse state
     mouse_position: (f64, f64),
     mouse_button_pressed: Option<MouseButton>,
+    // Multi-click tracking for word/line selection.
+    last_click_time: Option<std::time::Instant>,
+    last_click_pos: Option<(f64, f64)>,
+    click_count: u8,
 
     // Search state
     search: SearchState,
@@ -77,6 +98,10 @@ struct App {
     // SGR text blink state (blinking cells toggle on/off on a timer).
     text_blink_on: bool,
     last_text_blink: std::time::Instant,
+    // Visual bell: while Some, the renderer tints the window.
+    bell_flash_until: Option<std::time::Instant>,
+    /// Per-frame PTY drain budget in bytes (env-overridable for tuning).
+    drain_budget_bytes: usize,
 
     // Set when the last tab is closed — signals the event loop to exit.
     should_quit: bool,
@@ -126,12 +151,21 @@ impl App {
             modifiers: ModifiersState::default(),
             mouse_position: (0.0, f64::NEG_INFINITY),
             mouse_button_pressed: None,
+            last_click_time: None,
+            last_click_pos: None,
+            click_count: 1,
             search: SearchState::new(),
             selection: Selection::new(),
             cursor_visible: true,
             last_cursor_blink: std::time::Instant::now(),
             text_blink_on: true,
             last_text_blink: std::time::Instant::now(),
+            bell_flash_until: None,
+            drain_budget_bytes: std::env::var("TERMINAL_DRAIN_BUDGET")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DRAIN_BUDGET_BYTES),
             should_quit: false,
             config,
             size,
@@ -189,6 +223,7 @@ impl App {
     /// Returns `(had_data, more_pending)`: whether anything was processed and
     /// whether the channel still holds unparsed bytes after hitting the cap.
     fn drain_pty(&mut self) -> (bool, bool) {
+        let budget_cap = self.drain_budget_bytes;
         let Some(tm) = &mut self.tab_manager else {
             return (false, false);
         };
@@ -215,7 +250,7 @@ impl App {
                     Ok(chunk) => {
                         budget += chunk.len();
                         pending.push(chunk);
-                        if budget >= DRAIN_BUDGET_BYTES {
+                        if budget >= budget_cap {
                             more_pending = !rx.is_empty();
                             break;
                         }
@@ -332,9 +367,22 @@ impl App {
                 }
             }
 
-            // Bell (BEL): surfaced to the log; a visual flash is future work.
+            // Bell (BEL / OSC 9;7): flash the window or beep, per config.
             if tab.grid.take_bell() {
-                log::debug!("bell: visual feedback requested by application");
+                match self.config.bell {
+                    config::BellStyle::Audible => {
+                        use std::io::Write as _;
+                        let _ = std::io::stderr().write_all(b"\x07");
+                    }
+                    config::BellStyle::Flash => {
+                        self.bell_flash_until =
+                            Some(std::time::Instant::now() + BELL_FLASH_DURATION);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    config::BellStyle::None => {}
+                }
             }
             // OSC 9 notifications: surface via the desktop notification
             // daemon (notify-send/libnotify). Fire-and-forget — notify-send
@@ -436,6 +484,11 @@ impl App {
             Key::Character(s) if s.as_str() == "F" && ctrl && shift => {
                 self.search.activate();
                 log::debug!("Search: Ctrl+Shift+F");
+                true
+            }
+            // Ctrl+Shift+R — Reload configuration
+            Key::Character(s) if s.as_str() == "R" && ctrl && shift => {
+                self.reload_config();
                 true
             }
             // Ctrl+R — Reverse search
@@ -653,10 +706,31 @@ impl App {
         } else {
             0
         };
+        let pad = self.config.window.padding * 2;
         (
-            self.size.cols as u32 * atlas.cell_width,
-            self.size.rows as u32 * atlas.cell_height + tb_h,
+            self.size.cols as u32 * atlas.cell_width + pad,
+            self.size.rows as u32 * atlas.cell_height + tb_h + pad,
         )
+    }
+
+    /// Convert a window pixel position to a 0-based cell (col, row),
+    /// accounting for the tab bar and window padding.
+    fn cell_at_pixel(&self, x: f64, y: f64) -> (usize, usize) {
+        let cw = self
+            .atlas
+            .as_ref()
+            .map(|a| a.cell_width.max(1) as f64)
+            .unwrap_or(8.0);
+        let ch = self
+            .atlas
+            .as_ref()
+            .map(|a| a.cell_height.max(1) as f64)
+            .unwrap_or(16.0);
+        let pad = self.config.window.padding as f64;
+        let tb_h = self.tab_bar_height() as f64;
+        let col = ((x - pad) / cw).max(0.0) as usize;
+        let row = ((y - tb_h - pad) / ch).max(0.0) as usize;
+        (col, row)
     }
 
     /// Current tab bar height in pixels (0 if hidden).
@@ -713,7 +787,54 @@ impl App {
                 self.last_text_blink + std::time::Duration::from_millis(self.config.text_blink_ms);
             deadline = Some(deadline.map_or(t, |d| d.min(t)));
         }
+        if let Some(t) = self.bell_flash_until {
+            deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        }
         deadline
+    }
+
+    /// Reload configuration from disk (Ctrl+Shift+R / SIGHUP). Applies the
+    /// settings that can change live (theme/colors, opacity, padding, blink,
+    /// bell, security). Font, shell, and scrollback require a restart and are
+    /// preserved from the running config.
+    fn reload_config(&mut self) {
+        let new_config = Config::load();
+        // Preserve settings that cannot be applied without rebuilding the
+        // atlas, PTY, or grid.
+        self.config.font = new_config.font.clone();
+        self.config.shell = new_config.shell.clone();
+        self.config.scrollback = new_config.scrollback;
+        // Copy the live-applicable fields over.
+        self.config.colors = new_config.colors.clone();
+        self.config.window = new_config.window.clone();
+        self.config.tabs = new_config.tabs.clone();
+        self.config.cursor_blink_ms = new_config.cursor_blink_ms;
+        self.config.text_blink_ms = new_config.text_blink_ms;
+        self.config.cursor_style = new_config.cursor_style;
+        self.config.bell = new_config.bell.clone();
+        self.config.security = new_config.security.clone();
+        self.config.reduced_motion = new_config.reduced_motion;
+        self.show_tab_bar = self.config.tabs.show_tab_bar;
+        if self.config.reduced_motion {
+            self.config.cursor_blink_ms = 0;
+            self.config.text_blink_ms = 0;
+        }
+
+        // Theme changed: drop the cached color table so it rebuilds.
+        if let Some(p) = &mut self.pipeline {
+            p.invalidate_colors();
+        }
+
+        // Padding may have changed the window footprint; re-request the size
+        // and redraw everything.
+        if let (Some(atlas), Some(w)) = (&self.atlas, &self.window) {
+            let (pw, ph) = self.pixel_size(atlas);
+            let _ = w.request_inner_size(PhysicalSize::new(pw.max(1), ph.max(1)));
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+        log::info!("Configuration reloaded");
     }
 }
 
@@ -721,6 +842,22 @@ impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
+        }
+
+        // SIGHUP → reload config (Unix). The signal handler only sets an
+        // atomic flag; a relay thread posts the event so the handler itself
+        // stays async-signal-safe.
+        #[cfg(unix)]
+        {
+            unsafe { libc::signal(libc::SIGHUP, on_sighup as libc::sighandler_t) };
+            if let Some(proxy) = self.event_proxy.clone() {
+                std::thread::spawn(move || loop {
+                    if RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
+                        let _ = proxy.send_event(UserEvent::ReloadConfig);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                });
+            }
         }
         let trace_startup = std::env::var_os("TERMINAL_STARTUP_TRACE").is_some();
         let startup_started = self.startup_started;
@@ -734,8 +871,22 @@ impl ApplicationHandler<UserEvent> for App {
         };
 
         trace("resumed");
-        let font_bytes = render::font::embedded_font();
-        let atlas = GlyphAtlas::from_bytes(font_bytes, self.config.font.size);
+        let font_bytes = render::font::load_primary_font(&self.config.font);
+        let mut atlas = GlyphAtlas::from_bytes(&font_bytes, self.config.font.size);
+        if let Some(path) = &self.config.font.bold_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                atlas.set_bold_font(&bytes);
+            } else {
+                log::warn!("Bold font path {} unreadable", path);
+            }
+        }
+        if let Some(path) = &self.config.font.italic_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                atlas.set_italic_font(&bytes);
+            } else {
+                log::warn!("Italic font path {} unreadable", path);
+            }
+        }
         trace("font");
         let (pw, ph) = self.pixel_size(&atlas);
 
@@ -822,6 +973,9 @@ impl ApplicationHandler<UserEvent> for App {
     /// Drain the channel and request a redraw — no more 16ms polling.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::ReloadConfig => {
+                self.reload_config();
+            }
             UserEvent::PtyData => {
                 self.pty_wake_pending.store(false, Ordering::Release);
                 let (had_data, _more_pending) = self.drain_pty();
@@ -871,9 +1025,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(atlas) = &self.atlas {
                     let tb_h = self.tab_bar_height();
-                    let new_cols = (size.width / atlas.cell_width.max(1)) as u16;
-                    let new_rows =
-                        ((size.height.saturating_sub(tb_h)) / atlas.cell_height.max(1)) as u16;
+                    let pad = self.config.window.padding as u32 * 2;
+                    let new_cols =
+                        (size.width.saturating_sub(pad) / atlas.cell_width.max(1)) as u16;
+                    let new_rows = ((size.height.saturating_sub(tb_h + pad))
+                        / atlas.cell_height.max(1)) as u16;
                     if new_cols > 0 && new_rows > 0 {
                         self.size = WinSize {
                             cols: new_cols,
@@ -917,16 +1073,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Report motion if mouse tracking is active
-                if let Some(atlas) = &self.atlas {
+                if self.atlas.is_some() {
                     let mode = self.active_mouse_mode();
                     let button_pressed = self.mouse_button_pressed.is_some();
 
                     if mouse::should_report_motion(mode, button_pressed) {
-                        let col = (position.x / atlas.cell_width.max(1) as f64) as u32 + 1;
-                        let row = ((position.y - self.tab_bar_height() as f64)
-                            / atlas.cell_height.max(1) as f64)
-                            as u32
-                            + 1;
+                        let (c, r) = self.cell_at_pixel(position.x, position.y);
+                        let col = c as u32 + 1;
+                        let row = r as u32 + 1;
 
                         let event = mouse::MouseEvent {
                             button: self
@@ -945,10 +1099,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.write_to_pty(encoded.as_bytes());
                     } else if self.selection.selecting {
                         // Update selection during drag
-                        let col = (position.x / atlas.cell_width.max(1) as f64) as usize;
-                        let row = ((position.y - self.tab_bar_height() as f64)
-                            / atlas.cell_height.max(1) as f64)
-                            as usize;
+                        let (col, row) = self.cell_at_pixel(position.x, position.y);
 
                         // Mark previously selected cells dirty
                         let (old_start, old_end) = self.selection.normalized();
@@ -1048,7 +1199,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                if let Some(atlas) = &self.atlas {
+                if self.atlas.is_some() {
                     let mode = self.active_mouse_mode();
 
                     if mouse::is_mouse_tracking_active(mode) {
@@ -1070,12 +1221,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         };
 
-                        let col =
-                            (self.mouse_position.0 / atlas.cell_width.max(1) as f64) as u32 + 1;
-                        let row = ((self.mouse_position.1 - self.tab_bar_height() as f64)
-                            / atlas.cell_height.max(1) as f64)
-                            as u32
-                            + 1;
+                        let (c, r) =
+                            self.cell_at_pixel(self.mouse_position.0, self.mouse_position.1);
+                        let col = c as u32 + 1;
+                        let row = r as u32 + 1;
 
                         let event = mouse::MouseEvent {
                             button: winit_button.unwrap_or(mouse::MouseButton::Left),
@@ -1092,10 +1241,8 @@ impl ApplicationHandler<UserEvent> for App {
                         self.write_to_pty(encoded.as_bytes());
                     } else if button == winit::event::MouseButton::Left {
                         // Handle selection when mouse tracking is not active
-                        let col = (self.mouse_position.0 / atlas.cell_width.max(1) as f64) as usize;
-                        let row = ((self.mouse_position.1 - self.tab_bar_height() as f64)
-                            / atlas.cell_height.max(1) as f64)
-                            as usize;
+                        let (col, row) =
+                            self.cell_at_pixel(self.mouse_position.0, self.mouse_position.1);
 
                         match state {
                             ElementState::Pressed => {
@@ -1117,28 +1264,69 @@ impl ApplicationHandler<UserEvent> for App {
                                         log::warn!("Blocked unsupported hyperlink scheme");
                                     }
                                 }
-                                // Start new selection: Alt = rectangular (block)
-                                // selection, Shift = line selection, else char.
+                                // Multi-click detection: a press within the
+                                // double-click window and a few pixels of the
+                                // last press advances the click count (winit
+                                // does not report click counts itself).
+                                let now = std::time::Instant::now();
+                                let pos = self.mouse_position;
+                                self.click_count = match self.last_click_time {
+                                    Some(t)
+                                        if now.duration_since(t)
+                                            < std::time::Duration::from_millis(400)
+                                            && self.last_click_pos.map_or(true, |p| {
+                                                (p.0 - pos.0).abs() < 4.0
+                                                    && (p.1 - pos.1).abs() < 4.0
+                                            }) =>
+                                    {
+                                        (self.click_count % 3) + 1
+                                    }
+                                    _ => 1,
+                                };
+                                self.last_click_time = Some(now);
+                                self.last_click_pos = Some(pos);
+
+                                // Alt = rectangular (block), Shift/triple =
+                                // line, double = word, else char.
                                 let mode = if self.modifiers.alt_key() {
                                     SelectionMode::Rectangular
-                                } else if self.modifiers.shift_key() {
+                                } else if self.modifiers.shift_key() || self.click_count >= 3 {
                                     SelectionMode::Line
+                                } else if self.click_count == 2 {
+                                    SelectionMode::Word
                                 } else {
                                     SelectionMode::Char
                                 };
                                 self.selection.start_selection(row, col, mode);
+                                // Word/line selection completes immediately
+                                // (no drag): expand to the whole word/line.
+                                if mode == SelectionMode::Word {
+                                    let lines = self.active_all_lines();
+                                    self.selection.expand_to_word(&lines);
+                                    self.selection.end_selection();
+                                } else if mode == SelectionMode::Line {
+                                    self.selection.update(row, self.size.cols as usize);
+                                    self.selection.end_selection();
+                                }
                             }
                             ElementState::Released => {
                                 // End selection
                                 self.selection.end_selection();
-                                // Copy to clipboard if there's a selection
+                                // Copy a real selection (drag or multi-click); a
+                                // bare single click (start == end) just clears
+                                // so the clipboard isn't clobbered.
                                 if self.selection.active {
-                                    let lines = self.active_all_lines();
-                                    let text = self
-                                        .selection
-                                        .extract_text(&lines, self.size.cols as usize);
-                                    if !text.is_empty() {
-                                        self.clipboard.copy(&text);
+                                    let (s, e) = self.selection.normalized();
+                                    if s != e || self.click_count >= 2 {
+                                        let lines = self.active_all_lines();
+                                        let text = self
+                                            .selection
+                                            .extract_text(&lines, self.size.cols as usize);
+                                        if !text.is_empty() {
+                                            self.clipboard.copy(&text);
+                                        }
+                                    } else {
+                                        self.selection.cancel();
                                     }
                                 }
                             }
@@ -1153,7 +1341,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(atlas) = &self.atlas {
+                if self.atlas.is_some() {
                     let mode = self.active_mouse_mode();
 
                     if mouse::is_mouse_tracking_active(mode) {
@@ -1164,12 +1352,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         };
 
-                        let col =
-                            (self.mouse_position.0 / atlas.cell_width.max(1) as f64) as u32 + 1;
-                        let row = ((self.mouse_position.1 - self.tab_bar_height() as f64)
-                            / atlas.cell_height.max(1) as f64)
-                            as u32
-                            + 1;
+                        let (c, r) =
+                            self.cell_at_pixel(self.mouse_position.0, self.mouse_position.1);
+                        let col = c as u32 + 1;
+                        let row = r as u32 + 1;
 
                         // Determine scroll direction
                         let button = if v > 0.0 {
@@ -1198,6 +1384,28 @@ impl ApplicationHandler<UserEvent> for App {
                             let encoding = self.active_mouse_encoding();
                             let encoded = event.encode(encoding);
                             self.write_to_pty(encoded.as_bytes());
+                        }
+                    } else {
+                        // Not tracking the mouse — scroll the scrollback.
+                        if let Some(tm) = &mut self.tab_manager {
+                            let ch = self
+                                .atlas
+                                .as_ref()
+                                .map(|a| a.cell_height.max(1) as f32)
+                                .unwrap_or(16.0);
+                            let lines = match delta {
+                                winit::event::MouseScrollDelta::LineDelta(_h, v) => v as f32 * 3.0,
+                                winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                                    pos.y as f32 / ch
+                                }
+                            };
+                            let grid = &mut tm.active_mut().grid;
+                            if lines > 0.0 {
+                                grid.smooth_scroll_up(lines);
+                            } else if lines < 0.0 {
+                                grid.smooth_scroll_down(-lines);
+                            }
+                            grid.mark_all_dirty();
                         }
                     }
                 }
@@ -1412,6 +1620,17 @@ impl ApplicationHandler<UserEvent> for App {
                 // a fresh phase and mid-frame redraws keep blinking on time.
                 let needs_redraw = self.advance_blinks();
 
+                // Visual bell: flash is active until its deadline, then the
+                // overlay is cleared (the expiry redraw is scheduled below).
+                let bell_flash = match self.bell_flash_until {
+                    Some(t) if std::time::Instant::now() < t => true,
+                    Some(_) => {
+                        self.bell_flash_until = None;
+                        false
+                    }
+                    None => false,
+                };
+
                 // Compute tab bar height before borrowing tab_manager mutably.
                 let tb_height = self.tab_bar_height();
                 let tb_ref = if tb_height > 0 {
@@ -1431,6 +1650,9 @@ impl ApplicationHandler<UserEvent> for App {
                         atlas,
                         cursor_visible: self.cursor_visible,
                         blink_on: self.text_blink_on,
+                        bell_flash,
+                        padding: self.config.window.padding as f32,
+                        opacity: self.config.window.opacity as f32,
                         colors: &self.config.colors,
                         selection: &self.selection,
                         search: Some(&mut self.search),
@@ -1482,6 +1704,15 @@ impl ApplicationHandler<UserEvent> for App {
         if self.advance_blinks() {
             if let Some(w) = &self.window {
                 w.request_redraw();
+            }
+        }
+        // Clear an expired visual-bell flash and redraw to drop the overlay.
+        if let Some(until) = self.bell_flash_until {
+            if std::time::Instant::now() >= until {
+                self.bell_flash_until = None;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
         }
         match self.next_blink_deadline() {

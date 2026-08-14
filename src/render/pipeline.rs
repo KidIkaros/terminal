@@ -198,6 +198,12 @@ pub struct RenderParams<'a> {
     /// Current SGR blink phase: true renders blinking glyphs, false hides
     /// them (xterm blinks between foreground and background).
     pub blink_on: bool,
+    /// Visual bell: true tints the whole window for one frame.
+    pub bell_flash: bool,
+    /// Window padding in pixels (offset of the cell grid from the window edge).
+    pub padding: f32,
+    /// Window opacity (1.0 = opaque, < 1.0 = translucent background).
+    pub opacity: f32,
     pub colors: &'a ColorConfig,
     pub selection: &'a Selection,
     pub search: Option<&'a mut SearchState>,
@@ -327,7 +333,18 @@ impl TerminalPipeline {
             } else {
                 wgpu::PresentMode::Immediate // No VSync (tearing possible)
             },
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: caps
+                .alpha_modes
+                .iter()
+                .copied()
+                .find(|&m| m == wgpu::CompositeAlphaMode::PostMultiplied)
+                .or_else(|| {
+                    caps.alpha_modes
+                        .iter()
+                        .copied()
+                        .find(|&m| m == wgpu::CompositeAlphaMode::PreMultiplied)
+                })
+                .unwrap_or(caps.alpha_modes[0]),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -543,7 +560,21 @@ impl TerminalPipeline {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // Premultiplied alpha: the shader outputs colors already
+                    // multiplied by their alpha, so translucency composites
+                    // correctly for transparent windows.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -874,6 +905,12 @@ impl TerminalPipeline {
         self.last_dirty_cells
     }
 
+    /// Invalidate the cached color lookup table so the next frame rebuilds it
+    /// (used when the theme/palette changes via config reload).
+    pub fn invalidate_colors(&mut self) {
+        self.color_table.clear();
+    }
+
     // -----------------------------------------------------------------------
     // Re-upload atlas after a cache miss
     // -----------------------------------------------------------------------
@@ -992,6 +1029,7 @@ impl TerminalPipeline {
         cw: f32,
         ch: f32,
         tab_bar_height: f32,
+        pad: f32,
         grid: &Grid,
     ) {
         if self.sixel_images.is_empty() || grid.sixel_images.is_empty() {
@@ -999,7 +1037,8 @@ impl TerminalPipeline {
         }
         // Placement lookup by id (the lists are ≤ MAX_LIVE_SIXELS, so a
         // linear scan per image is cheap and allocation-free).
-        let view_offset = grid.view_scrollback_lines();
+        let (view_offset, scroll_frac) = grid.smooth_view();
+        let scroll_shift = scroll_frac * ch;
         for img in &self.sixel_images {
             let Some(p) = grid.sixel_images.iter().find(|p| p.id == img.id) else {
                 continue;
@@ -1013,7 +1052,10 @@ impl TerminalPipeline {
             let span_w = ((img.pixel_w as f32) / cw.max(1.0)).ceil() as u32;
             let span_h = ((img.pixel_h as f32) / ch.max(1.0)).ceil() as u32;
             let instance = GlyphInstance {
-                cell_pos: [p.col as f32 * cw, tab_bar_height + screen_row as f32 * ch],
+                cell_pos: [
+                    pad + p.col as f32 * cw,
+                    tab_bar_height + pad + screen_row as f32 * ch - scroll_shift,
+                ],
                 cell_size: [span_w as f32 * cw, span_h as f32 * ch],
                 atlas_uv_min: [0.0, 0.0],
                 atlas_uv_max: [1.0, 1.0],
@@ -1116,6 +1158,9 @@ impl TerminalPipeline {
             atlas,
             cursor_visible,
             blink_on,
+            bell_flash,
+            padding,
+            opacity,
             colors,
             selection,
             search,
@@ -1125,6 +1170,7 @@ impl TerminalPipeline {
         let cw = atlas.cell_width as f32;
         let ch = atlas.cell_height as f32;
         let baseline = atlas.baseline;
+        let pad = padding;
 
         // Rebuild cached color table if empty (first render or after theme change).
         // Previously build_color_table allocated 256 entries per cell every frame
@@ -1154,7 +1200,7 @@ impl TerminalPipeline {
             selection.active,
             search.as_ref().is_some_and(|state| state.active),
             tab_bar_changed,
-            grid.view_scrollback_lines() > 0,
+            grid.is_scrolled(),
             dirty_cells.len(),
             grid.rows * grid.cols,
         );
@@ -1384,9 +1430,10 @@ impl TerminalPipeline {
 
         // Scrollback view offset (T1-4): when the user has scrolled up, the
         // top rows are served from the scrollback buffer and the live grid
-        // shifts down. `cell_at_view` handles the mapping; offset 0 keeps
-        // this an identity mapping.
-        let view_offset = grid.view_scrollback_lines();
+        // shifts down. `smooth_view` yields the ceil offset plus a fractional
+        // remainder that shifts content up for smooth (sub-line) scrolling.
+        let (view_offset, scroll_frac) = grid.smooth_view();
+        let scroll_shift = scroll_frac * ch;
 
         for row in 0..grid.rows {
             for col in 0..grid.cols {
@@ -1416,12 +1463,13 @@ impl TerminalPipeline {
                     continue;
                 }
                 let render_cw = if line_mode == 6 { cw * 2.0 } else { cw };
-                let px = if line_mode == 6 {
-                    (col / 2) as f32 * render_cw
-                } else {
-                    col as f32 * cw
-                };
-                let py = tab_bar_height + row as f32 * ch;
+                let px = pad
+                    + if line_mode == 6 {
+                        (col / 2) as f32 * render_cw
+                    } else {
+                        col as f32 * cw
+                    };
+                let py = tab_bar_height + pad + row as f32 * ch - scroll_shift;
 
                 let fg_raw = color_to_rgba(cell.fg, true, colors, &grid.palette, &self.color_table);
                 let bg_raw =
@@ -1438,12 +1486,16 @@ impl TerminalPipeline {
 
                 // Apply selection highlighting — selection coordinates address
                 // live grid rows, so shift by the view offset.
-                if row >= view_offset && selection.contains(row - view_offset, col) {
-                    let sel_bg = cached_sel_bg;
-                    let sel_fg = cached_sel_fg;
-                    bg = sel_bg;
-                    fg = sel_fg;
+                let selected = row >= view_offset && selection.contains(row - view_offset, col);
+                if selected {
+                    bg = cached_sel_bg;
+                    fg = cached_sel_fg;
                 }
+
+                // Background alpha: the default (and colored) cell background
+                // is translucent when the window is; selection/inverse stay
+                // opaque for readability.
+                let bg_alpha = if selected || inverse { 1.0 } else { opacity };
 
                 // 1. Background rectangle
                 instances.push(GlyphInstance {
@@ -1451,8 +1503,8 @@ impl TerminalPipeline {
                     cell_size: [render_cw, ch],
                     atlas_uv_min: [0.0; 2],
                     atlas_uv_max: [0.0; 2],
-                    fg_color: bg, // For background rect, use bg color
-                    bg_color: bg,
+                    fg_color: [bg[0], bg[1], bg[2], bg_alpha],
+                    bg_color: [bg[0], bg[1], bg[2], bg_alpha],
                     mode: 0,
                     _pad: [0; 3],
                 });
@@ -1598,8 +1650,8 @@ impl TerminalPipeline {
             let live_row = grid.cursor.row.min(grid.rows - 1);
             let screen_row = live_row + view_offset;
             if screen_row < grid.rows {
-                let px = col as f32 * cw;
-                let py = tab_bar_height + screen_row as f32 * ch;
+                let px = pad + col as f32 * cw;
+                let py = tab_bar_height + pad + screen_row as f32 * ch - scroll_shift;
                 let cursor_color = cached_cursor;
                 // Geometry by DECSCUSR shape (0/1 fall back to block — the
                 // app side already gates blinking via cursor_visible).
@@ -1619,6 +1671,25 @@ impl TerminalPipeline {
                     _pad: [0; 3],
                 });
             }
+        }
+
+        // Visual bell: full-window tint while a flash is active. Drawn last
+        // so it composites over the cell grid (alpha-blended white overlay).
+        if bell_flash {
+            const FLASH_ALPHA: f32 = 0.18;
+            instances.push(GlyphInstance {
+                cell_pos: [0.0, 0.0],
+                cell_size: [
+                    self.surface_config.width as f32,
+                    self.surface_config.height as f32,
+                ],
+                atlas_uv_min: [0.0; 2],
+                atlas_uv_max: [0.0; 2],
+                fg_color: [1.0, 1.0, 1.0, FLASH_ALPHA],
+                bg_color: [1.0, 1.0, 1.0, FLASH_ALPHA],
+                mode: 0,
+                _pad: [0; 3],
+            });
         }
 
         if atlas.take_dirty() {
@@ -1646,12 +1717,16 @@ impl TerminalPipeline {
                 label: Some("frame"),
             });
 
-        let bg_color = cached_bg;
+        // Transparency: clear fully transparent when the window is translucent
+        // so translucent cell backgrounds composite over the desktop rather
+        // than over an opaque clear. Colors are premultiplied to match the
+        // surface's alpha mode.
+        let clear_alpha = if opacity < 1.0 { 0.0 } else { 1.0 };
         let clear_color = wgpu::Color {
-            r: bg_color[0] as f64,
-            g: bg_color[1] as f64,
-            b: bg_color[2] as f64,
-            a: bg_color[3] as f64,
+            r: cached_bg[0] as f64 * clear_alpha,
+            g: cached_bg[1] as f64 * clear_alpha,
+            b: cached_bg[2] as f64 * clear_alpha,
+            a: clear_alpha,
         };
 
         // Upload instance buffer using double buffering.
@@ -1737,7 +1812,7 @@ impl TerminalPipeline {
                     occlusion_query_set: None,
                 });
                 rpass.set_pipeline(&self.sixel_pipeline);
-                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, grid);
+                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, pad, grid);
             }
 
             // Composite the persistent terminal framebuffer into the swapchain.
@@ -1820,7 +1895,7 @@ impl TerminalPipeline {
                     occlusion_query_set: None,
                 });
                 rpass.set_pipeline(&self.sixel_pipeline);
-                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, grid);
+                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, pad, grid);
             }
 
             self.offscreen_initialized = true;

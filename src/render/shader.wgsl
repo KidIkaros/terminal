@@ -61,13 +61,17 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Colors are emitted premultiplied by alpha; the pipeline blends with
+    // (One, OneMinusSrcAlpha) so translucent backgrounds composite correctly.
     if in.mode == 0u {
         // Background rectangle — solid color, no texture lookup
-        return in.bg_color;
+        return vec4<f32>(in.bg_color.rgb * in.bg_color.a, in.bg_color.a);
     } else {
-        // Glyph — sample atlas (grayscale coverage in R channel)
+        // Glyph — sample atlas (grayscale coverage in R channel). Alpha is the
+        // glyph coverage so only the glyph shape is opaque; the translucent
+        // background underneath shows through the gaps.
         let coverage = textureSample(atlas_texture, atlas_sampler, in.uv).r;
-        // Blend fg over bg using glyph alpha
-        return mix(in.bg_color, in.fg_color, coverage);
+        let alpha = in.fg_color.a * coverage;
+        return vec4<f32>(in.fg_color.rgb * alpha, alpha);
     }
 }

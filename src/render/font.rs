@@ -49,6 +49,12 @@ pub const ATLAS_SIZE: u32 = 1024;
 
 pub struct GlyphAtlas {
     font: Font,
+    /// Dedicated bold/italic faces (loaded from config paths). None falls back
+    /// to the primary face; bold is then synthesized via a faux-bold smear.
+    bold_font: Option<Font>,
+    italic_font: Option<Font>,
+    /// Primary font bytes, kept for RustyBuzz cluster shaping.
+    font_data: Vec<u8>,
     /// Fallback fonts for CJK, emoji, etc., loaded on first glyph miss.
     fallback_fonts: Vec<Font>,
     fallback_attempted: bool,
@@ -91,6 +97,9 @@ impl GlyphAtlas {
 
         GlyphAtlas {
             font,
+            bold_font: None,
+            italic_font: None,
+            font_data: font_bytes.to_vec(),
             fallback_fonts: Vec::new(),
             fallback_attempted: false,
             font_size,
@@ -113,6 +122,20 @@ impl GlyphAtlas {
         }
     }
 
+    /// Set the dedicated bold face (loaded from `font.bold_path`).
+    pub fn set_bold_font(&mut self, font_bytes: &[u8]) {
+        if let Ok(font) = Font::from_bytes(font_bytes, FontSettings::default()) {
+            self.bold_font = Some(font);
+        }
+    }
+
+    /// Set the dedicated italic face (loaded from `font.italic_path`).
+    pub fn set_italic_font(&mut self, font_bytes: &[u8]) {
+        if let Ok(font) = Font::from_bytes(font_bytes, FontSettings::default()) {
+            self.italic_font = Some(font);
+        }
+    }
+
     /// Look up a glyph in the cache, rasterizing and packing it if absent.
     /// Returns `None` if the glyph is a space or if the atlas is full.
     pub fn get_or_rasterize(&mut self, ch: char, bold: bool, italic: bool) -> Option<AtlasRegion> {
@@ -126,8 +149,23 @@ impl GlyphAtlas {
             return Some(*region);
         }
 
-        // Try primary font first
-        let (metrics, bitmap) = self.font.rasterize(ch, self.font_size);
+        // Select the face: dedicated italic/bold fonts when loaded, otherwise
+        // the primary face (bold is then synthesized with a faux-bold smear).
+        let face = if italic {
+            self.italic_font.as_ref().unwrap_or(&self.font)
+        } else if bold {
+            self.bold_font.as_ref().unwrap_or(&self.font)
+        } else {
+            &self.font
+        };
+
+        let (metrics, mut bitmap) = face.rasterize(ch, self.font_size);
+        if bold && self.bold_font.is_none() && metrics.width > 0 {
+            apply_faux_bold(&mut bitmap, metrics.width as usize, metrics.height as usize);
+        }
+        if italic && self.italic_font.is_none() && metrics.width > 0 {
+            apply_faux_italic(&mut bitmap, metrics.width as usize, metrics.height as usize);
+        }
         if metrics.width == 0 || metrics.height == 0 {
             self.ensure_fallback_fonts();
             // Try fallback fonts
@@ -219,7 +257,7 @@ impl GlyphAtlas {
         if text.is_empty() {
             return Vec::new();
         }
-        let Some(face) = rustybuzz::Face::from_slice(embedded_font(), 0) else {
+        let Some(face) = rustybuzz::Face::from_slice(&self.font_data, 0) else {
             return Vec::new();
         };
         let mut buffer = rustybuzz::UnicodeBuffer::new();
@@ -283,26 +321,119 @@ pub fn embedded_font() -> &'static [u8] {
     include_bytes!("../../fonts/JetBrainsMono-Regular.ttf")
 }
 
-/// Load fallback fonts from the fonts directory or embedded resources.
-/// Currently tries to load a CJK fallback font for characters not in the primary font.
+/// Load fallback fonts for CJK, emoji, etc. Search the XDG config dir first
+/// (stable across working directories), then the current directory for a
+/// vendored copy.
 pub fn load_fallback_fonts(atlas: &mut GlyphAtlas) {
-    // Try to load CJK fallback font
     let cjk_font_paths = [
         "fonts/NotoSansCJK-Regular.otf",
         "fonts/NotoSansCJKsc-Regular.otf",
         "fonts/NotoSansSC-Regular.otf",
     ];
 
-    for path in &cjk_font_paths {
-        if let Ok(bytes) = std::fs::read(path) {
-            atlas.add_fallback_font(&bytes);
-            log::info!("Loaded fallback font from {}", path);
-            return;
+    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(config_dir) = dirs::config_dir() {
+        search_dirs.push(config_dir.join("terminal"));
+    }
+    search_dirs.push(std::path::PathBuf::from("."));
+
+    for dir in &search_dirs {
+        for rel in &cjk_font_paths {
+            let path = dir.join(rel);
+            if let Ok(bytes) = std::fs::read(&path) {
+                atlas.add_fallback_font(&bytes);
+                log::info!("Loaded fallback font from {}", path.display());
+                return;
+            }
         }
     }
 
     // No CJK fallback font found - log warning but don't crash
     log::warn!("No CJK fallback font found — CJK and emoji characters may not render correctly");
+}
+
+/// Resolve the primary font bytes from config: an explicit `path` wins, then a
+/// `family` looked up via fontconfig (`fc-match`), falling back to the embedded
+/// font so the binary stays self-contained.
+pub fn load_primary_font(fc: &crate::config::FontConfig) -> Vec<u8> {
+    if let Some(path) = &fc.path {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                log::info!("Loaded font from {}", path);
+                return bytes;
+            }
+            Err(e) => log::warn!("Font path {} unreadable: {e}", path),
+        }
+    }
+
+    if fc.family != crate::config::EMBEDDED_FONT_FAMILY {
+        if let Some(bytes) = resolve_family(&fc.family) {
+            log::info!("Loaded font family '{}' via fontconfig", fc.family);
+            return bytes;
+        }
+        log::warn!(
+            "Font family '{}' not found — using embedded font",
+            fc.family
+        );
+    }
+
+    embedded_font().to_vec()
+}
+
+/// Resolve a family name to font bytes via `fc-match` (fontconfig). Returns
+/// None when fontconfig is unavailable or the family can't be resolved.
+fn resolve_family(family: &str) -> Option<Vec<u8>> {
+    let out = std::process::Command::new("fc-match")
+        .args(["--format=%{file}", family])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// Synthesize bold by smearing each pixel one column rightward (faux bold),
+/// used only when no dedicated bold face is loaded.
+fn apply_faux_bold(bitmap: &mut [u8], width: usize, height: usize) {
+    if width < 2 {
+        return;
+    }
+    for row in 0..height {
+        let base = row * width;
+        for col in (0..width - 1).rev() {
+            let v = bitmap[base + col];
+            if v > bitmap[base + col + 1] {
+                bitmap[base + col + 1] = v;
+            }
+        }
+    }
+}
+
+/// Synthesize italic by shearing the glyph (top rows shift right, bottom rows
+/// stay), used only when no dedicated italic face is loaded. Operates within
+/// the existing width, clipping the slanted right edge by up to a few pixels.
+fn apply_faux_italic(bitmap: &mut [u8], width: usize, height: usize) {
+    if width < 2 || height < 2 {
+        return;
+    }
+    let skew = (height / 8).clamp(1, 4);
+    let mut out = vec![0u8; width * height];
+    for row in 0..height {
+        // Top leans right; bottom is the pivot.
+        let offset = (skew * (height - 1 - row)) / (height - 1);
+        for col in 0..width {
+            let dst = col + offset;
+            if dst < width {
+                out[row * width + dst] = bitmap[row * width + col];
+            }
+        }
+    }
+    bitmap.copy_from_slice(&out);
 }
 
 #[cfg(test)]
@@ -323,5 +454,39 @@ mod tests {
         assert!(!atlas.fallback_attempted);
         atlas.ensure_fallback_fonts();
         assert!(atlas.fallback_attempted);
+    }
+
+    #[test]
+    fn faux_bold_smears_pixels_rightward() {
+        // 3x2 bitmap with a single lit pixel on the left edge of each row.
+        let mut bitmap = vec![200, 0, 0, 150, 0, 0];
+        apply_faux_bold(&mut bitmap, 3, 2);
+        assert_eq!(bitmap, vec![200, 200, 0, 150, 150, 0]);
+    }
+
+    #[test]
+    fn faux_italic_shears_top_rows_right() {
+        // A single lit pixel in the left column of a tall bitmap: after
+        // shearing, the top pixel shifts right while the bottom stays put.
+        let mut bitmap = vec![200, 0, 0, 150, 0, 0];
+        apply_faux_italic(&mut bitmap, 3, 2);
+        // Top row (row 0) shifts right by `skew`; bottom row stays.
+        assert_eq!(bitmap[0], 0, "top pixel moved");
+        assert_eq!(bitmap[1], 200, "top pixel sheared right");
+        assert_eq!(bitmap[3], 150, "bottom pixel unmoved");
+    }
+
+    #[test]
+    fn primary_font_falls_back_to_embedded_for_default_family() {
+        let fc = crate::config::FontConfig {
+            family: crate::config::EMBEDDED_FONT_FAMILY.to_string(),
+            size: 15.0,
+            path: None,
+            bold_path: None,
+            italic_path: None,
+            ligatures: true,
+        };
+        let bytes = load_primary_font(&fc);
+        assert_eq!(bytes, embedded_font());
     }
 }

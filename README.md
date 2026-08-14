@@ -21,6 +21,8 @@ A fast, GPU-accelerated terminal emulator written in Rust.
 - **Notifications** - OSC 9 desktop notifications via notify-send (falls back to logging without a notification daemon)
 - **Locked Down by Default** - OSC 52 clipboard reads are off by default; URI-scheme allowlist for hyperlinks
 - **Keyboard Protocols** - Full kitty keyboard protocol (`CSI u`) with progressive-enhancement flags, push/pop/query, key repeat/release events, alternate keys, and associated text; plus xterm modifyOtherKeys
+- **Kitty Graphics Protocol** - Inline images via `ESC _ G` (`chafa --format=kitty`, `timg`): raw RGB (`f=24`) and RGBA (`f=32`) with chunked transfers (`m=1`/`m=0`). PNG (`f=100`) is not yet decoded
+- **Modern Look & Feel** - Configurable padding and window opacity, double-click word / triple-click line selection, SIGHUP config hot-reload, and smooth scrollback animation
 - **Parser Fuzz Harness** - Deterministic seeded fuzzing of the parser/grid seam
 
 ## Installation
@@ -91,6 +93,7 @@ cursor = "#F5E0DC"
 cursor_style = "block"
 cursor_blink_ms = 500
 text_blink_ms = 500
+bell = "flash"
 ```
 
 ### Available Themes
@@ -152,7 +155,7 @@ Run it yourself: `cargo run --release --bin bench`.
 
 ## Verification
 
-- `cargo test --locked` — 307 tests (parser, grid, selection, sixel, fuzz smoke)
+- `cargo test --locked` — 314 tests (parser, grid, selection, sixel, fuzz smoke)
 - `cargo run --release --bin vt_conformance` — 34 headless VT conformance cases
 - `cargo run --release --bin fuzz -- --quick` — deterministic parser fuzzing
 

@@ -14,9 +14,9 @@ Configuration is loaded from the following locations (in order of priority):
 
 ```toml
 [font]
-family = "JetBrains Mono"  # Font family name (for future use)
+family = "JetBrains Mono"  # Font family name (resolved via fontconfig)
 size = 15.0                # Font size in pixels
-path = ""                  # Path to font file (optional)
+path = ""                  # Path to font file (optional, overrides family)
 bold_path = ""             # Path to bold font file (optional)
 italic_path = ""           # Path to italic font file (optional)
 ligatures = true           # Enable ligature rendering
@@ -26,11 +26,11 @@ ligatures = true           # Enable ligature rendering
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `family` | string | `"JetBrains Mono"` | Font family name (currently informational) |
+| `family` | string | `"JetBrains Mono"` | Font family name, looked up via `fc-match`; embedded fallback |
 | `size` | float | `15.0` | Font size in pixels |
-| `path` | string | `""` | Path to custom font file (TTF/OTF) |
-| `bold_path` | string | `""` | Path to bold variant font |
-| `italic_path` | string | `""` | Path to italic variant font |
+| `path` | string | `""` | Path to custom font file (TTF/OTF), overrides `family` |
+| `bold_path` | string | `""` | Path to bold variant font (otherwise synthesized) |
+| `italic_path` | string | `""` | Path to italic variant font (otherwise regular) |
 | `ligatures` | bool | `true` | Enable ligature rendering |
 
 ## Window Configuration
@@ -140,6 +140,7 @@ text_blink_ms = 500       # SGR text blink interval in milliseconds (0 = no blin
 | `cursor_style` | string | `"block"` | Cursor appearance |
 | `cursor_blink_ms` | u64 | `500` | Cursor blink interval (0 to disable) |
 | `text_blink_ms` | u64 | `500` | SGR text blink interval (0 to disable) |
+| `bell` | string | `"flash"` | BEL feedback: `"flash"`, `"audible"`, or `"none"` |
 
 ### Cursor Styles
 

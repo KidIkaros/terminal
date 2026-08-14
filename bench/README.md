@@ -52,6 +52,20 @@ This is the CPU-side parser+grid tier only; the full GUI tier adds rendering. Sh
 118–170 MiB/s figures are whole-GUI numbers, so a like-for-like comparison requires the GUI
 benchmark on a display.
 
+## PTY drain budget
+
+The interactive app drains each tab's PTY channel in bounded chunks per frame
+(`DRAIN_BUDGET_BYTES`, 256 KiB, overridable via `TERMINAL_DRAIN_BUDGET`). This keeps a single
+output burst from stalling a frame: at ~48 MiB/s a 256 KiB drain parses in ~5 ms, well under a
+16.6 ms frame at 60 Hz. The backlog then drains across subsequent frames.
+
+The trade-off is throughput under vsync: effective sustained rate ≈ `budget × refresh_rate`.
+At 256 KiB × 60 Hz that is ~15 MiB/s, below the ~48 MiB/s raw parse ceiling, so a `cat` of a
+very large file is budget-bound rather than parser-bound. Raising the budget (e.g.
+`TERMINAL_DRAIN_BUDGET=1048576` for 1 MiB) makes the parser the bottleneck again at the cost
+of up to ~20 ms per drain under a spike. The default favors input responsiveness; the raw
+`bench` numbers above are unaffected because they bypass the drain loop entirely.
+
 ## Scroll-path hot loop
 
 Profiling showed `cat bigfile` spent ~85% of CPU in the scroll path, not the write loop

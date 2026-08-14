@@ -627,10 +627,35 @@ pub struct Grid {
     next_sixel_id: u64,
     /// True while inside a sixel DCS sequence so Put accumulates raw data.
     dcs_sixel: bool,
+    /// In-progress kitty graphics transmission (chunked `m=1`).
+    kitty_gfx: Option<KittyGfxPending>,
     /// Cell size in pixels (set by the app after font load; used for the
     /// post-image cursor advance).
     pub cell_w: u32,
     pub cell_h: u32,
+}
+
+/// In-progress kitty graphics (APC `G`) transmission. Chunked transfers
+/// (`m=1`) accumulate base64 across multiple APC sequences until the final
+/// `m=0` chunk arrives.
+struct KittyGfxPending {
+    /// Pixel format: 24 = RGB24, 32 = RGBA8 (the default), 100 = PNG.
+    format: u32,
+    width: u32,
+    height: u32,
+    /// Accumulated base64 payload (decoded at finalize).
+    data: Vec<u8>,
+}
+
+/// Parse a non-negative ASCII integer (kitty graphics control values).
+fn parse_ascii_u32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0u32, |acc, &b| {
+        if b.is_ascii_digit() {
+            acc * 10 + (b - b'0') as u32
+        } else {
+            acc
+        }
+    })
 }
 
 /// Default horizontal tab stops: every 8 columns (VT100 power-up state).
@@ -804,6 +829,7 @@ impl Grid {
             notification: None,
             sixel_images: Vec::new(),
             dcs_sixel: false,
+            kitty_gfx: None,
             cell_w: 8,
             cell_h: 16,
             clipboard_query_requested: false,
@@ -941,6 +967,122 @@ impl Grid {
         log::debug!("Sixel: placed image #{id} at ({col},{row})");
     }
 
+    /// Handle a completed APC string. Only the kitty graphics protocol
+    /// (`ESC _ G ... ST`) is recognized; other APC payloads are ignored.
+    fn handle_apc(&mut self, data: &[u8]) {
+        if data.first() != Some(&b'G') {
+            return;
+        }
+        // Split control params from the base64 payload at the first ';'.
+        let (control, payload) = match data[1..].iter().position(|&b| b == b';') {
+            Some(i) => (&data[1..1 + i], &data[2 + i..]),
+            None => (&data[1..], &[][..]),
+        };
+
+        let mut action = 0u8;
+        let mut format = 32u32;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut more_chunks = false;
+        for kv in control.split(|&b| b == b',') {
+            let Some(eq) = kv.iter().position(|&b| b == b'=') else {
+                continue;
+            };
+            let (k, v) = (&kv[..eq], &kv[eq + 1..]);
+            match k {
+                b"a" => action = v.first().copied().unwrap_or(0),
+                b"f" => format = parse_ascii_u32(v),
+                b"s" => width = parse_ascii_u32(v),
+                b"v" => height = parse_ascii_u32(v),
+                b"m" => more_chunks = parse_ascii_u32(v) == 1,
+                _ => {}
+            }
+        }
+
+        // `a=T` starts a new transmission; continuation chunks carry only
+        // `m=`. Only transmit-and-place is implemented (a=t/a=C/a=d/a=q are
+        // ignored for now).
+        if action == b'T' {
+            self.kitty_gfx = Some(KittyGfxPending {
+                format,
+                width,
+                height,
+                data: payload.to_vec(),
+            });
+            if !more_chunks {
+                let done = self.kitty_gfx.take().expect("pending");
+                self.finalize_kitty(done);
+            }
+        } else if self.kitty_gfx.is_some() {
+            let pending = self.kitty_gfx.as_mut().expect("checked");
+            pending.data.extend_from_slice(payload);
+            if !more_chunks {
+                let done = self.kitty_gfx.take().expect("pending");
+                self.finalize_kitty(done);
+            }
+        }
+    }
+
+    /// Decode a completed kitty graphics transmission and place it at the
+    /// cursor (reusing the sixel placement/render path).
+    fn finalize_kitty(&mut self, pending: KittyGfxPending) {
+        use base64::Engine as _;
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&pending.data) else {
+            log::debug!("Kitty graphics: base64 decode failed");
+            return;
+        };
+        let rgba = match pending.format {
+            24 => {
+                // RGB24 (3 bytes/px) → RGBA8, opaque alpha.
+                let mut out =
+                    Vec::with_capacity(pending.width as usize * pending.height as usize * 4);
+                for chunk in raw.chunks_exact(3) {
+                    out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+                }
+                out
+            }
+            32 => raw, // RGBA8 (4 bytes/px) — the default, stored as-is.
+            100 => {
+                // PNG requires a decoder dependency; deferred for now.
+                log::debug!("Kitty graphics: PNG (f=100) not yet supported");
+                return;
+            }
+            other => {
+                log::debug!("Kitty graphics: unsupported format {other}");
+                return;
+            }
+        };
+        let expected = pending.width as usize * pending.height as usize * 4;
+        if rgba.len() != expected {
+            log::debug!(
+                "Kitty graphics: size mismatch ({} vs {expected})",
+                rgba.len()
+            );
+            return;
+        }
+
+        let image = crate::sixel::SixelImage {
+            width: pending.width,
+            height: pending.height,
+            rgba,
+        };
+        let col = self.cursor.col;
+        let row = self.cursor.row;
+        let id = self.next_sixel_id;
+        self.next_sixel_id = self.next_sixel_id.wrapping_add(1);
+        self.sixel_images.push(crate::sixel::SixelPlacement {
+            id,
+            col,
+            row,
+            image,
+        });
+        while self.sixel_images.len() > crate::sixel::MAX_LIVE_SIXELS {
+            self.sixel_images.remove(0);
+        }
+        self.mark_all_dirty();
+        log::debug!("Kitty graphics: placed image #{id} at ({col},{row})");
+    }
+
     /// Take the pending notification text (OSC 9 / OSC 9;4), leaving None.
     pub fn take_notification(&mut self) -> Option<String> {
         std::mem::take(&mut self.notification)
@@ -1010,6 +1152,22 @@ impl Grid {
     /// what the buffer holds).
     pub fn view_scrollback_lines(&self) -> usize {
         self.scrollback_offset.min(self.scrollback.len())
+    }
+
+    /// True when the view is scrolled up at all (integer or fractional).
+    pub fn is_scrolled(&self) -> bool {
+        self.scrollback_offset > 0 || self.scroll_fraction > 0.0
+    }
+
+    /// Smooth-scroll view mapping: `(view_offset, remaining_fraction)` where
+    /// `view_offset` is the number of scrollback lines to skip at the top
+    /// (ceil of the fractional position) and `remaining_fraction` is how much
+    /// of the top line is clipped (0.0..1.0, 0 when on an integer boundary).
+    pub fn smooth_view(&self) -> (usize, f32) {
+        let total = self.scrollback_offset as f32 + self.scroll_fraction;
+        let ceil = total.ceil() as usize;
+        let view_offset = ceil.min(self.scrollback.len());
+        (view_offset, (total.ceil() - total).clamp(0.0, 1.0))
     }
 
     /// Map a *screen* row/col to its backing cell, accounting for the
@@ -1351,23 +1509,22 @@ impl Grid {
         self.scroll_fraction = 0.0;
     }
 
-    /// Scroll up by a fractional amount (for smooth scrolling)
+    /// Scroll up by a fractional line amount (for smooth scrolling).
     pub fn smooth_scroll_up(&mut self, amount: f32) {
-        let total = self.scrollback_offset as f32 + self.scroll_fraction + amount;
-        self.scrollback_offset = (total / self.rows as f32).floor() as usize;
-        self.scroll_fraction = total.fract();
+        let total = (self.scrollback_offset as f32 + self.scroll_fraction + amount)
+            .min(self.scrollback.len() as f32);
+        self.scrollback_offset = total.floor() as usize;
+        self.scroll_fraction = total - total.floor();
+        if self.scrollback_offset >= self.scrollback.len() {
+            self.scroll_fraction = 0.0;
+        }
     }
 
-    /// Scroll down by a fractional amount (for smooth scrolling)
+    /// Scroll down by a fractional line amount (for smooth scrolling).
     pub fn smooth_scroll_down(&mut self, amount: f32) {
-        let total = self.scrollback_offset as f32 + self.scroll_fraction - amount;
-        if total <= 0.0 {
-            self.scrollback_offset = 0;
-            self.scroll_fraction = 0.0;
-        } else {
-            self.scrollback_offset = (total / self.rows as f32).floor() as usize;
-            self.scroll_fraction = total.fract();
-        }
+        let total = (self.scrollback_offset as f32 + self.scroll_fraction - amount).max(0.0);
+        self.scrollback_offset = total.floor() as usize;
+        self.scroll_fraction = total - total.floor();
     }
 
     /// Mark cells in a match range as dirty for highlighting
@@ -3605,6 +3762,10 @@ impl Perform for Grid {
                 self.handle_osc(&params);
             }
 
+            Action::ApcDispatch { data } => {
+                self.handle_apc(&data);
+            }
+
             Action::EscDispatch {
                 intermediates,
                 ignore: _,
@@ -3795,6 +3956,61 @@ mod tests {
         assert_eq!(g.cell(0, 0).ch, 'A');
         assert_eq!(g.cursor.col, 1);
         assert_eq!(g.cursor.row, 0);
+    }
+
+    #[test]
+    fn test_kitty_graphics_places_rgb_image() {
+        use base64::Engine as _;
+        let mut g = make_grid(80, 24);
+        // 2x1 RGB24 image (f=24): red, green.
+        let raw = [255u8, 0, 0, 0, 255, 0];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let mut seq = format!("\x1b_Ga=T,f=24,s=2,v=1;{b64}").into_bytes();
+        seq.extend_from_slice(b"\x1b\\");
+        feed(&mut g, &seq);
+
+        assert_eq!(g.sixel_images.len(), 1);
+        let p = &g.sixel_images[0];
+        assert_eq!(p.image.width, 2);
+        assert_eq!(p.image.height, 1);
+        assert_eq!(p.image.rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!((p.col, p.row), (0, 0));
+    }
+
+    #[test]
+    fn test_kitty_graphics_places_rgba_image() {
+        use base64::Engine as _;
+        let mut g = make_grid(80, 24);
+        // 2x1 RGBA image (f=32, the default): red@255, green@128.
+        let raw = [255u8, 0, 0, 255, 0, 255, 0, 128];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let mut seq = format!("\x1b_Ga=T,f=32,s=2,v=1;{b64}").into_bytes();
+        seq.extend_from_slice(b"\x1b\\");
+        feed(&mut g, &seq);
+
+        assert_eq!(g.sixel_images.len(), 1);
+        let p = &g.sixel_images[0];
+        assert_eq!(p.image.rgba, vec![255, 0, 0, 255, 0, 255, 0, 128]);
+    }
+
+    #[test]
+    fn test_kitty_graphics_chunked() {
+        use base64::Engine as _;
+        let mut g = make_grid(80, 24);
+        let raw = [255u8, 0, 0, 0, 255, 0];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let (c1, c2) = b64.split_at(b64.len() / 2);
+        let mut seq = format!("\x1b_Ga=T,f=24,s=2,v=1,m=1;{c1}").into_bytes();
+        seq.extend_from_slice(b"\x1b\\");
+        seq.extend_from_slice(format!("\x1b_Gm=0;{c2}").as_bytes());
+        seq.extend_from_slice(b"\x1b\\");
+        feed(&mut g, &seq);
+
+        assert_eq!(g.sixel_images.len(), 1);
+        assert_eq!(
+            g.sixel_images[0].image.rgba,
+            vec![255, 0, 0, 255, 0, 255, 0, 255]
+        );
     }
 
     #[test]

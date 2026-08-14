@@ -3,6 +3,8 @@
 # or ~/.config/terminal/config.toml for global settings.
 
 [font]
+# family is resolved via fontconfig (fc-match); falls back to the embedded
+# JetBrains Mono when not installed. `path` overrides family entirely.
 family = "JetBrains Mono"
 size = 15.0
 # path = "/path/to/font.ttf"
@@ -84,6 +86,9 @@ cursor_blink_ms = 500
 
 # SGR text blink interval in milliseconds (0 = no blink; rendered solid)
 text_blink_ms = 500
+
+# Bell feedback: "flash", "audible", or "none"
+bell = "flash"
 
 # Cursor style: "block", "bar", or "underline"
 cursor_style = "block"
