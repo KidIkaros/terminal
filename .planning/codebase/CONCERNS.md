@@ -68,31 +68,34 @@ The following items from the 2026-08-10 audit are no longer concerns:
 - **Glyph atlas is a single 1024×1024 page.** Sufficient for ASCII + Latin-1 +
   modest CJK, but full CJK/emoji coverage could exhaust it. The scaling path is
   multi-page atlases.
-- **Parse thread / grid snapshot** is deferred — but now on measured data, not
-  speculation. A scroll-storm trace (see Performance notes) shows the render
-  pass is ~1.3 ms/frame (p50) while the PTY drain is ~25–50 ms/call at the
-  256 KiB budget. The bottleneck is the single-threaded parse+apply drain, not
-  rendering; a background grid/parse thread would overlap that work with the
-  render loop and recover input responsiveness under sustained backlogs. It is
-  a large, correctness-sensitive refactor (grid ownership, input sync, cursor
-  round-trips) and is the one remaining performance item.
+- **Parse thread / grid snapshot** — *implemented*. Each tab now runs a
+  background engine thread (`src/engine.rs`) that owns the grid, parser, and
+  PTY and publishes immutable `GridSnapshot`s (rows are shared `Arc` handles,
+  so publishing copies only row pointers). The render/input threads never
+  parse; they read snapshots and drive the engine through a command channel.
+  Input state (selection, viewport scroll, resize, focus, mouse/key modes)
+  round-trips as commands; side effects (bell, title, clipboard, DECCOLM)
+  arrive as events. Measured win: see Performance notes — sustained `cat`
+  throughput roughly quadrupled and the frame loop no longer stalls on the
+  drain.
 
 ## Performance notes
 
-- **PTY drain is budget-capped** (`DRAIN_BUDGET_BYTES`, 256 KiB, overridable via
-  `TERMINAL_DRAIN_BUDGET`). A backlog drains across frames rather than stalling
-  one. Throughput ceiling under vsync ≈ `budget × refresh_rate`; raise the
-  budget for full ~48 MiB/s sustained `cat` throughput.
+- **Parsing runs on a per-tab engine thread** (`src/engine.rs`); the app never
+  parses. The engine drains the PTY channel in budget-capped batches
+  (`DRAIN_BUDGET_BYTES`, 256 KiB, overridable via `TERMINAL_DRAIN_BUDGET`),
+  then publishes a snapshot and wakes the event loop. The budget bounds
+  engine-side batch latency so snapshots stay fresh; it no longer caps GUI
+  throughput the way the old single-threaded drain did.
+- **Scroll-storm trace (measured 2026-08-14 after the engine refactor,
+  `TERMINAL_RENDER_TRACE=1`, 24 MiB `cat`-style burst):** engine parse
+  throughput ~45 MiB/s (up from ~6–12 MiB/s effective single-threaded), while
+  the main thread rendered ~5000 frames at p50 ≈ 0.4 ms, p99 ≈ 1.1 ms — the
+  frame loop no longer stalls on parsing. The engine and render loop run
+  concurrently; the old profile (render 1.3 ms, drain 22–44 ms/call blocking
+  the frame) is retired.
 - **Raw parser throughput** is ~48 MiB/s headless (validated on a quiet
-  machine). This is the number that matters for `bench`; the GUI number is
-  vsync/contention-bound.
-- **Scroll-storm trace (measured 2026-08-14, `TERMINAL_RENDER_TRACE=1`):**
-  render p50/p90/p99 ≈ 1.3/1.7/13.7 ms per frame at 1200 dirty cells — the
-  render path is not the bottleneck. The drain is: ~256 KiB/call at
-  ~22–44 ms/call (≈6–12 MiB/s effective) with `more_pending` set throughout.
-  Conclusion: the ~4x gap to raw parse throughput lives in the single-threaded
-  parse+apply drain, not in rendering — see "Parse thread / grid snapshot"
-  above.
+  machine). The GUI number is now PTY/reader-bound rather than frame-bound.
 
 ## Fragile areas
 
@@ -105,8 +108,8 @@ The following items from the 2026-08-10 audit are no longer concerns:
 
 ## Test coverage (current)
 
-- **~318 tests** across lib + bins (parser, grid, key encoding, config, font),
-  **320** with `--features video`.
+- **~319 tests** across lib + bins (parser, grid, key encoding, config, font,
+  engine, tabs), **321** with `--features video`.
 - **35/35 VT conformance** cases (`vt_conformance` binary).
 - **Fuzz harness** (`src/bin/fuzz.rs`) — hundreds of MB fuzzed clean across
   parser/grid/scroll/erase/sixel paths.

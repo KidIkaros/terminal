@@ -20,7 +20,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::config::ColorConfig;
-use crate::grid::{Color, ColorPalette, Grid};
+use crate::grid::{Color, ColorPalette, GridSnapshot};
 use crate::render::font::{GlyphAtlas, ShapedGlyph, ATLAS_SIZE};
 use crate::search::SearchState;
 use crate::selection::Selection;
@@ -192,7 +192,13 @@ fn color_to_rgba(
 
 /// Parameters for a single frame render.
 pub struct RenderParams<'a> {
-    pub grid: &'a mut Grid,
+    /// Immutable engine snapshot for this frame (Arc clone — O(1)). The
+    /// pipeline caches it for next-frame dirty diffing.
+    pub grid: Arc<GridSnapshot>,
+    /// Inline video frame to draw (app-owned; `None` clears the overlay).
+    pub video_frame: Option<&'a crate::sixel::SixelImage>,
+    /// Version counter for `video_frame` — re-upload only when it changes.
+    pub video_version: u64,
     pub atlas: &'a mut GlyphAtlas,
     pub cursor_visible: bool,
     /// Current SGR blink phase: true renders blinking glyphs, false hides
@@ -251,6 +257,10 @@ pub struct TerminalPipeline {
     dirty_mask: Vec<bool>,
     /// Number of terminal cells reported dirty by the most recent frame.
     last_dirty_cells: usize,
+    /// Previous frame's snapshot; row-pointer diffing against the current
+    /// one yields dirty rows (the grid copy-on-writes rows, so a changed
+    /// row always has a new Arc identity).
+    last_snapshot: Option<Arc<GridSnapshot>>,
     /// Cached 256-entry color lookup table. Rebuilt only when theme changes.
     /// Previously build_color_table was called per-cell for Color::Indexed,
     /// allocating a 256-entry Vec every time. Now cached globally.
@@ -827,6 +837,7 @@ impl TerminalPipeline {
             instances: Vec::with_capacity(4096),
             dirty_mask: Vec::new(),
             last_dirty_cells: 0,
+            last_snapshot: None,
             color_table: Vec::with_capacity(256),
             current_buffer: 0,
             sixel_pipeline,
@@ -946,7 +957,7 @@ impl TerminalPipeline {
     /// switch), so this reconciles by id: textures for placements the grid
     /// removed are freed, and new placements are uploaded. The grid caps its
     /// list at `MAX_LIVE_SIXELS`, so no GPU-side trim is needed.
-    fn upload_sixel_images(&mut self, grid: &mut Grid) {
+    fn upload_sixel_images(&mut self, grid: &GridSnapshot) {
         if self.sixel_images.is_empty() && grid.sixel_images.is_empty() {
             return;
         }
@@ -1028,8 +1039,8 @@ impl TerminalPipeline {
     /// Update each sixel image's instance quad with the current cell geometry
     /// and draw them all into the given render pass (caller selects pipeline
     /// and sets vertex buffers 0..2 is handled here). Positions come from the
-    /// grid's live placement list each frame, shifted by the scrollback view
-    /// offset like the cells underneath.
+    /// snapshot's live placement list each frame, shifted by the scrollback
+    /// view offset like the cells underneath.
     fn draw_sixel_images(
         &mut self,
         rpass: &mut wgpu::RenderPass<'_>,
@@ -1037,7 +1048,7 @@ impl TerminalPipeline {
         ch: f32,
         tab_bar_height: f32,
         pad: f32,
-        grid: &Grid,
+        grid: &GridSnapshot,
     ) {
         if self.sixel_images.is_empty() || grid.sixel_images.is_empty() {
             return;
@@ -1081,17 +1092,17 @@ impl TerminalPipeline {
     }
 
     /// Upload (or clear) the inline video frame texture. Re-uploads only when
-    /// `grid.video_frame_version` changes, so steady frames are free.
-    fn upload_video_frame(&mut self, grid: &Grid) {
-        let Some(frame) = &grid.video_frame else {
+    /// `version` changes, so steady frames are free.
+    fn upload_video_frame(&mut self, frame: Option<&crate::sixel::SixelImage>, version: u64) {
+        let Some(frame) = frame else {
             self.video_image = None;
             self.video_version = 0;
             return;
         };
-        if self.video_version == grid.video_frame_version && self.video_image.is_some() {
+        if self.video_version == version && self.video_image.is_some() {
             return;
         }
-        self.video_version = grid.video_frame_version;
+        self.video_version = version;
         let w = frame.width.max(1);
         let h = frame.height.max(1);
 
@@ -1188,18 +1199,16 @@ impl TerminalPipeline {
         ch: f32,
         tab_bar_height: f32,
         pad: f32,
-        grid: &Grid,
+        cols: usize,
+        rows: usize,
     ) {
         let Some(img) = &self.video_image else { return };
-        if grid.video_frame.is_none() {
-            return;
-        }
         // Center the frame (its native pixel size) in the cell-grid area,
         // letterboxing to preserve the source aspect ratio.
         let vw = img.pixel_w as f32;
         let vh = img.pixel_h as f32;
-        let area_w = grid.cols as f32 * cw;
-        let area_h = grid.rows as f32 * ch;
+        let area_w = cols as f32 * cw;
+        let area_h = rows as f32 * ch;
         let instance = GlyphInstance {
             cell_pos: [
                 pad + (area_w - vw) / 2.0,
@@ -1300,9 +1309,45 @@ impl TerminalPipeline {
         bg_count
     }
 
+    /// Diff the current snapshot against the previous frame's to find dirty
+    /// cells. Rows are shared Arc handles and the grid copy-on-writes them,
+    /// so pointer identity is an exact "row changed" test in O(rows).
+    fn diff_dirty_cells(&self, grid: &GridSnapshot) -> Vec<(usize, usize)> {
+        let total = grid.rows * grid.cols;
+        let prev = match &self.last_snapshot {
+            Some(p) if p.generation == grid.generation => return Vec::new(),
+            Some(p) if p.rows == grid.rows && p.cols == grid.cols => p,
+            // Size changed — everything is dirty.
+            _ => {
+                return (0..total).map(|i| (i / grid.cols, i % grid.cols)).collect();
+            }
+        };
+        // Non-cell state that changes per-cell rendering (DECSCNM screen
+        // reverse, palette colors) forces a full redraw even when no row
+        // pointer changed.
+        if prev.screen_reverse != grid.screen_reverse || prev.palette != grid.palette {
+            return (0..total).map(|i| (i / grid.cols, i % grid.cols)).collect();
+        }
+        let mut dirty = Vec::new();
+        for row in 0..grid.rows {
+            let changed = match (prev.cells.get(row), grid.cells.get(row)) {
+                (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                _ => true,
+            };
+            if changed {
+                for col in 0..grid.cols {
+                    dirty.push((row, col));
+                }
+            }
+        }
+        dirty
+    }
+
     pub fn render(&mut self, params: RenderParams<'_>) {
         let RenderParams {
             grid,
+            video_frame,
+            video_version,
             atlas,
             cursor_visible,
             blink_on,
@@ -1337,12 +1382,18 @@ impl TerminalPipeline {
         // Keep the damage count for profiling and drive the guarded persistent
         // target path. UI overlays, selection, scrollback, cursor visibility,
         // and large damage regions use a correctness-first full redraw.
-        // Upload any sixel images the grid decoded since the last frame, and
-        // the inline video frame (re-uploaded only when its version changes).
-        self.upload_sixel_images(grid);
-        self.upload_video_frame(grid);
+        // Upload any sixel images the engine decoded since the last snapshot,
+        // and the inline video frame (re-uploaded only when its version
+        // changes).
+        self.upload_sixel_images(&grid);
+        self.upload_video_frame(video_frame, video_version);
 
-        let dirty_cells = grid.take_dirty_cells();
+        // Dirty tracking by snapshot diff: the engine copy-on-writes rows, so
+        // a changed row always has a new Arc identity. Comparing row pointers
+        // against the previous frame's snapshot yields exact dirty rows in
+        // O(rows) without any per-cell bookkeeping on the engine thread.
+        let dirty_cells = self.diff_dirty_cells(&grid);
+        self.last_snapshot = Some(Arc::clone(&grid));
         self.last_dirty_cells = dirty_cells.len();
         let full_redraw = needs_full_redraw(
             self.offscreen_initialized,
@@ -1962,8 +2013,16 @@ impl TerminalPipeline {
                     occlusion_query_set: None,
                 });
                 rpass.set_pipeline(&self.sixel_pipeline);
-                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, pad, grid);
-                self.draw_video_frame(&mut rpass, cw, ch, tab_bar_height, pad, grid);
+                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, pad, &grid);
+                self.draw_video_frame(
+                    &mut rpass,
+                    cw,
+                    ch,
+                    tab_bar_height,
+                    pad,
+                    grid.cols,
+                    grid.rows,
+                );
             }
 
             // Composite the persistent terminal framebuffer into the swapchain.
@@ -2050,8 +2109,16 @@ impl TerminalPipeline {
                     occlusion_query_set: None,
                 });
                 rpass.set_pipeline(&self.sixel_pipeline);
-                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, pad, grid);
-                self.draw_video_frame(&mut rpass, cw, ch, tab_bar_height, pad, grid);
+                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, pad, &grid);
+                self.draw_video_frame(
+                    &mut rpass,
+                    cw,
+                    ch,
+                    tab_bar_height,
+                    pad,
+                    grid.cols,
+                    grid.rows,
+                );
             }
 
             self.offscreen_initialized = true;

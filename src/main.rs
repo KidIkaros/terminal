@@ -5,7 +5,8 @@ use std::sync::{
 
 use terminal::clipboard::ClipboardManager;
 use terminal::config::Config;
-use terminal::grid::WinSize;
+use terminal::engine::{Command, Event as EngineEvent};
+use terminal::grid::{GridSnapshot, WinSize};
 use terminal::mouse::MouseButton;
 use terminal::render::{
     font::GlyphAtlas,
@@ -13,15 +14,14 @@ use terminal::render::{
 };
 use terminal::search::SearchState;
 use terminal::selection::{Selection, SelectionMode};
+use terminal::sixel::SixelImage;
 use terminal::tab_bar::TabBar;
 use terminal::tabs::TabManager;
 use terminal::theme::Theme;
 // Re-import modules so bare paths like `grid::MouseMode` resolve.
 #[cfg(unix)]
 use nix::libc;
-use terminal::{
-    clipboard, config, grid, mouse, parser, pty, render, search, selection, tab_bar, tabs, theme,
-};
+use terminal::{config, grid, mouse, pty, render, tab_bar};
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
@@ -132,6 +132,15 @@ struct App {
     video_next_frame: std::time::Instant,
     #[cfg(feature = "video")]
     video_frame_interval: std::time::Duration,
+
+    /// Generation of the last snapshot the app rendered/acknowledged; used
+    /// in `about_to_wait` to catch publishes whose wake was coalesced away.
+    last_generation: u64,
+    /// Current inline video frame (app-owned overlay, rendered via the
+    /// kitty-graphics path). `None` hides the overlay.
+    video_frame: Option<SixelImage>,
+    /// Bumped on every frame change so the GPU re-uploads only on update.
+    video_version: u64,
 }
 
 impl App {
@@ -196,6 +205,9 @@ impl App {
             video_next_frame: std::time::Instant::now(),
             #[cfg(feature = "video")]
             video_frame_interval: std::time::Duration::from_millis(33),
+            last_generation: 0,
+            video_frame: None,
+            video_version: 0,
         }
     }
 
@@ -211,187 +223,99 @@ impl App {
     // --- Active tab accessors (return defaults when tab_manager is not yet
     //     initialized, i.e. before `resumed`). ---
 
-    fn active_mouse_mode(&self) -> grid::MouseMode {
+    /// Latest engine snapshot for the active tab, if the tab exists.
+    fn active_snapshot(&self) -> Option<std::sync::Arc<GridSnapshot>> {
         self.tab_manager
             .as_ref()
-            .map(|tm| tm.active().grid.mouse_mode)
+            .map(|tm| tm.active().engine.snapshot())
+    }
+
+    fn active_mouse_mode(&self) -> grid::MouseMode {
+        self.active_snapshot()
+            .map(|s| s.mouse_mode)
             .unwrap_or_default()
     }
 
     fn active_mouse_encoding(&self) -> grid::MouseEncoding {
-        self.tab_manager
-            .as_ref()
-            .map(|tm| tm.active().grid.mouse_encoding)
+        self.active_snapshot()
+            .map(|s| s.mouse_encoding)
             .unwrap_or_default()
     }
 
+    /// Extract visible lines for search/selection. Blocking round-trip to
+    /// the engine thread (user-initiated, rare).
     fn active_all_lines(&self) -> Vec<String> {
         self.tab_manager
             .as_ref()
-            .map(|tm| tm.active().grid.all_lines())
+            .map(|tm| tm.active().engine.get_lines_blocking())
             .unwrap_or_default()
     }
 
     fn active_bracketed_paste(&self) -> bool {
-        self.tab_manager
-            .as_ref()
-            .map(|tm| tm.active().grid.bracketed_paste)
+        self.active_snapshot()
+            .map(|s| s.bracketed_paste)
             .unwrap_or(false)
     }
 
-    /// Drain pending bytes from the active tab's PTY channel, parse them, and
-    /// update the grid. Parsing is budget-capped per call so a large output
-    /// burst is spread across multiple frames rather than stalling one frame.
-    /// Returns `(had_data, more_pending)`: whether anything was processed and
-    /// whether the channel still holds unparsed bytes after hitting the cap.
-    fn drain_pty(&mut self) -> (bool, bool) {
-        let budget_cap = self.drain_budget_bytes;
-        let Some(tm) = &mut self.tab_manager else {
-            return (false, false);
+    /// Drain the active tab's engine event channel and apply side effects
+    /// (clipboard, title, bell, notifications, DECCOLM resize requests, shell
+    /// exit). Parsing itself happens on the engine thread; this only touches
+    /// app-owned state. Returns true if the frame should be redrawn.
+    fn process_engine_events(&mut self) -> bool {
+        let Some(tm) = &self.tab_manager else {
+            return false;
         };
-        let tab = tm.active_mut();
-
-        // Capture the title before parsing so we can detect OSC title changes.
-        let title_before = tab.grid.palette.title.clone();
-
-        // Collect chunks first so we can split the borrow cleanly. A
-        // disconnected receiver means the child shell exited; preserve the
-        // final bytes already queued, then let the app close cleanly.
-        //
-        // Budget-capped: stop pulling once DRAIN_BUDGET_BYTES have been
-        // collected and flag that more remains, so the backlog drains across
-        // frames instead of blocking this one. A chunk is never split (it may
-        // end mid-escape-sequence), so we may overshoot the cap by one chunk.
-        let mut pending: Vec<Vec<u8>> = Vec::new();
-        let mut channel_closed = false;
-        let mut more_pending = false;
-        if let Some(rx) = &tab.pty_rx {
-            let mut budget = 0usize;
-            loop {
-                match rx.try_recv() {
-                    Ok(chunk) => {
-                        budget += chunk.len();
-                        pending.push(chunk);
-                        if budget >= budget_cap {
-                            more_pending = !rx.is_empty();
-                            break;
-                        }
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        channel_closed = true;
-                        break;
-                    }
-                }
+        // Collect pending events first so we can borrow self mutably below.
+        let mut events = Vec::new();
+        loop {
+            match tm.active().engine.try_event() {
+                Some(ev) => events.push(ev),
+                None => break,
             }
         }
-        let had_data = !pending.is_empty();
-        if had_data {
-            // Bulk mode: skip per-cell dirty bookkeeping during the batch.
-            // Scrolling output would otherwise mark the whole visible region
-            // dirty on every line feed (O(rows×cols) per scroll). One
-            // mark_all_dirty() below covers the same cells for rendering.
-            tab.grid.bulk_output = true;
-        }
-        // Env-gated parse timing: TERMINAL_RENDER_TRACE logs the bytes
-        // parsed and microseconds spent per drain, so a backlog spike is
-        // measurable in the field.
-        let trace = std::env::var_os("TERMINAL_RENDER_TRACE").is_some();
-        let parse_start = trace.then(std::time::Instant::now);
-        let mut parsed_bytes = 0usize;
-        for chunk in pending {
-            parsed_bytes += chunk.len();
-            tab.parser.advance_bytes(&mut tab.grid, &chunk);
-        }
-        if let Some(start) = parse_start {
-            log::info!(
-                "perf drain bytes={} elapsed_us={} more_pending={}",
-                parsed_bytes,
-                start.elapsed().as_micros(),
-                more_pending
-            );
-        }
-        if had_data {
-            tab.grid.bulk_output = false;
-            // The parser marks changed cells dirty during print/scroll/erase
-            // operations; bulk mode deferred that, so mark the grid once.
-            tab.grid.mark_all_dirty();
-
-            // Device-query responses (T2): DA/DSR/CPR/DECRQM/OSC color
-            // replies queued by the grid during parsing. Write them straight
-            // to the PTY (tab is already mutably borrowed, so use its writer
-            // rather than write_to_pty(&self)).
-            for response in tab.grid.take_responses() {
-                if let Some(w) = &tab.pty_writer {
-                    w.write(&response);
-                }
-            }
-
-            // OSC 52 clipboard drain (T1-6): apply set requests, then answer
-            // queries with the current system clipboard contents. The reply is
-            // written through tab.pty_writer directly (tab is already mutably
-            // borrowed) — write_to_pty(&self) would conflict with the borrow.
-            //
-            // Security policy (locked down by default): writes are gated by
-            // `security.osc52_write`, reads by `security.osc52_read` — a
-            // hostile prompt must not silently read the clipboard.
-            if let Some(text) = tab.grid.clipboard_set.take() {
-                if !self.config.security.osc52_write {
-                    log::warn!("OSC 52 write blocked by security policy");
-                } else if text.is_empty() {
-                    self.clipboard.clear();
-                    log::debug!("OSC 52: cleared system clipboard");
-                } else {
-                    self.clipboard.copy(&text);
-                    log::debug!("OSC 52: set system clipboard ({} chars)", text.len());
-                }
-            }
-            if tab.grid.clipboard_query_requested {
-                tab.grid.clipboard_query_requested = false;
-                if !self.config.security.osc52_read {
-                    log::warn!("OSC 52 query blocked by security policy");
-                } else if let Some(contents) = self.clipboard.paste() {
-                    let response = ClipboardManager::osc52_set(&contents);
-                    if let Some(w) = &tab.pty_writer {
-                        w.write(response.as_bytes());
-                    }
-                    log::debug!("OSC 52: replied to clipboard query");
-                }
-            }
-
-            // DECCOLM (?3) / DECSCPP: the terminal asked to switch column
-            // count (80/132). Mirror it in the real window so the renderer's
-            // cell geometry stays consistent; the resulting Resized event
-            // re-syncs the grid to the same size.
-            if let Some(size) = tab.grid.window_resize_request.take() {
-                if let (Some(w), Some(atlas)) = (&self.window, &self.atlas) {
-                    // Inline tab_bar_height() (a method would conflict with
-                    // the active-tab borrow held for this block).
-                    let tb_h = if self.show_tab_bar {
-                        self.config
-                            .tabs
-                            .height
-                            .max(tab_bar::TabBar::HIT_SIZE as u32)
+        let mut redraw = false;
+        for ev in events {
+            match ev {
+                EngineEvent::ClipboardSet(text) => {
+                    if !self.config.security.osc52_write {
+                        log::warn!("OSC 52 write blocked by security policy");
+                    } else if text.is_empty() {
+                        self.clipboard.clear();
+                        log::debug!("OSC 52: cleared system clipboard");
                     } else {
-                        0
-                    };
-                    let width = (size.cols as u32) * atlas.cell_width.max(1);
-                    let height = (size.rows as u32) * atlas.cell_height.max(1) + tb_h;
-                    let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(
-                        width.max(1),
-                        height.max(1),
-                    ));
-                    log::debug!(
-                        "DECCOLM/DECSCPP: requested {}x{} window",
-                        size.cols,
-                        size.rows
-                    );
+                        self.clipboard.copy(&text);
+                        log::debug!("OSC 52: set system clipboard ({} chars)", text.len());
+                    }
                 }
-            }
-
-            // Bell (BEL / OSC 9;7): flash the window or beep, per config.
-            if tab.grid.take_bell() {
-                match self.config.bell {
+                EngineEvent::ClipboardQueryRequested => {
+                    if !self.config.security.osc52_read {
+                        log::warn!("OSC 52 query blocked by security policy");
+                    } else if let Some(contents) = self.clipboard.paste() {
+                        let response = ClipboardManager::osc52_set(&contents);
+                        self.write_to_pty(response.as_bytes());
+                        log::debug!("OSC 52: replied to clipboard query");
+                    }
+                }
+                EngineEvent::TitleChanged(title) => {
+                    let active_idx = self
+                        .tab_manager
+                        .as_ref()
+                        .map(|tm| tm.active_index())
+                        .unwrap_or(0);
+                    if let Some(tm) = &mut self.tab_manager {
+                        tm.set_active_title(&title);
+                    }
+                    self.tab_bar.update_tabs(
+                        &self
+                            .tab_manager
+                            .as_ref()
+                            .map(|tm| tm.titles())
+                            .unwrap_or_default(),
+                        active_idx,
+                    );
+                    redraw = true;
+                }
+                EngineEvent::Bell => match self.config.bell {
                     config::BellStyle::Audible => {
                         use std::io::Write as _;
                         let _ = std::io::stderr().write_all(b"\x07");
@@ -399,67 +323,67 @@ impl App {
                     config::BellStyle::Flash => {
                         self.bell_flash_until =
                             Some(std::time::Instant::now() + BELL_FLASH_DURATION);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        redraw = true;
                     }
                     config::BellStyle::None => {}
+                },
+                EngineEvent::Notification(msg) => {
+                    match std::process::Command::new("notify-send")
+                        .args(["-a", "terminal", "-i", "utilities-terminal"])
+                        .arg(&msg)
+                        .spawn()
+                    {
+                        Ok(_) => log::debug!("notification: {}", msg),
+                        Err(e) => {
+                            log::info!("notification (notify-send unavailable): {} ({})", msg, e)
+                        }
+                    }
                 }
-            }
-            // OSC 9 notifications: surface via the desktop notification
-            // daemon (notify-send/libnotify). Fire-and-forget — notify-send
-            // exits on its own — and fall back to the log when the binary is
-            // missing (headless session, non-Linux desktop).
-            if let Some(msg) = tab.grid.take_notification() {
-                match std::process::Command::new("notify-send")
-                    .args(["-a", "terminal", "-i", "utilities-terminal"])
-                    .arg(&msg)
-                    .spawn()
-                {
-                    Ok(_) => log::debug!("notification: {}", msg),
-                    Err(e) => log::info!("notification (notify-send unavailable): {} ({})", msg, e),
+                // DECCOLM/DECSCPP: mirror the requested column count in the
+                // real window; the resulting Resized event re-syncs the grid.
+                EngineEvent::WindowResizeRequest(size) => {
+                    if let (Some(w), Some(atlas)) = (&self.window, &self.atlas) {
+                        let tb_h = if self.show_tab_bar {
+                            self.config
+                                .tabs
+                                .height
+                                .max(tab_bar::TabBar::HIT_SIZE as u32)
+                        } else {
+                            0
+                        };
+                        let width = (size.cols as u32) * atlas.cell_width.max(1);
+                        let height = (size.rows as u32) * atlas.cell_height.max(1) + tb_h;
+                        let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(
+                            width.max(1),
+                            height.max(1),
+                        ));
+                        log::debug!(
+                            "DECCOLM/DECSCPP: requested {}x{} window",
+                            size.cols,
+                            size.rows
+                        );
+                    }
+                    redraw = true;
                 }
-            }
-
-            // If the shell set a title via OSC 0/2, update the tab manager + tab bar.
-            let title_after = &tab.grid.palette.title;
-            if title_after != &title_before && !title_after.is_empty() {
-                let new_title = title_after.clone();
-                let active_idx = self
-                    .tab_manager
-                    .as_ref()
-                    .map(|tm| tm.active_index())
-                    .unwrap_or(0);
-                if let Some(tm) = &mut self.tab_manager {
-                    tm.set_active_title(&new_title);
+                EngineEvent::ChannelClosed => {
+                    self.should_quit = true;
                 }
-                self.tab_bar.update_tabs(
-                    &self
-                        .tab_manager
-                        .as_ref()
-                        .map(|tm| tm.titles())
-                        .unwrap_or_default(),
-                    active_idx,
-                );
             }
         }
-        if channel_closed {
-            self.should_quit = true;
-        }
-        (had_data, more_pending)
+        redraw
     }
 
+    /// Queue bytes to the active tab's PTY. The engine owns the writer, so
+    /// this is an ordered command; order is preserved with parser output.
     fn write_to_pty(&self, data: &[u8]) {
         if let Some(tm) = &self.tab_manager {
-            if let Some(w) = &tm.active().pty_writer {
-                w.write(data);
-            }
+            tm.active().engine.send(Command::WriteToPty(data.to_vec()));
         }
     }
 
     /// Handle keyboard shortcuts (Ctrl+Shift+C, Ctrl+Shift+V, etc.)
     /// Returns true if the key was handled as a shortcut.
-    fn handle_shortcut(&mut self, key: &Key, text: &Option<String>) -> bool {
+    fn handle_shortcut(&mut self, key: &Key, _text: &Option<String>) -> bool {
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
 
@@ -635,24 +559,12 @@ impl App {
             Key::Named(NamedKey::Enter) => {
                 let lines = self.active_all_lines();
                 self.search.search(&lines);
-                if let Some(m) = self.search.next() {
-                    if let Some(tm) = &mut self.tab_manager {
-                        tm.active_mut()
-                            .grid
-                            .mark_match_dirty(m.row, m.start_col, m.end_col);
-                    }
-                }
+                self.search.next();
                 true
             }
             // F3 or Ctrl+G — Find next
             Key::Named(NamedKey::F3) => {
-                if let Some(m) = self.search.next() {
-                    if let Some(tm) = &mut self.tab_manager {
-                        tm.active_mut()
-                            .grid
-                            .mark_match_dirty(m.row, m.start_col, m.end_col);
-                    }
-                }
+                self.search.next();
                 true
             }
             Key::Character(s)
@@ -660,13 +572,7 @@ impl App {
                     && self.modifiers.control_key()
                     && !self.modifiers.shift_key() =>
             {
-                if let Some(m) = self.search.next() {
-                    if let Some(tm) = &mut self.tab_manager {
-                        tm.active_mut()
-                            .grid
-                            .mark_match_dirty(m.row, m.start_col, m.end_col);
-                    }
-                }
+                self.search.next();
                 true
             }
             // Shift+F3 or Ctrl+Shift+G — Find previous
@@ -675,13 +581,7 @@ impl App {
                     && self.modifiers.control_key()
                     && self.modifiers.shift_key() =>
             {
-                if let Some(m) = self.search.prev() {
-                    if let Some(tm) = &mut self.tab_manager {
-                        tm.active_mut()
-                            .grid
-                            .mark_match_dirty(m.row, m.start_col, m.end_col);
-                    }
-                }
+                self.search.prev();
                 true
             }
             // Backspace — Remove last character from query
@@ -706,23 +606,6 @@ impl App {
             }
             _ => false,
         }
-    }
-
-    /// Convert pixel coordinates to cell coordinates (1-based for CSI sequences).
-    fn pixel_to_cell(&self, x: f64, y: f64) -> (u32, u32) {
-        let cell_width = self
-            .atlas
-            .as_ref()
-            .map(|a| a.cell_width as f64)
-            .unwrap_or(8.0);
-        let cell_height = self
-            .atlas
-            .as_ref()
-            .map(|a| a.cell_height as f64)
-            .unwrap_or(16.0);
-        let col = (x / cell_width) as u32 + 1; // 1-based
-        let row = (y / cell_height) as u32 + 1; // 1-based
-        (col, row)
     }
 
     fn pixel_size(&self, atlas: &GlyphAtlas) -> (u32, u32) {
@@ -905,14 +788,12 @@ impl App {
         }
         match stream.try_recv() {
             Ok(frame) => {
-                let img = terminal::sixel::SixelImage {
+                self.video_frame = Some(SixelImage {
                     width: frame.width,
                     height: frame.height,
                     rgba: frame.rgba,
-                };
-                if let Some(tm) = &mut self.tab_manager {
-                    tm.active_mut().grid.set_video_frame(Some(img));
-                }
+                });
+                self.video_version = self.video_version.wrapping_add(1);
                 self.video_next_frame += self.video_frame_interval;
                 true
             }
@@ -923,9 +804,8 @@ impl App {
             }
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 // EOF: clear the overlay and stop.
-                if let Some(tm) = &mut self.tab_manager {
-                    tm.active_mut().grid.set_video_frame(None);
-                }
+                self.video_frame = None;
+                self.video_version = self.video_version.wrapping_add(1);
                 self.video_stream = None;
                 true
             }
@@ -1078,6 +958,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.config.scrollback,
                 cmd,
                 wake_factory,
+                self.drain_budget_bytes,
             )
         } else {
             TabManager::new(
@@ -1085,16 +966,15 @@ impl ApplicationHandler<UserEvent> for App {
                 &self.config.shell,
                 self.config.scrollback,
                 wake_factory,
+                self.drain_budget_bytes,
             )
         };
         match tm_result {
             Ok(mut tm) => {
                 trace("pty_ready");
                 // Record the real cell size so sixel cursor advances and
-                // image spans use the correct geometry.
+                // image spans use the correct geometry (new tabs inherit it).
                 tm.set_cell_size(atlas.cell_width, atlas.cell_height);
-                // Mark all cells dirty so the first frame renders the full grid.
-                tm.active_mut().grid.mark_all_dirty();
                 self.tab_manager = Some(tm);
                 self.refresh_tab_bar();
             }
@@ -1114,8 +994,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.window.as_ref().unwrap().request_redraw();
     }
 
-    /// T5-2: PTY reader thread pokes the event loop via EventLoopProxy.
-    /// Drain the channel and request a redraw — no more 16ms polling.
+    /// T5-2: the engine thread pokes the event loop via EventLoopProxy after
+    /// each parse batch. Apply engine events and request a redraw.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::ReloadConfig => {
@@ -1123,17 +1003,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::PtyData => {
                 self.pty_wake_pending.store(false, Ordering::Release);
-                let (had_data, _more_pending) = self.drain_pty();
+                // The engine published a fresh snapshot; apply any side
+                // effects (bell/title/clipboard) and redraw unconditionally
+                // (unless the app requested synchronized output).
+                let _ = self.process_engine_events();
                 if self.should_quit {
                     _event_loop.exit();
                     return;
                 }
                 let sync_active = self
-                    .tab_manager
-                    .as_ref()
-                    .map(|tm| tm.active().grid.synchronized_output)
+                    .active_snapshot()
+                    .map(|s| s.synchronized_output)
                     .unwrap_or(false);
-                if had_data && !sync_active {
+                if !sync_active {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -1149,18 +1031,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             // T4-3: focus reporting (?1004). vim/neovim use this to update
-            // the statusline when the terminal gains/loses focus.
+            // the statusline when the terminal gains/loses focus. The engine
+            // writes the CSI I/O responses to the PTY itself.
             WindowEvent::Focused(focused) => {
-                if let Some(tm) = &mut self.tab_manager {
-                    let grid = &mut tm.active_mut().grid;
-                    if focused {
-                        grid.focus_in();
+                if let Some(tm) = &self.tab_manager {
+                    tm.active().engine.send(if focused {
+                        Command::FocusIn
                     } else {
-                        grid.focus_out();
-                    }
-                    for response in grid.take_responses() {
-                        self.write_to_pty(&response);
-                    }
+                        Command::FocusOut
+                    });
                 }
             }
 
@@ -1180,17 +1059,12 @@ impl ApplicationHandler<UserEvent> for App {
                             cols: new_cols,
                             rows: new_rows,
                         };
-                        let mut responses = Vec::new();
                         if let Some(tm) = &mut self.tab_manager {
-                            tm.resize(self.size);
-                            // In-band resize notification (mode 2048): tell
-                            // the application the new size so tmux/neovim
+                            // Resizes the grid + PTY window on the engine
+                            // thread; the engine also sends the in-band
+                            // resize notification (mode 2048) so tmux/neovim
                             // redraw without polling.
-                            tm.active_mut().grid.resize_report();
-                            responses = tm.active_mut().grid.take_responses();
-                        }
-                        for response in responses {
-                            self.write_to_pty(&response);
+                            tm.resize(self.size);
                         }
                     }
                 }
@@ -1243,35 +1117,11 @@ impl ApplicationHandler<UserEvent> for App {
                         let encoded = event.encode(encoding);
                         self.write_to_pty(encoded.as_bytes());
                     } else if self.selection.selecting {
-                        // Update selection during drag
+                        // Update selection during drag. The renderer forces a
+                        // full redraw whenever a selection is active, so no
+                        // per-cell dirty marking is needed.
                         let (col, row) = self.cell_at_pixel(position.x, position.y);
-
-                        // Mark previously selected cells dirty
-                        let (old_start, old_end) = self.selection.normalized();
-                        if let Some(tm) = &mut self.tab_manager {
-                            let grid = &mut tm.active_mut().grid;
-                            for r in old_start.0..=old_end.0 {
-                                for c in 0..self.size.cols as usize {
-                                    if self.selection.contains(r, c) {
-                                        grid.mark_dirty(c, r);
-                                    }
-                                }
-                            }
-                        }
-
                         self.selection.update(row, col);
-
-                        // Mark newly selected cells dirty
-                        if let Some(tm) = &mut self.tab_manager {
-                            let grid = &mut tm.active_mut().grid;
-                            for r in old_start.0.min(row)..=old_end.0.max(row) {
-                                for c in 0..self.size.cols as usize {
-                                    if self.selection.contains(r, c) {
-                                        grid.mark_dirty(c, r);
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -1391,12 +1241,10 @@ impl ApplicationHandler<UserEvent> for App {
 
                         match state {
                             ElementState::Pressed => {
-                                // Check for hyperlink at click position
-                                let hyperlink_url = self
-                                    .tab_manager
-                                    .as_ref()
-                                    .and_then(|tm| tm.active().grid.get_hyperlink_at(col, row))
-                                    .map(|s| s.to_string());
+                                // Check for hyperlink at click position.
+                                let hyperlink_url = self.tab_manager.as_ref().and_then(|tm| {
+                                    tm.active().engine.get_hyperlink_blocking(col, row)
+                                });
                                 if let Some(url) = hyperlink_url {
                                     if hyperlink_is_allowed(&url, &self.config.security.uri_schemes)
                                     {
@@ -1532,7 +1380,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     } else {
                         // Not tracking the mouse — scroll the scrollback.
-                        if let Some(tm) = &mut self.tab_manager {
+                        if let Some(tm) = &self.tab_manager {
                             let ch = self
                                 .atlas
                                 .as_ref()
@@ -1544,13 +1392,11 @@ impl ApplicationHandler<UserEvent> for App {
                                     pos.y as f32 / ch
                                 }
                             };
-                            let grid = &mut tm.active_mut().grid;
                             if lines > 0.0 {
-                                grid.smooth_scroll_up(lines);
+                                tm.active().engine.send(Command::SmoothScrollUp(lines));
                             } else if lines < 0.0 {
-                                grid.smooth_scroll_down(-lines);
+                                tm.active().engine.send(Command::SmoothScrollDown(-lines));
                             }
-                            grid.mark_all_dirty();
                         }
                     }
                 }
@@ -1592,79 +1438,56 @@ impl ApplicationHandler<UserEvent> for App {
                         // prompt is in scrollback, scroll it to the top of the
                         // viewport; when visible, move the cursor to it.
                         Key::Named(NamedKey::ArrowUp) if ctrl && shift => {
-                            if let Some(tm) = &mut self.tab_manager {
-                                let grid = &mut tm.active_mut().grid;
-                                let sb_len = grid.scrollback.len();
-                                let from = sb_len + grid.cursor.row;
-                                if let Some(idx) = grid.prev_prompt(from) {
-                                    if idx < sb_len {
-                                        grid.scrollback_offset = sb_len - idx;
-                                    } else {
-                                        grid.reset_scroll();
-                                        grid.cursor.row = idx - sb_len;
-                                        grid.mark_all_dirty();
-                                    }
-                                }
+                            if let Some(tm) = &self.tab_manager {
+                                tm.active().engine.send(Command::JumpPrompt { dir: -1 });
                             }
                         }
                         Key::Named(NamedKey::ArrowDown) if ctrl && shift => {
-                            if let Some(tm) = &mut self.tab_manager {
-                                let grid = &mut tm.active_mut().grid;
-                                let sb_len = grid.scrollback.len();
-                                let from = sb_len + grid.cursor.row;
-                                if let Some(idx) = grid.next_prompt(from) {
-                                    if idx < sb_len {
-                                        grid.scrollback_offset = sb_len - idx;
-                                    } else {
-                                        grid.reset_scroll();
-                                        grid.cursor.row = idx - sb_len;
-                                        grid.mark_all_dirty();
-                                    }
-                                } else {
-                                    // No further prompt — return to the live
-                                    // view at the shell cursor.
-                                    grid.reset_scroll();
-                                    grid.mark_all_dirty();
-                                }
+                            if let Some(tm) = &self.tab_manager {
+                                tm.active().engine.send(Command::JumpPrompt { dir: 1 });
                             }
                         }
                         Key::Named(NamedKey::PageUp) if shift => {
                             // Scroll up in scrollback
-                            let scroll_amount = self.size.rows as usize;
-                            if let Some(tm) = &mut self.tab_manager {
-                                let grid = &mut tm.active_mut().grid;
-                                grid.scrollback_offset = (grid.scrollback_offset + scroll_amount)
-                                    .min(grid.scrollback.len());
-                                log::debug!("Scroll up: offset={}", grid.scrollback_offset);
+                            let scroll_amount = self.size.rows as i32;
+                            if let Some(tm) = &self.tab_manager {
+                                tm.active().engine.send(Command::ScrollBy {
+                                    amount: scroll_amount,
+                                });
+                                log::debug!("Scroll up by {scroll_amount} lines");
                             }
                         }
                         Key::Named(NamedKey::PageDown) if shift => {
                             // Scroll down in scrollback
-                            let scroll_amount = self.size.rows as usize;
-                            if let Some(tm) = &mut self.tab_manager {
-                                let grid = &mut tm.active_mut().grid;
-                                grid.scrollback_offset =
-                                    grid.scrollback_offset.saturating_sub(scroll_amount);
-                                log::debug!("Scroll down: offset={}", grid.scrollback_offset);
+                            let scroll_amount = self.size.rows as i32;
+                            if let Some(tm) = &self.tab_manager {
+                                tm.active().engine.send(Command::ScrollBy {
+                                    amount: -scroll_amount,
+                                });
+                                log::debug!("Scroll down by {scroll_amount} lines");
                             }
                         }
                         _ => {
                             // No shortcut matched, send to PTY.
-                            // Also reset scrollback offset on any key press
-                            if let Some(tm) = &mut self.tab_manager {
-                                let grid = &mut tm.active_mut().grid;
-                                if grid.scrollback_offset > 0 || grid.scroll_fraction > 0.0 {
-                                    grid.reset_scroll();
+                            let snapshot = self.active_snapshot();
+                            // Also reset scrollback offset on any key press.
+                            if let Some(snap) = &snapshot {
+                                if snap.is_scrolled() {
+                                    if let Some(tm) = &self.tab_manager {
+                                        tm.active().engine.send(Command::ResetScroll);
+                                    }
                                 }
                             }
-                            let (kitty_flags, modify_other_keys) = self
-                                .tab_manager
+                            let (kitty_flags, modify_other_keys, app_cursor_keys) = snapshot
                                 .as_ref()
-                                .map(|tm| {
-                                    let grid = &tm.active().grid;
-                                    (grid.kitty_flags, grid.modify_other_keys)
+                                .map(|s| {
+                                    (
+                                        s.kitty_flags,
+                                        s.modify_other_keys,
+                                        s.application_cursor_keys,
+                                    )
                                 })
-                                .unwrap_or((0, 0));
+                                .unwrap_or((0, 0, false));
                             let event_type = if repeat { 2 } else { 1 };
                             let mut bytes = encode_protocol_key(
                                 &logical_key,
@@ -1691,12 +1514,10 @@ impl ApplicationHandler<UserEvent> for App {
                             // sequences instead of CSI (T3-1). vim/less/nano
                             // rely on this — but only in legacy mode (kitty's
                             // canonical forms ignore the cursor-key mode).
-                            if kitty_flags & (KITTY_DISAMBIGUATE | KITTY_ALL_KEYS) == 0 {
-                                if let Some(tm) = &self.tab_manager {
-                                    if tm.active().grid.application_cursor_keys {
-                                        app_cursor_remap(&mut bytes);
-                                    }
-                                }
+                            if kitty_flags & (KITTY_DISAMBIGUATE | KITTY_ALL_KEYS) == 0
+                                && app_cursor_keys
+                            {
+                                app_cursor_remap(&mut bytes);
                             }
                             if !bytes.is_empty() {
                                 self.write_to_pty(&bytes);
@@ -1734,17 +1555,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // Enter/Tab/Backspace keys produce raw bytes rather than an
                 // escape code, so gate on the encoded form being an escape
                 // sequence (per the spec, those need the all-keys enhancement).
-                let kitty_flags = self
-                    .tab_manager
-                    .as_ref()
-                    .map(|tm| tm.active().grid.kitty_flags)
-                    .unwrap_or(0);
+                let snapshot = self.active_snapshot();
+                let kitty_flags = snapshot.as_ref().map(|s| s.kitty_flags).unwrap_or(0);
                 if kitty_flags & KITTY_EVENT_TYPES != 0 {
-                    let modify_other_keys = self
-                        .tab_manager
-                        .as_ref()
-                        .map(|tm| tm.active().grid.modify_other_keys)
-                        .unwrap_or(0);
+                    let modify_other_keys =
+                        snapshot.as_ref().map(|s| s.modify_other_keys).unwrap_or(0);
                     let bytes = encode_protocol_key(
                         &logical_key,
                         &self.modifiers,
@@ -1776,7 +1591,11 @@ impl ApplicationHandler<UserEvent> for App {
                     None => false,
                 };
 
-                // Compute tab bar height before borrowing tab_manager mutably.
+                // Clone the latest engine snapshot first (O(1) Arc bump) so
+                // the immutable snapshot can coexist with the mutable borrows
+                // of pipeline/atlas/search/tab_bar below.
+                let snapshot = self.active_snapshot();
+                // Compute tab bar height before borrowing pipeline/atlas.
                 let tb_height = self.tab_bar_height();
                 let tb_ref = if tb_height > 0 {
                     Some(&mut self.tab_bar)
@@ -1784,14 +1603,15 @@ impl ApplicationHandler<UserEvent> for App {
                     None
                 };
 
-                if let (Some(pipeline), Some(atlas), Some(tm)) =
-                    (&mut self.pipeline, &mut self.atlas, &mut self.tab_manager)
+                if let (Some(pipeline), Some(atlas), Some(snapshot)) =
+                    (&mut self.pipeline, &mut self.atlas, snapshot)
                 {
-                    let tab = tm.active_mut();
                     let trace = std::env::var_os("TERMINAL_RENDER_TRACE").is_some();
                     let render_start = trace.then(std::time::Instant::now);
                     pipeline.render(RenderParams {
-                        grid: &mut tab.grid,
+                        grid: snapshot,
+                        video_frame: self.video_frame.as_ref(),
+                        video_version: self.video_version,
                         atlas,
                         cursor_visible: self.cursor_visible,
                         blink_on: self.text_blink_on,
@@ -1824,9 +1644,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if let Some(w) = &self.window {
-                    // Update window title if OSC changed it
-                    if let Some(tm) = &self.tab_manager {
-                        let title = &tm.active().grid.palette.title;
+                    // Update window title if OSC changed it (from the snapshot).
+                    if let Some(snap) = self.active_snapshot() {
+                        let title = &snap.palette.title;
                         if !title.is_empty() {
                             w.set_title(title);
                         }
@@ -1877,19 +1697,25 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.video_next_frame));
         }
 
-        // Drain any PTY data that arrived between events (safety net for
+        // Apply engine events that arrived between events (safety net for
         // data that came in after the last user_event but before we sleep).
-        let (had_data, _more_pending) = self.drain_pty();
+        let _ = self.process_engine_events();
         if self.should_quit {
             event_loop.exit();
             return;
         }
+        // A publish whose wake was coalesced away still needs a redraw;
+        // detect it by the snapshot generation counter.
+        let mut fresh = false;
+        if let Some(snap) = self.active_snapshot() {
+            fresh = snap.generation != self.last_generation;
+            self.last_generation = snap.generation;
+        }
         let sync_active = self
-            .tab_manager
-            .as_ref()
-            .map(|tm| tm.active().grid.synchronized_output)
+            .active_snapshot()
+            .map(|s| s.synchronized_output)
             .unwrap_or(false);
-        if had_data && !sync_active {
+        if fresh && !sync_active {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }

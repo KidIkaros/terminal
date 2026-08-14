@@ -1,58 +1,40 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::Ordering;
 
-use crate::grid::{Grid, WinSize};
-use crate::parser::Parser;
-use crate::pty::{self, PtyHandle, PtyWriter};
+use crate::engine::{Command, EngineHandle};
+use crate::grid::WinSize;
+use crate::pty::{self, PtyError};
 
-use crossbeam_channel::Receiver;
-
-/// A single tab containing its own terminal state and PTY.
+/// A single tab: an engine thread owning its grid, parser, and PTY, plus
+/// app-side metadata (title, activity). The engine publishes immutable
+/// snapshots; the app renders from them and drives the engine by commands.
 pub struct Tab {
     /// Tab title (can be changed via OSC 0/2).
     pub title: String,
-    /// Terminal grid for this tab.
-    pub grid: Grid,
-    /// VT parser for this tab.
-    pub parser: Parser,
+    /// Background engine (grid + parser + PTY) for this tab.
+    pub engine: EngineHandle,
     /// Whether this tab is currently active.
     pub active: bool,
-    /// Writer half of the PTY (None if the tab was constructed without spawning).
-    pub pty_writer: Option<PtyWriter>,
-    /// Child process handle — Drop sends SIGHUP + reaps.
-    pub pty_handle: Option<PtyHandle>,
-    /// Reader channel for PTY output.
-    pub pty_rx: Option<Receiver<Vec<u8>>>,
-    /// Whether the PTY reader thread should be reading. Set false while the
-    /// tab is in the background so the kernel PTY buffer provides backpressure
-    /// (the shell blocks on a full buffer) instead of growing the channel
-    /// unboundedly. Toggled by [`TabManager::switch_to`].
-    pub reading: Arc<AtomicBool>,
 }
 
 impl Tab {
     /// Create a new tab with the given size and scrollback, spawning a PTY.
-    /// The `wake` callback is invoked by the reader thread on each data chunk
-    /// (T5-2) so the event loop can drain promptly.
+    /// `wake` is invoked by the engine after each parse batch so the event
+    /// loop can redraw promptly.
     pub fn spawn(
         title: &str,
         size: WinSize,
         scrollback: usize,
+        cell_size: (u32, u32),
         argv: &[String],
         wake: pty::WakeCallback,
-    ) -> Result<Self, pty::PtyError> {
-        let (writer, handle, rx, reading) = pty::spawn_pty(size, argv, wake)?;
+        drain_budget: usize,
+    ) -> Result<Self, PtyError> {
+        let engine =
+            EngineHandle::spawn(title, size, scrollback, cell_size, argv, wake, drain_budget)?;
         Ok(Self {
             title: title.to_string(),
-            grid: Grid::new(size, scrollback),
-            parser: Parser::new(),
+            engine,
             active: false,
-            pty_writer: Some(writer),
-            pty_handle: Some(handle),
-            pty_rx: Some(rx),
-            reading,
         })
     }
 
@@ -60,13 +42,8 @@ impl Tab {
     pub fn without_pty(title: &str, size: WinSize, scrollback: usize) -> Self {
         Self {
             title: title.to_string(),
-            grid: Grid::new(size, scrollback),
-            parser: Parser::new(),
+            engine: EngineHandle::idle(size, scrollback),
             active: false,
-            pty_writer: None,
-            pty_handle: None,
-            pty_rx: None,
-            reading: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -83,26 +60,36 @@ pub struct TabManager {
     scrollback: usize,
     /// Shell path for new tabs.
     shell: String,
-    /// Wake callback cloned for each new tab's reader thread (T5-2).
+    /// Wake callback cloned for each new tab's engine (T5-2).
     wake_factory: Box<dyn Fn() -> pty::WakeCallback + Send + Sync>,
     /// Terminal cell size in pixels (width, height); inherited by new tabs
     /// so sixel cursor advances use the correct geometry.
     cell_size: (u32, u32),
+    /// Per-tab PTY drain budget (env-overridable).
+    drain_budget: usize,
 }
 
 impl TabManager {
     /// Create a new tab manager with an initial tab (spawns its PTY).
-    /// `wake_factory` produces a fresh wake callback for each tab's reader
-    /// thread (T5-2).
+    /// `wake_factory` produces a fresh wake callback for each tab's engine.
     pub fn new(
         initial_size: WinSize,
         shell: &str,
         scrollback: usize,
         wake_factory: Box<dyn Fn() -> pty::WakeCallback + Send + Sync>,
-    ) -> Result<Self, pty::PtyError> {
+        drain_budget: usize,
+    ) -> Result<Self, PtyError> {
         let argv = vec![shell.to_string()];
         let wake = wake_factory();
-        let mut first = Tab::spawn("Terminal", initial_size, scrollback, &argv, wake)?;
+        let mut first = Tab::spawn(
+            "Terminal",
+            initial_size,
+            scrollback,
+            (8, 16),
+            &argv,
+            wake,
+            drain_budget,
+        )?;
         first.active = true;
         Ok(Self {
             tabs: vec![first],
@@ -112,6 +99,7 @@ impl TabManager {
             shell: shell.to_string(),
             wake_factory,
             cell_size: (8, 16),
+            drain_budget,
         })
     }
 
@@ -123,10 +111,19 @@ impl TabManager {
         scrollback: usize,
         command: &str,
         wake_factory: Box<dyn Fn() -> pty::WakeCallback + Send + Sync>,
-    ) -> Result<Self, pty::PtyError> {
+        drain_budget: usize,
+    ) -> Result<Self, PtyError> {
         let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
         let wake = wake_factory();
-        let mut first = Tab::spawn("Terminal", initial_size, scrollback, &argv, wake)?;
+        let mut first = Tab::spawn(
+            "Terminal",
+            initial_size,
+            scrollback,
+            (8, 16),
+            &argv,
+            wake,
+            drain_budget,
+        )?;
         first.active = true;
         Ok(Self {
             tabs: vec![first],
@@ -136,6 +133,7 @@ impl TabManager {
             shell: shell.to_string(),
             wake_factory,
             cell_size: (8, 16),
+            drain_budget,
         })
     }
 
@@ -170,12 +168,19 @@ impl TabManager {
     }
 
     /// Create a new tab (spawns a PTY) and return its index.
-    pub fn new_tab(&mut self) -> Result<usize, pty::PtyError> {
+    pub fn new_tab(&mut self) -> Result<usize, PtyError> {
         let title = format!("Terminal {}", self.tabs.len() + 1);
         let wake = (self.wake_factory)();
         let argv = vec![self.shell.clone()];
-        let mut tab = Tab::spawn(&title, self.default_size, self.scrollback, &argv, wake)?;
-        tab.grid.set_cell_size(self.cell_size.0, self.cell_size.1);
+        let tab = Tab::spawn(
+            &title,
+            self.default_size,
+            self.scrollback,
+            self.cell_size,
+            &argv,
+            wake,
+            self.drain_budget,
+        )?;
         self.tabs.push(tab);
         let new_index = self.tabs.len() - 1;
         self.switch_to(new_index);
@@ -184,13 +189,14 @@ impl TabManager {
 
     /// Close the current tab. Returns the new active index, or `None` if this
     /// was the last tab (caller should close the window). Dropping the `Tab`
-    /// drops its `PtyHandle`, which sends SIGHUP + reaps the child.
+    /// sends `Quit` to the engine, which drops the PTY handle (SIGHUP + reap).
     pub fn close_current(&mut self) -> Option<usize> {
         if self.tabs.len() == 1 {
             return None;
         }
 
-        self.tabs.remove(self.active_index);
+        let tab = self.tabs.remove(self.active_index);
+        tab.engine.shutdown();
 
         if self.active_index >= self.tabs.len() {
             self.active_index = self.tabs.len() - 1;
@@ -198,6 +204,7 @@ impl TabManager {
 
         self.tabs[self.active_index].active = true;
         self.tabs[self.active_index]
+            .engine
             .reading
             .store(true, Ordering::Release);
         Some(self.active_index)
@@ -209,7 +216,8 @@ impl TabManager {
             return None;
         }
 
-        self.tabs.remove(index);
+        let tab = self.tabs.remove(index);
+        tab.engine.shutdown();
 
         if self.active_index >= self.tabs.len() {
             self.active_index = self.tabs.len() - 1;
@@ -219,6 +227,7 @@ impl TabManager {
 
         self.tabs[self.active_index].active = true;
         self.tabs[self.active_index]
+            .engine
             .reading
             .store(true, Ordering::Release);
         Some(self.active_index)
@@ -227,15 +236,18 @@ impl TabManager {
     /// Switch to a specific tab by index.
     pub fn switch_to(&mut self, index: usize) {
         if index < self.tabs.len() {
-            // Pause the outgoing tab's reader so it stops pulling output; the
-            // incoming tab's reader resumes so its (blocked) writer unblocks.
+            // Pause the outgoing tab's engine reader so it stops pulling
+            // output; the incoming tab's reader resumes so its (blocked)
+            // writer unblocks. Mirrors xterm/kitty background-pane behavior.
             self.tabs[self.active_index]
+                .engine
                 .reading
                 .store(false, Ordering::Release);
             self.tabs[self.active_index].active = false;
             self.active_index = index;
             self.tabs[self.active_index].active = true;
             self.tabs[self.active_index]
+                .engine
                 .reading
                 .store(true, Ordering::Release);
         }
@@ -277,10 +289,7 @@ impl TabManager {
     pub fn resize(&mut self, size: WinSize) {
         self.default_size = size;
         for tab in &mut self.tabs {
-            tab.grid.resize(size);
-            if let Some(w) = &tab.pty_writer {
-                w.resize(size);
-            }
+            tab.engine.send(Command::Resize(size));
         }
     }
 
@@ -289,13 +298,10 @@ impl TabManager {
         self.tabs.iter().map(|t| t.title.as_str()).collect()
     }
 
-    /// Record the terminal's cell size (pixels) for all tabs; new tabs
-    /// inherit it via [`TabManager::new_tab`].
+    /// Record the terminal's cell size (pixels) for new tabs; existing tabs
+    /// already received theirs at spawn.
     pub fn set_cell_size(&mut self, w: u32, h: u32) {
         self.cell_size = (w.max(1), h.max(1));
-        for tab in &mut self.tabs {
-            tab.grid.set_cell_size(self.cell_size.0, self.cell_size.1);
-        }
     }
 }
 
@@ -319,6 +325,7 @@ mod tests {
             shell: "/bin/bash".to_string(),
             wake_factory: Box::new(|| Box::new(|| {}) as pty::WakeCallback),
             cell_size: (8, 16),
+            drain_budget: 256 * 1024,
         }
     }
 
@@ -413,15 +420,18 @@ mod tests {
         ));
 
         // First tab starts reading.
-        manager.tabs[0].reading.store(true, Ordering::Release);
+        manager.tabs[0]
+            .engine
+            .reading
+            .store(true, Ordering::Release);
 
         manager.switch_to(1);
-        assert!(!manager.tabs[0].reading.load(Ordering::Acquire));
-        assert!(manager.tabs[1].reading.load(Ordering::Acquire));
+        assert!(!manager.tabs[0].engine.reading.load(Ordering::Acquire));
+        assert!(manager.tabs[1].engine.reading.load(Ordering::Acquire));
 
         manager.switch_to(0);
-        assert!(manager.tabs[0].reading.load(Ordering::Acquire));
-        assert!(!manager.tabs[1].reading.load(Ordering::Acquire));
+        assert!(manager.tabs[0].engine.reading.load(Ordering::Acquire));
+        assert!(!manager.tabs[1].engine.reading.load(Ordering::Acquire));
     }
 
     #[test]
@@ -433,12 +443,12 @@ mod tests {
             manager.scrollback,
         ));
         manager.switch_to(1);
-        assert!(!manager.tabs[0].reading.load(Ordering::Acquire));
-        assert!(manager.tabs[1].reading.load(Ordering::Acquire));
+        assert!(!manager.tabs[0].engine.reading.load(Ordering::Acquire));
+        assert!(manager.tabs[1].engine.reading.load(Ordering::Acquire));
 
         // Close the active tab → the remaining tab becomes active and resumes.
         manager.close_current();
-        assert!(manager.tabs[0].reading.load(Ordering::Acquire));
+        assert!(manager.tabs[0].engine.reading.load(Ordering::Acquire));
     }
 
     #[test]
@@ -457,5 +467,30 @@ mod tests {
         manager.resize(new_size);
 
         assert_eq!(manager.default_size, new_size);
+    }
+
+    #[test]
+    fn test_engine_idle_snapshot_and_commands() {
+        // The idle engine publishes a snapshot and services commands.
+        let size = WinSize { cols: 20, rows: 5 };
+        let engine = EngineHandle::idle(size, 100);
+        let snap = engine.snapshot();
+        assert_eq!(snap.rows, 5);
+        assert_eq!(snap.cols, 20);
+        assert_eq!(snap.cells.len(), 5);
+
+        engine.send(Command::ScrollTo {
+            offset: 3,
+            fraction: 0.0,
+        });
+        // Command servicing is async; poll briefly for the snapshot update.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            if engine.snapshot().scrollback_offset == 3 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("engine did not apply ScrollTo command");
     }
 }

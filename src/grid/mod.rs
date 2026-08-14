@@ -4,6 +4,7 @@
 //! The grid owns all terminal state: cursor position, active SGR attributes,
 //! scroll region, and the alternate screen buffer.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use unicode_width::UnicodeWidthChar;
@@ -98,7 +99,7 @@ fn default_palette() -> [(u8, u8, u8); 256] {
 }
 
 /// Terminal color palette with OSC 4/10/11 support.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColorPalette {
     colors: [(u8, u8, u8); 256],
     /// Default foreground color (can be overridden by OSC 10).
@@ -819,6 +820,88 @@ fn map_dec_special(ch: char) -> Option<char> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GridSnapshot
+// ---------------------------------------------------------------------------
+
+/// Immutable, thread-safe view of a grid at a point in time.
+///
+/// Built by the per-tab engine thread after each parse batch and consumed by
+/// the render/input threads without locking the grid. Rows are shared `Arc`
+/// handles — the grid copy-on-writes rows via `Arc::make_mut`, so snapshot
+/// construction copies only row *pointers* (O(rows)), never cell contents.
+/// The renderer diffs consecutive snapshots by row-pointer identity to find
+/// dirty rows.
+#[derive(Clone)]
+pub struct GridSnapshot {
+    pub cols: usize,
+    pub rows: usize,
+    /// Active screen's row handles, row-major.
+    pub cells: Vec<Arc<Vec<Cell>>>,
+    /// Scrollback rows, oldest first.
+    pub scrollback: VecDeque<Arc<Vec<Cell>>>,
+    /// Per-row DEC line modes (0 normal, 3/4 double-height halves,
+    /// 6 double-width).
+    pub line_modes: Vec<u8>,
+    /// Viewport scroll state (0 = live view, >0 = scrolled up).
+    pub scrollback_offset: usize,
+    pub scroll_fraction: f32,
+    pub cursor: Cursor,
+    pub cursor_visible: bool,
+    pub cursor_shape: u8,
+    /// DECSCNM (?5) screen-reverse video.
+    pub screen_reverse: bool,
+    pub synchronized_output: bool,
+    pub palette: ColorPalette,
+    /// Sixel/kitty image placements decoded by the engine.
+    pub sixel_images: Vec<crate::sixel::SixelPlacement>,
+    /// Input-state flags the app thread reads to encode keys/mouse events.
+    pub mouse_mode: MouseMode,
+    pub mouse_encoding: MouseEncoding,
+    pub bracketed_paste: bool,
+    pub kitty_flags: u8,
+    pub modify_other_keys: u8,
+    pub application_cursor_keys: bool,
+    pub keypad_app: bool,
+    pub backarrow_del: bool,
+    pub focus_reporting: bool,
+    /// Monotonic counter bumped on every snapshot; cheap change detection.
+    pub generation: u64,
+    /// Shared blank cell returned for out-of-range lookups.
+    blank_cell: Cell,
+}
+
+impl GridSnapshot {
+    /// `(offset, fraction)` view position — see [`Grid::smooth_view`].
+    pub fn smooth_view(&self) -> (usize, f32) {
+        let total = self.scrollback_offset as f32 + self.scroll_fraction;
+        let offset = total.floor() as usize;
+        let frac = total - offset as f32;
+        (offset.min(self.scrollback.len()), frac)
+    }
+
+    pub fn is_scrolled(&self) -> bool {
+        self.scrollback_offset > 0 || self.scroll_fraction > 0.0
+    }
+
+    pub fn line_mode(&self, row: usize) -> u8 {
+        self.line_modes.get(row).copied().unwrap_or(0)
+    }
+
+    /// Cell at a *live grid* coordinate (row < `rows`).
+    pub fn cell(&self, col: usize, row: usize) -> &Cell {
+        self.cells
+            .get(row)
+            .and_then(|r| r.get(col))
+            .unwrap_or(&self.blank_cell)
+    }
+
+    /// Scrollback length in lines.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+}
+
 impl Grid {
     pub fn new(size: WinSize, scrollback: usize) -> Self {
         let cols = size.cols as usize;
@@ -1395,6 +1478,39 @@ impl Grid {
             } else {
                 None
             }
+        }
+    }
+
+    /// Build an immutable [`GridSnapshot`] of the current state. Row handles
+    /// are shared Arcs (copy-on-write), so this copies O(rows + scrollback)
+    /// pointers — never cell bytes — and is safe to call on every batch.
+    pub fn snapshot(&self) -> GridSnapshot {
+        GridSnapshot {
+            cols: self.cols,
+            rows: self.rows,
+            cells: self.cells().to_vec(),
+            scrollback: self.scrollback.clone(),
+            line_modes: self.line_modes.clone(),
+            scrollback_offset: self.scrollback_offset,
+            scroll_fraction: self.scroll_fraction,
+            cursor: self.cursor,
+            cursor_visible: self.cursor_visible,
+            cursor_shape: self.cursor_shape,
+            screen_reverse: self.screen_reverse,
+            synchronized_output: self.synchronized_output,
+            palette: self.palette.clone(),
+            sixel_images: self.sixel_images.clone(),
+            mouse_mode: self.mouse_mode,
+            mouse_encoding: self.mouse_encoding,
+            bracketed_paste: self.bracketed_paste,
+            kitty_flags: self.kitty_flags,
+            modify_other_keys: self.modify_other_keys,
+            application_cursor_keys: self.application_cursor_keys,
+            keypad_app: self.keypad_app,
+            backarrow_del: self.backarrow_del,
+            focus_reporting: self.focus_reporting,
+            generation: 0,
+            blank_cell: Cell::default(),
         }
     }
 

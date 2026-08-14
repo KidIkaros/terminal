@@ -4,6 +4,7 @@
 
 pub mod clipboard;
 pub mod config;
+pub mod engine;
 pub mod grid;
 pub mod image;
 pub mod ligatures;

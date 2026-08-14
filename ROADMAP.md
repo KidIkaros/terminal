@@ -26,15 +26,18 @@
   background thread, frames render via the kitty-graphics path (`--video FILE`)
 - Padding + window opacity, double/triple-click selection, config hot-reload
   (SIGHUP), italic synthesis, smooth scrollback animation
-- Performance: ~48 MiB/s headless parse, bounded PTY drain, dirty-cell tracking,
-  StagingBelt uploads, coalesced wake events
+- Performance: per-tab engine thread (parse+apply off the frame path,
+  ~45 MiB/s sustained `cat` with sub-millisecond renders), bounded PTY drain,
+  dirty-cell tracking via snapshot row-pointer diff, StagingBelt uploads,
+  coalesced wake events
 - Bell (visual flash / audible), cursor + SGR text blink
 
 ## Remaining (see CONCERNS.md for details)
 
 - [ ] Multi-page glyph atlas for full CJK/emoji coverage
-- [ ] Kitty graphics file/shared-memory transmission (`t=f`/`t=s`); animation
-- [ ] Parse thread / grid snapshot (only if profiling shows frame hitches)
+- [ ] Kitty graphics shared-memory transmission (`t=s`) and animation (`a=f`)
+  (file transmission `t=f`/`t=t` and PNG are implemented)
+- [ ] Multi-page atlas / shaping for bold-italic fallback fonts
 
 ---
 
