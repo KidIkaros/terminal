@@ -2,6 +2,29 @@
 # Place this file as terminal.toml in your project directory
 # or ~/.config/terminal/config.toml for global settings.
 
+# -- Top-level settings --
+
+# Shell to run (defaults to $SHELL or /bin/bash)
+# shell = "/bin/bash"
+
+# Scrollback buffer size (lines)
+scrollback = 10000
+
+# Enable mouse reporting by default
+mouse_reporting = false
+
+# Cursor blink interval in milliseconds (0 = no blink)
+cursor_blink_ms = 500
+
+# SGR text blink interval in milliseconds (0 = no blink; rendered solid)
+text_blink_ms = 500
+
+# Bell feedback: "flash", "audible", or "none"
+bell = "flash"
+
+# Cursor style: "block", "bar", or "underline"
+cursor_style = "block"
+
 [font]
 # family is resolved via fontconfig (fc-match); falls back to the embedded
 # JetBrains Mono when not installed. `path` overrides family entirely.
@@ -70,27 +93,6 @@ ansi = [
 #     { key = "Ctrl+Shift+C", action = "copy" },
 #     { key = "Ctrl+Shift+V", action = "paste" },
 # ]
-
-# Shell to run (defaults to $SHELL or /bin/bash)
-# shell = "/bin/bash"
-
-# Scrollback buffer size (lines)
-scrollback = 10000
-
-# Enable mouse reporting by default
-mouse_reporting = false
-
-# Cursor blink interval in milliseconds (0 = no blink)
-cursor_blink_ms = 500
-
-# SGR text blink interval in milliseconds (0 = no blink; rendered solid)
-text_blink_ms = 500
-
-# Bell feedback: "flash", "audible", or "none"
-bell = "flash"
-
-# Cursor style: "block", "bar", or "underline"
-cursor_style = "block"
 
 [tabs]
 # Show the tab bar (visible automatically when more than one tab is open)
