@@ -183,7 +183,7 @@ checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 [[package]]
 name = "asciline"
 version = "0.1.0"
-source = "git+https://github.com/KidIkaros/asciline-rust?rev=d3d2df2efbd83b1ce6cfe64722b14bd33b0fbd7a#d3d2df2efbd83b1ce6cfe64722b14bd33b0fbd7a"
+source = "git+https://github.com/KidIkaros/asciline-rust?rev=628ceea7dc40acdec02acd20874747eaf811c279#628ceea7dc40acdec02acd20874747eaf811c279"
 dependencies = [
  "anyhow",
  "flate2",

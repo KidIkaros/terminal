@@ -41,18 +41,22 @@ The following items from the 2026-08-10 audit are no longer concerns:
   placement path. Image-id round-trips (`a=t`/`a=p`/`a=d`/`a=q`) let caching
   tools (ranger, image.nvim) store, re-place, query and delete images.
 - **Inline video playback** — opt-in `--features video`: `terminal --video
-  clip.mp4` decodes on a background thread via the `asciline` library and
-  renders frames through the kitty-graphics pipeline (letterboxed, real-time
-  paced).
+  clip.mp4` (or Ctrl+Shift+M with a video path on the clipboard) decodes on a
+  background thread via the `asciline` library and renders frames through the
+  kitty-graphics pipeline (letterboxed, real-time paced).
+- **Kitty graphics file transmission** — `t=f`/`t=t` read the image from a
+  base64-encoded file path (SSH-friendly); paths into `/proc`, `/sys`, `/dev`,
+  non-regular files, and files over 32 MiB are refused.
 
 ## Remaining tech debt / gaps
 
-- **Kitty graphics file/shared-memory transmission** (`t=f`/`t=s`) and
-  animation (`a=f`) are not implemented — only direct (`t=d`) data. Covers
-  `chafa`/`timg`/`kitten icat` (PNG is decoded), but not file-backed transfers.
-- **Inline video is opt-in and ffmpeg-bound.** The `video` feature pulls in
-  asciline's dependency tree (tokio/axum/rayon/…) and requires ffmpeg/ffprobe
-  on PATH at runtime; the default build stays lean.
+- **Kitty graphics shared-memory (`t=s`) and animation (`a=f`) are not
+  implemented.** File transmission (`t=f`/`t=t`) and PNG are done; `t=s` is a
+  rare Linux-shared-memory medium and `a=f` (frame animation) is niche.
+- **Inline video is opt-in and ffmpeg-bound.** The `video` feature requires
+  ffmpeg/ffprobe on PATH at runtime. The dependency tree was slimmed by
+  feature-gating asciline's server/player stack (see below), so the feature now
+  adds no tokio/axum/rayon.
 - **Cluster shaping uses the primary face only.** `shape_cluster` shapes
   combining clusters against the primary font bytes; bold/italic/fallback
   variants are not shaped. Acceptable for monospace terminals.
@@ -64,10 +68,14 @@ The following items from the 2026-08-10 audit are no longer concerns:
 - **Glyph atlas is a single 1024×1024 page.** Sufficient for ASCII + Latin-1 +
   modest CJK, but full CJK/emoji coverage could exhaust it. The scaling path is
   multi-page atlases.
-- **Parse thread / grid snapshot** is deferred. Steady-state is already smooth
-  (per-tab reader threads + coalesced wakes + bounded drain); the snapshot
-  refactor is only worth it if a GPU profile shows frame hitches under large
-  backlogs.
+- **Parse thread / grid snapshot** is deferred — but now on measured data, not
+  speculation. A scroll-storm trace (see Performance notes) shows the render
+  pass is ~1.3 ms/frame (p50) while the PTY drain is ~25–50 ms/call at the
+  256 KiB budget. The bottleneck is the single-threaded parse+apply drain, not
+  rendering; a background grid/parse thread would overlap that work with the
+  render loop and recover input responsiveness under sustained backlogs. It is
+  a large, correctness-sensitive refactor (grid ownership, input sync, cursor
+  round-trips) and is the one remaining performance item.
 
 ## Performance notes
 
@@ -78,6 +86,13 @@ The following items from the 2026-08-10 audit are no longer concerns:
 - **Raw parser throughput** is ~48 MiB/s headless (validated on a quiet
   machine). This is the number that matters for `bench`; the GUI number is
   vsync/contention-bound.
+- **Scroll-storm trace (measured 2026-08-14, `TERMINAL_RENDER_TRACE=1`):**
+  render p50/p90/p99 ≈ 1.3/1.7/13.7 ms per frame at 1200 dirty cells — the
+  render path is not the bottleneck. The drain is: ~256 KiB/call at
+  ~22–44 ms/call (≈6–12 MiB/s effective) with `more_pending` set throughout.
+  Conclusion: the ~4x gap to raw parse throughput lives in the single-threaded
+  parse+apply drain, not in rendering — see "Parse thread / grid snapshot"
+  above.
 
 ## Fragile areas
 
@@ -90,8 +105,9 @@ The following items from the 2026-08-10 audit are no longer concerns:
 
 ## Test coverage (current)
 
-- **~314 tests** across lib + bins (parser, grid, key encoding, config, font).
-- **34/34 VT conformance** cases (`vt_conformance` binary).
+- **~318 tests** across lib + bins (parser, grid, key encoding, config, font),
+  **320** with `--features video`.
+- **35/35 VT conformance** cases (`vt_conformance` binary).
 - **Fuzz harness** (`src/bin/fuzz.rs`) — hundreds of MB fuzzed clean across
   parser/grid/scroll/erase/sixel paths.
 - **Sixel cross-validation** against `chafa` (real encoder) in `bench/`.

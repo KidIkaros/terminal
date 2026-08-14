@@ -513,6 +513,12 @@ impl App {
                 self.reload_config();
                 true
             }
+            // Ctrl+Shift+M — play a video (path taken from the clipboard).
+            #[cfg(feature = "video")]
+            Key::Character(s) if s.as_str() == "M" && ctrl && shift => {
+                self.play_video_from_clipboard();
+                true
+            }
             // Ctrl+R — Reverse search
             Key::Character(s) if s.as_str() == "r" && ctrl && !shift => {
                 self.search.activate_reverse();
@@ -857,6 +863,32 @@ impl App {
                 self.video_stream = Some(stream);
             }
             Err(e) => log::error!("video: {e}"),
+        }
+    }
+
+    /// Read a video path from the clipboard and start playback (feature
+    /// `video`, Ctrl+Shift+M). The clipboard must hold a path to an existing
+    /// file.
+    #[cfg(feature = "video")]
+    fn play_video_from_clipboard(&mut self) {
+        let Some(text) = self.clipboard.paste() else {
+            log::warn!("video: clipboard is empty — copy a video path first");
+            return;
+        };
+        let path = text.trim().trim_matches('"').trim_matches('\'').to_string();
+        if !std::path::Path::new(&path).is_file() {
+            log::warn!("video: clipboard is not a file path: {path}");
+            return;
+        }
+        self.video_path = Some(path);
+        let (cw, ch) = self
+            .atlas
+            .as_ref()
+            .map(|a| (a.cell_width, a.cell_height))
+            .unwrap_or((8, 16));
+        self.start_video_if_requested(cw, ch);
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 

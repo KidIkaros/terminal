@@ -59,7 +59,7 @@ png = "0.17"
 # Inline video playback (optional, feature "video"). Used only for its
 # decoder (`video::FrameReader` / `probe_video`), which spawns ffmpeg.
 # `default-features = false` skips asciline's tokio/axum web-server stack.
-asciline = { git = "https://github.com/KidIkaros/asciline-rust", rev = "d3d2df2efbd83b1ce6cfe64722b14bd33b0fbd7a", default-features = false, optional = true }
+asciline = { git = "https://github.com/KidIkaros/asciline-rust", rev = "628ceea7dc40acdec02acd20874747eaf811c279", default-features = false, optional = true }
 
 # Configuration file (TOML)
 toml = "0.8"

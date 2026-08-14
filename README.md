@@ -22,7 +22,7 @@ A fast, GPU-accelerated terminal emulator written in Rust.
 - **Locked Down by Default** - OSC 52 clipboard reads are off by default; URI-scheme allowlist for hyperlinks
 - **Keyboard Protocols** - Full kitty keyboard protocol (`CSI u`) with progressive-enhancement flags, push/pop/query, key repeat/release events, alternate keys, and associated text; plus xterm modifyOtherKeys
 - **Kitty Graphics Protocol** - Inline images via `ESC _ G` (`chafa --format=kitty`, `timg`): raw RGB (`f=24`), RGBA (`f=32`) and PNG (`f=100`) with chunked transfers, plus image-id round-trips (`a=t`/`a=p`/`a=d`/`a=q`) for caching tools like ranger and image.nvim
-- **Inline Video** - Opt-in (`--features video`) playback of a video file directly in the terminal via `terminal --video clip.mp4`: asciline's decoder runs on a background thread and frames render through the kitty-graphics path (requires ffmpeg on PATH)
+- **Inline Video** - Opt-in (`--features video`) playback of a video file directly in the terminal via `terminal --video clip.mp4` (or Ctrl+Shift+M with a video path on the clipboard): asciline's decoder runs on a background thread and frames render through the kitty-graphics path (requires ffmpeg on PATH)
 - **Modern Look & Feel** - Configurable padding and window opacity, double-click word / triple-click line selection, SIGHUP config hot-reload, and smooth scrollback animation
 - **Parser Fuzz Harness** - Deterministic seeded fuzzing of the parser/grid seam
 

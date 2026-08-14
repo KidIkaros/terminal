@@ -664,6 +664,9 @@ struct KittyGfxPending {
     /// True for `a=t` (transmit + store + respond), false for `a=T`
     /// (transmit + display immediately).
     transmit_only: bool,
+    /// Transmission medium: `t=d` direct (default), `t=f`/`t=t` read the
+    /// image from a file whose path is the (base64) payload.
+    transmission: u8,
     /// Accumulated base64 payload (decoded at finalize).
     data: Vec<u8>,
 }
@@ -677,6 +680,31 @@ fn parse_ascii_u32(bytes: &[u8]) -> u32 {
             acc
         }
     })
+}
+
+/// Read an image file for kitty graphics `t=f`/`t=t` transmission. The path
+/// comes from untrusted terminal input, so we refuse pseudo-filesystems,
+/// non-regular files, and oversized files. `metadata` follows symlinks (the
+/// spec requires it); symlink loops surface as OS errors on open.
+fn read_graphics_file(path: &str) -> Result<Vec<u8>, String> {
+    const MAX_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
+    let blocked = path == "/proc"
+        || path == "/sys"
+        || path == "/dev"
+        || path.starts_with("/proc/")
+        || path.starts_with("/sys/")
+        || path.starts_with("/dev/");
+    if blocked {
+        return Err(format!("path not allowed: {path}"));
+    }
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("not a regular file: {path}"));
+    }
+    if meta.len() > MAX_BYTES {
+        return Err(format!("file too large ({} bytes)", meta.len()));
+    }
+    std::fs::read(path).map_err(|e| format!("read failed: {e}"))
 }
 
 /// Decode a PNG payload into `(width, height, RGBA8)` pixels. The
@@ -1025,6 +1053,7 @@ impl Grid {
         let mut height = 0u32;
         let mut image_id = 0u32;
         let mut delete = 0u8;
+        let mut transmission = b'd';
         let mut more_chunks = false;
         for kv in control.split(|&b| b == b',') {
             let Some(eq) = kv.iter().position(|&b| b == b'=') else {
@@ -1038,6 +1067,7 @@ impl Grid {
                 b"v" => height = parse_ascii_u32(v),
                 b"i" => image_id = parse_ascii_u32(v),
                 b"d" => delete = v.first().copied().unwrap_or(0),
+                b"t" => transmission = v.first().copied().unwrap_or(b'd'),
                 b"m" => more_chunks = parse_ascii_u32(v) == 1,
                 _ => {}
             }
@@ -1054,6 +1084,7 @@ impl Grid {
                     height,
                     image_id,
                     transmit_only: action == b't',
+                    transmission,
                     data: payload.to_vec(),
                 });
                 if !more_chunks {
@@ -1065,7 +1096,7 @@ impl Grid {
             b'p' => self.place_kitty_image(image_id),
             // Query (test-load, do not store). Direct transmission is always
             // accepted, so acknowledge unconditionally.
-            b'q' => self.respond_kitty(image_id, true),
+            b'q' => self.respond_kitty(image_id, "OK"),
             // Delete: `d=A` clears everything, otherwise delete `i=<id>`.
             b'd' => {
                 if delete == b'A' {
@@ -1092,8 +1123,7 @@ impl Grid {
 
     /// Queue a kitty graphics acknowledgement: `ESC _ G i=<id>;OK ST` on
     /// success, `...;ENOENT:<msg>` on failure.
-    fn respond_kitty(&mut self, image_id: u32, ok: bool) {
-        let status = if ok { "OK" } else { "ENOENT:no such image" };
+    fn respond_kitty(&mut self, image_id: u32, status: &str) {
         let reply = format!("\x1b_Gi={image_id};{status}\x1b\\");
         self.respond(reply.as_bytes());
     }
@@ -1103,7 +1133,7 @@ impl Grid {
     fn place_kitty_image(&mut self, image_id: u32) {
         let Some(stored) = self.kitty_images.iter().find(|k| k.id == image_id) else {
             log::debug!("Kitty graphics: put for unknown id {image_id}");
-            self.respond_kitty(image_id, false);
+            self.respond_kitty(image_id, "ENOENT:no such image");
             return;
         };
         let image = stored.image.clone();
@@ -1122,7 +1152,7 @@ impl Grid {
             self.sixel_images.remove(0);
         }
         self.mark_all_dirty();
-        self.respond_kitty(image_id, true);
+        self.respond_kitty(image_id, "OK");
         log::debug!("Kitty graphics: placed stored image #{id} at ({col},{row})");
     }
 
@@ -1139,12 +1169,30 @@ impl Grid {
     /// reuse the sixel placement/render path.
     fn finalize_kitty(&mut self, pending: KittyGfxPending) {
         use base64::Engine as _;
-        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&pending.data) else {
+        let Ok(payload) = base64::engine::general_purpose::STANDARD.decode(&pending.data) else {
             log::debug!("Kitty graphics: base64 decode failed");
             if pending.transmit_only {
-                self.respond_kitty(pending.image_id, false);
+                self.respond_kitty(pending.image_id, "EIO:base64 decode failed");
             }
             return;
+        };
+        // Direct (`t=d`) data is the image itself; `t=f`/`t=t` carry a
+        // base64-encoded file path to read the image from (SSH-friendly).
+        let raw = match pending.transmission {
+            b'f' | b't' => {
+                let path = String::from_utf8_lossy(&payload).into_owned();
+                match read_graphics_file(&path) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log::debug!("Kitty graphics: {e}");
+                        if pending.transmit_only {
+                            self.respond_kitty(pending.image_id, &format!("EIO:{e}"));
+                        }
+                        return;
+                    }
+                }
+            }
+            _ => payload,
         };
         let (width, height, rgba) = match pending.format {
             24 => {
@@ -1162,7 +1210,7 @@ impl Grid {
                 None => {
                     log::debug!("Kitty graphics: PNG (f=100) decode failed");
                     if pending.transmit_only {
-                        self.respond_kitty(pending.image_id, false);
+                        self.respond_kitty(pending.image_id, "EIO:png decode failed");
                     }
                     return;
                 }
@@ -1170,7 +1218,7 @@ impl Grid {
             other => {
                 log::debug!("Kitty graphics: unsupported format {other}");
                 if pending.transmit_only {
-                    self.respond_kitty(pending.image_id, false);
+                    self.respond_kitty(pending.image_id, "EIO:unsupported format");
                 }
                 return;
             }
@@ -1182,7 +1230,7 @@ impl Grid {
                 rgba.len()
             );
             if pending.transmit_only {
-                self.respond_kitty(pending.image_id, false);
+                self.respond_kitty(pending.image_id, "EIO:size mismatch");
             }
             return;
         }
@@ -1208,7 +1256,7 @@ impl Grid {
                     image,
                 });
             }
-            self.respond_kitty(pending.image_id, true);
+            self.respond_kitty(pending.image_id, "OK");
             return;
         }
 
@@ -4238,6 +4286,37 @@ mod tests {
         assert_eq!(g.take_responses(), vec![b"\x1b_Gi=1;OK\x1b\\".to_vec()]);
         assert!(g.kitty_images.is_empty());
         assert!(g.sixel_images.is_empty());
+    }
+
+    #[test]
+    fn test_kitty_graphics_file_transmission() {
+        use base64::Engine as _;
+        let mut g = make_grid(80, 24);
+        // Write a 1x1 RGBA red image to a temp file.
+        let dir = std::env::temp_dir().join(format!("kitty-gfx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("img.rgba");
+        std::fs::write(&path, [255u8, 0, 0, 255]).expect("write");
+        let path_str = path.to_string_lossy();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(path_str.as_bytes());
+
+        // t=f,f=32,s=1,v=1 → read the file as raw RGBA.
+        let mut seq = format!("\x1b_Ga=T,f=32,s=1,v=1,t=f;{b64}").into_bytes();
+        seq.extend_from_slice(b"\x1b\\");
+        feed(&mut g, &seq);
+        assert_eq!(g.sixel_images.len(), 1);
+        assert_eq!(g.sixel_images[0].image.rgba, vec![255, 0, 0, 255]);
+
+        // Sensitive path is refused.
+        let blocked = base64::engine::general_purpose::STANDARD.encode(b"/proc/self/mem");
+        let mut seq = format!("\x1b_Ga=t,i=9,f=32,s=1,v=1,t=f;{blocked}").into_bytes();
+        seq.extend_from_slice(b"\x1b\\");
+        feed(&mut g, &seq);
+        assert!(g.kitty_images.is_empty(), "sensitive path must be refused");
+        assert!(g.take_responses()[0].windows(3).any(|w| w == b"EIO"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

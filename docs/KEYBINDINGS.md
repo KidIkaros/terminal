@@ -61,6 +61,7 @@ This document lists all keyboard shortcuts available in the terminal.
 | Ctrl+Z | SIGTSTP | Send suspend signal (default behavior) |
 | Ctrl+D | EOF | Send end-of-file (default behavior) |
 | Ctrl+L | Clear | Clear screen (default behavior) |
+| Ctrl+Shift+M | Play Video | Play the video file whose path is on the clipboard (requires `--features video` and ffmpeg) |
 
 ## Mouse Support
 
