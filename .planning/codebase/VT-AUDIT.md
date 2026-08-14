@@ -239,11 +239,15 @@ Per vt100.net's own advice: spec + real terminal + **vttest**.
       `test_decaln_fills_screen`), including parser ST assertions
 - [x] Advanced compatibility coverage: grapheme tails/RustyBuzz shaping, Kitty keyboard,
       modifyOtherKeys, DEC line modes, and extended underline styles
-- [x] Native headless runner: `cargo run --release --bin vt_conformance -- --json` — 25/25 cases
-      passed (grew from 6 → 9 → 19 → 25 across sessions; latest additions: IRM insert mode,
+- [x] Native headless runner: `cargo run --release --bin vt_conformance -- --json` — 31/31 cases
+      passed (grew from 6 → 9 → 19 → 25 → 31 across sessions; additions: IRM insert mode,
       DECSC/DECRC save/restore, truecolor SGR colon+semicolon forms, CHT/CBT tabulation,
-      DECTCEM cursor visibility, DECOM origin mode — the CHT case found and fixed a missing
-      `CSI I` handler). JSON report saved to `bench/results/vt-conformance.json`.
+      DECTCEM cursor visibility, DECOM origin mode, plus a vt100.net research pass:
+      DECSTR soft reset, DECREQTPARM, DECCOLM/DECSCPP real column switches (grid resize +
+      app window-resize request), DECIC/DECDC column insert/delete, DECFRA/DECERA
+      rectangular fill/erase, DECNKM + DECPAM/DECPNM keypad mode, DECBKM. The CHT and
+      DECCOLM cases found real gaps: `CSI I` had no handler and DECCOLM was a no-op.
+      JSON report saved to `bench/results/vt-conformance.json`.
 - [x] Sixel lifecycle hardened (2026-08-13): placements are grid-owned (stable ids, capped at
       `MAX_LIVE_SIXELS`) and shift with scroll, drop on ED/EL/resize/alt-screen; the renderer
       reconciles GPU textures by id each frame instead of draining the queue.

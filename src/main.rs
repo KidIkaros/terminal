@@ -259,6 +259,36 @@ impl App {
                 }
             }
 
+            // DECCOLM (?3) / DECSCPP: the terminal asked to switch column
+            // count (80/132). Mirror it in the real window so the renderer's
+            // cell geometry stays consistent; the resulting Resized event
+            // re-syncs the grid to the same size.
+            if let Some(size) = tab.grid.window_resize_request.take() {
+                if let (Some(w), Some(atlas)) = (&self.window, &self.atlas) {
+                    // Inline tab_bar_height() (a method would conflict with
+                    // the active-tab borrow held for this block).
+                    let tb_h = if self.show_tab_bar {
+                        self.config
+                            .tabs
+                            .height
+                            .max(tab_bar::TabBar::HIT_SIZE as u32)
+                    } else {
+                        0
+                    };
+                    let width = (size.cols as u32) * atlas.cell_width.max(1);
+                    let height = (size.rows as u32) * atlas.cell_height.max(1) + tb_h;
+                    let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(
+                        width.max(1),
+                        height.max(1),
+                    ));
+                    log::debug!(
+                        "DECCOLM/DECSCPP: requested {}x{} window",
+                        size.cols,
+                        size.rows
+                    );
+                }
+            }
+
             // Bell (BEL): surfaced to the log; a visual flash is future work.
             if tab.grid.take_bell() {
                 log::debug!("bell: visual feedback requested by application");

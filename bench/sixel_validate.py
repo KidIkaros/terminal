@@ -16,6 +16,7 @@ Usage:  python3 bench/sixel_validate.py   (needs: PIL, a release build)
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,8 @@ def encode(img):
     w, h = img.size
     px = img.convert("RGB")
 
-    out = bytearray(f'"1;1;{h};{w}'.encode())
+    # Raster attrs: Pn3 = width, Pn4 = height (DEC Sixel Graphics Protocol).
+    out = bytearray(f'"1;1;{w};{h}'.encode())
     regs = {}
     cur_reg = -1
 
@@ -87,6 +89,85 @@ def build_test_image():
         for x in range(28, 36):
             px[x, y] = (0, 0, 255)        # blue block, 6 px tall
     return img
+
+
+def validate_with_chafa(binary):
+    """Cross-check against chafa, a real-world encoder, when available.
+
+    chafa quantizes colors to a small palette, so this checks structure
+    rather than exact pixels: the decoded size must equal the source size
+    (chafa declares raster width/height = source dims, Pn3 = width per the
+    DEC spec) and each colored block must decode at its position with the
+    right dominant hue.
+    """
+    chafa = shutil.which("chafa")
+    if not chafa:
+        print("chafa not found on PATH — skipping real-encoder cross-check")
+        return 0
+
+    src = build_test_image()  # 40x18, red/green/blue blocks
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        src.save(f.name)
+        png = f.name
+    try:
+        proc = subprocess.run(
+            [chafa, "--format=sixel", png], capture_output=True, timeout=30
+        )
+    finally:
+        os.unlink(png)
+    if proc.returncode != 0:
+        print(f"chafa encode failed: {proc.stderr.decode(errors='replace').strip()}")
+        return 1
+
+    payload = proc.stdout
+    with tempfile.NamedTemporaryFile(suffix=".sixel", delete=False) as f:
+        f.write(payload)
+        path = f.name
+    try:
+        dec = subprocess.run(
+            [binary, path, "800", "600"], capture_output=True, timeout=30
+        )
+    finally:
+        os.unlink(path)
+    if dec.returncode != 0:
+        print(f"chafa payload decode failed: {dec.stderr.decode(errors='replace').strip()}")
+        return 1
+
+    size_line = next(
+        (l for l in dec.stderr.decode().splitlines() if l.startswith("SIZE")), None
+    )
+    w, h = (int(v) for v in size_line.split()[1].split("x")) if size_line else (0, 0)
+    if w == 0 or h == 0:
+        print("chafa payload decoded empty")
+        return 1
+
+    # chafa rounds its render size (e.g. 40x18 -> 40x20), so scale the block
+    # rectangles from source coords to the decoded grid.
+    sw, sh = src.size
+    sx, sy = w / sw, h / sh
+    rgba = dec.stdout
+    expected = [  # (x0, y0, x1, y1, hue predicate)
+        (4, 0, 10, 12, lambda r, g, b: r > g and r > b),       # red block
+        (16, 6, 24, 18, lambda r, g, b: g > r and g > b),      # green block
+        (28, 0, 36, 6, lambda r, g, b: b > r and b > g),       # blue block
+    ]
+    for x0, y0, x1, y1, pred in expected:
+        X0, Y0 = int(x0 * sx), int(y0 * sy)
+        X1, Y1 = max(X0 + 1, int(x1 * sx)), max(Y0 + 1, int(y1 * sy))
+        n = (X1 - X0) * (Y1 - Y0)
+        rs = gs = bs = 0
+        for y in range(Y0, Y1):
+            for x in range(X0, X1):
+                i = (y * w + x) * 4
+                rs += rgba[i]
+                gs += rgba[i + 1]
+                bs += rgba[i + 2]
+        r, g, b = rs / n, gs / n, bs / n
+        if not pred(r, g, b):
+            print(f"chafa block at ({X0},{Y0}) wrong hue: avg ({r:.0f},{g:.0f},{b:.0f})")
+            return 1
+    print(f"PASS: chafa payload decodes to {w}x{h}, all 3 blocks at position with correct hue")
+    return 0
 
 
 def main():
@@ -151,4 +232,15 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    if rc == 0:
+        rc = validate_with_chafa(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "target",
+                "release",
+                "examples",
+                "sixel_check",
+            )
+        )
+    sys.exit(rc)

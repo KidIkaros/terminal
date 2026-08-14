@@ -16,8 +16,10 @@ decode/placement, autowrap-off clamping, REP, ICH/DCH/ECH, scroll-region confine
 UTF-8 robustness next to invalid bytes, OSC 52, cursor shapes / bracketed paste, pending-wrap
 behaviour, DECRQM, OSC 8 hyperlinks, IRM insert mode, DECSC/DECRC cursor save/restore,
 truecolor SGR (colon + semicolon forms), CHT/CBT tabulation, DECTCEM cursor visibility,
-and DECOM origin mode — **25 cases**. The CHT case caught a real gap: `CSI I` had no
-handler; it was added alongside the existing CBT.
+DECOM origin mode, DECSTR soft reset, DECREQTPARM, DECCOLM/DECSCPP column switches,
+DECIC/DECDC column insert/delete, DECFRA/DECERA rectangular fill/erase, and
+DECPAM/DECNKM/DECBKM — **31 cases**. The CHT and DECCOLM cases caught real gaps: `CSI I`
+had no handler, and DECCOLM was accepted but did not resize.
 
 ## Parser fuzz harness
 
@@ -82,6 +84,15 @@ It renders a 3-color test image with PIL, encodes it (raster attributes, inline
 img2sixel emit), decodes it through `examples/sixel_check`, and requires a pixel-exact
 match. This caught a real decoder bug: growing the buffer taller with a narrower column
 request truncated already-drawn pixels (fixed by making buffer growth monotonic).
+
+When `chafa` is on `PATH`, the script also runs a **real-encoder cross-check**: it encodes
+the same test image with chafa, decodes it through `examples/sixel_check`, and verifies the
+size and the position/hue of every colored block (chafa quantizes colors, so this checks
+structure, not exact pixels). This caught a second real bug: the raster attribute
+(`"Pn1;Pn2;Pn3;Pn4`) parser read Pn3 as height and Pn4 as width, but the DEC Sixel
+Graphics Protocol defines Pn3 = width, Pn4 = height — chafa's `"1;1;200;120` for a
+200x120 image decoded transposed to 120x200 with only the left half drawn. Fixed; chafa
+payloads now decode to their declared size with full coverage.
 
 ### Sixel lifecycle
 

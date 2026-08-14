@@ -14,7 +14,7 @@ A fast, GPU-accelerated terminal emulator written in Rust.
 - **Bracketed Paste** - Safe paste handling
 - **Customizable Themes** - 16 built-in themes (Catppuccin, Gruvbox, Dracula, etc.)
 - **Tabs** - Multiple terminal sessions with a tab bar
-- **Sixel Inline Images** - Decode and render sixel (DEC 54870) graphics: `cat image.six`, chafa, img2sixel; images track their rows on scroll and are removed on clear/resize/alt-screen
+- **Sixel Inline Images** - Decode and render sixel (DEC 54870) graphics: `cat image.six`, chafa, img2sixel; images track their rows on scroll and are removed on clear/resize/alt-screen. Cross-validated against chafa (real encoder) and an independent Python encoder
 - **Shell Integration** - OSC 133 prompt/command markers with Ctrl+Shift+Up/Down prompt jumping, OSC 7 cwd tracking
 - **In-Band Resize** - Mode 2048 resize notifications (`CSI 4;h;w t`) for tmux/neovim
 - **Rectangular Selection** - Alt+Click block selection (VS Code/kitty style)
@@ -151,8 +151,8 @@ Run it yourself: `cargo run --release --bin bench`.
 
 ## Verification
 
-- `cargo test --locked` — 287 tests (parser, grid, selection, sixel, fuzz smoke)
-- `cargo run --release --bin vt_conformance` — 25 headless VT conformance cases
+- `cargo test --locked` — 293 tests (parser, grid, selection, sixel, fuzz smoke)
+- `cargo run --release --bin vt_conformance` — 31 headless VT conformance cases
 - `cargo run --release --bin fuzz -- --quick` — deterministic parser fuzzing
 
 ## License

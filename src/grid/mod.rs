@@ -487,6 +487,14 @@ pub struct Grid {
     pub kitty_keyboard: bool,
     /// xterm modifyOtherKeys mode (0 disabled, 1/2 enabled).
     pub modify_other_keys: u8,
+    /// DECNKM (?66): application keypad mode (DECPAM `ESC =` on, DECPNM
+    /// `ESC >` off). Read by the key encoder to choose SS3 vs CSI digits.
+    pub keypad_app: bool,
+    /// DECBKM (?67): backarrow key sends DEL instead of BS.
+    pub backarrow_del: bool,
+    /// Set by DECCOLM (?3) / DECSCPP (`CSI | ~`) when the terminal requests
+    /// a column-count change; the app drains this and resizes the window.
+    pub window_resize_request: Option<WinSize>,
 
     // Cursor saved specifically for alternate screen entry/exit
     alt_saved_cursor: Cursor,
@@ -731,6 +739,9 @@ impl Grid {
             application_cursor_keys: false,
             kitty_keyboard: false,
             modify_other_keys: 0,
+            keypad_app: false,
+            backarrow_del: false,
+            window_resize_request: None,
             tab_stops: default_tab_stops(cols),
             last_char: None,
             saved_cursor_alt: SavedCursor::default(),
@@ -914,6 +925,8 @@ impl Grid {
             6 => self.origin_mode,             // DECOM
             7 => self.autowrap,                // DECAWM
             25 => self.cursor_visible,         // DECTCEM
+            66 => self.keypad_app,             // DECNKM
+            67 => self.backarrow_del,          // DECBKM
             1000 => self.mouse_mode == MouseMode::Normal,
             1002 => self.mouse_mode == MouseMode::ButtonEvent,
             1003 => self.mouse_mode == MouseMode::AnyEvent,
@@ -1167,6 +1180,72 @@ impl Grid {
         self.mark_all_dirty();
         // T4-5: prune orphaned hyperlink entries on resize.
         self.prune_hyperlinks();
+    }
+
+    /// Switch the terminal between 80/132-column modes (DECCOLM ?3 / DECSCPP
+    /// `CSI Ps | ~`). Per VT100 spec: reflow to the new width, clear the
+    /// screen, home the cursor, and reset the margins. Also surfaces a
+    /// `window_resize_request` for the app to mirror in the real window.
+    pub fn set_columns(&mut self, new_cols: usize) {
+        if new_cols == self.cols {
+            // Still a full reset of the screen state per spec.
+            self.active_fg = Color::Default;
+            self.active_bg = Color::Default;
+            self.active_attrs = Attrs::default();
+            self.erase_in_display(2);
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows - 1;
+            self.cursor = Cursor::default();
+            return;
+        }
+        let new_cols = new_cols.clamp(2, 512);
+        self.resize(WinSize {
+            cols: new_cols as u16,
+            rows: self.rows as u16,
+        });
+        // Spec side effects: clear, home cursor, reset margins.
+        self.active_fg = Color::Default;
+        self.active_bg = Color::Default;
+        self.active_attrs = Attrs::default();
+        self.erase_in_display(2);
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
+        self.cursor = Cursor::default();
+        self.window_resize_request = Some(WinSize {
+            cols: new_cols as u16,
+            rows: self.rows as u16,
+        });
+    }
+
+    /// DECSTR — soft terminal reset (`CSI ! p`). Returns the terminal to its
+    /// power-up state: modes off, SGR default, screen cleared, cursor home,
+    /// margins reset, tab stops re-initialized. Unlike RIS it keeps the
+    /// scrollback (xterm behaviour).
+    pub fn soft_reset(&mut self) {
+        self.active_fg = Color::Default;
+        self.active_bg = Color::Default;
+        self.active_attrs = Attrs::default();
+        self.autowrap = true;
+        self.origin_mode = false;
+        self.screen_reverse = false;
+        self.insert_mode = false;
+        self.cursor_visible = true;
+        self.cursor_shape = 0;
+        self.application_cursor_keys = false;
+        self.keypad_app = false;
+        self.backarrow_del = false;
+        self.bracketed_paste = false;
+        self.focus_reporting = false;
+        self.synchronized_output = false;
+        self.in_band_resize = false;
+        self.mouse_mode = MouseMode::None;
+        self.mouse_encoding = MouseEncoding::X10;
+        self.tab_stops = default_tab_stops(self.cols);
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
+        self.erase_in_display(2);
+        self.cursor = Cursor::default();
+        self.mark_all_dirty();
     }
 
     // -----------------------------------------------------------------------
@@ -1923,6 +2002,113 @@ impl Grid {
             .retain(|p| !(p.row == row && p.col >= start_col && p.col < end_col));
     }
 
+    /// Fill a rectangular area (DECFRA / DECERA): rows `top..=bottom` and
+    /// columns `left..=right`, all 1-based and shifted by the origin in
+    /// DECOM mode, clamped to the screen. Cells are replaced with `fill`
+    /// using the current SGR (DECERA pre-sets SGR to defaults).
+    fn fill_rect(&mut self, top: usize, left: usize, bottom: usize, right: usize, fill: u16) {
+        let origin = if self.origin_mode {
+            self.scroll_top.min(self.rows.saturating_sub(1))
+        } else {
+            0
+        };
+        let r0 = top.saturating_sub(1) + origin;
+        let r1 = bottom.saturating_sub(1) + origin;
+        let c0 = left.saturating_sub(1);
+        let c1 = right.saturating_sub(1);
+        let r0 = r0.min(self.rows - 1);
+        let r1 = r1.min(self.rows - 1);
+        let c0 = c0.min(self.cols - 1);
+        let c1 = c1.min(self.cols - 1);
+        if r0 > r1 || c0 > c1 {
+            return;
+        }
+        let ch = char::from_u32(fill as u32).unwrap_or(' ');
+        let fg = self.active_fg;
+        let bg = self.active_bg;
+        let attrs = self.active_attrs;
+        for r in r0..=r1 {
+            self.row_is_blank[r] = false;
+            let row_cells = Arc::make_mut(&mut self.cells_mut()[r]);
+            for c in c0..=c1 {
+                row_cells[c] = Cell {
+                    ch,
+                    fg,
+                    bg,
+                    attrs,
+                    dirty: true,
+                    ..Cell::default()
+                };
+            }
+        }
+    }
+
+    /// Insert `n` blank columns at the cursor (DECIC). Every row shifts its
+    /// content from the cursor column right; the rightmost columns fall off.
+    fn insert_columns(&mut self, n: usize) {
+        let cols = self.cols;
+        let col = self.cursor.col.min(cols);
+        if col >= cols {
+            return;
+        }
+        let n = n.min(cols - col);
+        let fg = self.active_fg;
+        let bg = self.active_bg;
+        let attrs = self.active_attrs;
+        for r in 0..self.rows {
+            self.row_is_blank[r] = false;
+            let row_cells = Arc::make_mut(&mut self.cells_mut()[r]);
+            for c in (col..cols).rev() {
+                if c + n < cols {
+                    row_cells[c + n] = row_cells[c].clone();
+                }
+                row_cells[c].dirty = true;
+            }
+            for c in col..(col + n).min(cols) {
+                row_cells[c] = Cell {
+                    ch: ' ',
+                    fg,
+                    bg,
+                    attrs,
+                    dirty: true,
+                    ..Cell::default()
+                };
+            }
+        }
+    }
+
+    /// Delete `n` columns at the cursor (DECDC). Every row shifts its content
+    /// left from the cursor column; the rightmost columns become blank.
+    fn delete_columns(&mut self, n: usize) {
+        let cols = self.cols;
+        let col = self.cursor.col.min(cols);
+        if col >= cols {
+            return;
+        }
+        let n = n.min(cols - col);
+        let fg = self.active_fg;
+        let bg = self.active_bg;
+        let attrs = self.active_attrs;
+        for r in 0..self.rows {
+            self.row_is_blank[r] = false;
+            let row_cells = Arc::make_mut(&mut self.cells_mut()[r]);
+            for c in col..(cols - n) {
+                row_cells[c] = row_cells[c + n].clone();
+                row_cells[c].dirty = true;
+            }
+            for c in (cols - n)..cols {
+                row_cells[c] = Cell {
+                    ch: ' ',
+                    fg,
+                    bg,
+                    attrs,
+                    dirty: true,
+                    ..Cell::default()
+                };
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // SGR — Select Graphic Rendition
     // -----------------------------------------------------------------------
@@ -2405,9 +2591,10 @@ impl Grid {
                             self.application_cursor_keys = set;
                         }
                         3 => {
-                            // DECCOLM — 80/132 column switch (T3-5). We accept
-                            // the mode without resizing (must not corrupt).
-                            log::debug!("DECCOLM {}: accepted, no resize", set);
+                            // DECCOLM — 80/132 column switch (T3-5): set → 80
+                            // columns, reset → 132 (VT100 convention). Resizes
+                            // the grid and requests the window to follow.
+                            self.set_columns(if set { 80 } else { 132 });
                         }
                         5 => {
                             // DECSCNM — screen reverse video (T3-4).
@@ -2427,6 +2614,15 @@ impl Grid {
                         }
                         25 => {
                             self.cursor_visible = set;
+                        }
+                        66 => {
+                            // DECNKM — keypad application mode (numeric off).
+                            self.keypad_app = set;
+                        }
+                        67 => {
+                            // DECBKM — backarrow key sends DEL when set, BS
+                            // when reset (default).
+                            self.backarrow_del = set;
                         }
                         1000 => {
                             // Normal mouse tracking
@@ -2587,6 +2783,16 @@ impl Grid {
                     self.respond(resp.as_bytes());
                 }
             }
+            // DECREQTPARM — request terminal parameters: CSI Ps x. Reports
+            // the VT220 default (parity none, 8 bits, 112.5 baud ×4 = 9600,
+            // 0 transmit bits, 0 receive bits) — the response xterm sends.
+            // Request 0 = "will send a report", 1 = "no change requested".
+            (b"", b'x') => {
+                let request = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+                let reply_type = if request == 1 { 3 } else { 2 };
+                let resp = format!("\x1b[{};1;1;112;112;1;0x", reply_type);
+                self.respond(resp.as_bytes());
+            }
             // DECRQM — Mode Request: CSI ? Pd $ p → DECRPM CSI ? Pd ; Ps $ y.
             // '$' is collected as a second intermediate, so we see [?, $].
             // Ps: 1=set, 2=reset, 0=not recognized. (T2-3)
@@ -2604,6 +2810,90 @@ impl Grid {
                 let state = self.mode_state(mode);
                 let resp = format!("\x1b[{};{}$y", mode, state);
                 self.respond(resp.as_bytes());
+            }
+            // DECSTR — soft terminal reset: CSI ! p.
+            (b"!", b'p') => {
+                self.soft_reset();
+            }
+            // DECSCPP — set columns per page: CSI Ps $ |. 80 or 132 (0 = no
+            // change). Shares the DECCOLM machinery.
+            (b"$", b'|') => {
+                let cols = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+                if cols == 80 || cols == 132 {
+                    self.set_columns(cols as usize);
+                }
+            }
+            // DECFRA — fill rectangular area: CSI Ps;Pt;Pl;Pp;Pv $ x. Fills
+            // the rectangle (top/left/bottom/right, 1-based, cursor-relative
+            // in origin mode) with the character Ps (space if omitted), using
+            // the current SGR.
+            (b"$", b'x') => {
+                let flat: Vec<u16> = params
+                    .iter()
+                    .map(|p| p.first().copied().unwrap_or(0))
+                    .collect();
+                let fill = flat.first().copied().unwrap_or(b' ' as u16);
+                let top = flat.get(1).copied().unwrap_or(1);
+                let left = flat.get(2).copied().unwrap_or(1);
+                let bottom = flat.get(3).copied().unwrap_or(1);
+                let right = flat.get(4).copied().unwrap_or(1);
+                self.fill_rect(
+                    top as usize,
+                    left as usize,
+                    bottom as usize,
+                    right as usize,
+                    fill as u16,
+                );
+            }
+            // DECERA — erase rectangular area: CSI Pt;Pl;Pp;Pv $ z. Replaces
+            // the rectangle's characters and attributes with default blanks.
+            (b"$", b'z') => {
+                let flat: Vec<u16> = params
+                    .iter()
+                    .map(|p| p.first().copied().unwrap_or(0))
+                    .collect();
+                let top = flat.first().copied().unwrap_or(1);
+                let left = flat.get(1).copied().unwrap_or(1);
+                let bottom = flat.get(2).copied().unwrap_or(1);
+                let right = flat.get(3).copied().unwrap_or(1);
+                let old_fg = self.active_fg;
+                let old_bg = self.active_bg;
+                let old_attrs = self.active_attrs;
+                self.active_fg = Color::Default;
+                self.active_bg = Color::Default;
+                self.active_attrs = Attrs::default();
+                self.fill_rect(
+                    top as usize,
+                    left as usize,
+                    bottom as usize,
+                    right as usize,
+                    b' ' as u16,
+                );
+                self.active_fg = old_fg;
+                self.active_bg = old_bg;
+                self.active_attrs = old_attrs;
+            }
+            // DECIC — insert columns: CSI Ps ' }. Inserts Ps blank columns at
+            // the cursor, shifting content right off the right margin.
+            (b"'", b'}') => {
+                let n = params
+                    .first()
+                    .and_then(|p| p.first())
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                self.insert_columns(n);
+            }
+            // DECDC — delete columns: CSI Ps ' ~. Deletes Ps columns at the
+            // cursor, pulling content left and blanking the right edge.
+            (b"'", b'~') => {
+                let n = params
+                    .first()
+                    .and_then(|p| p.first())
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                self.delete_columns(n);
             }
             // Kitty keyboard protocol: CSI > 1 u enables disambiguation;
             // CSI < u restores the previous mode. This handles the common
@@ -3152,6 +3442,14 @@ impl Perform for Grid {
                             self.scrollback_capacity,
                         );
                         self.cursor_visible = true;
+                    }
+                    // DECPAM — keypad application mode (ESC =).
+                    (_, b'=') => {
+                        self.keypad_app = true;
+                    }
+                    // DECPNM — keypad numeric mode (ESC >).
+                    (_, b'>') => {
+                        self.keypad_app = false;
                     }
                     _ => {}
                 }
@@ -4190,13 +4488,20 @@ mod tests {
     }
 
     #[test]
-    fn test_deccolm_accepted_harmlessly() {
+    fn test_deccolm_switches_columns() {
         let mut g = make_grid(80, 24);
-        feed(&mut g, b"\x1b[?3h"); // must not corrupt
+        feed(&mut g, b"text\x1b[?3h"); // DECCOLM set → 80 columns, cleared
         assert_eq!(g.cols, 80);
         assert_eq!(g.rows, 24);
-        feed(&mut g, b"\x1b[?3l");
-        assert_eq!(g.cols, 80);
+        assert_eq!(g.cursor.col, 0, "DECCOLM should home the cursor");
+        assert_eq!(
+            g.line_to_string(0),
+            "".to_owned() + &" ".repeat(80),
+            "DECCOLM should clear"
+        );
+        feed(&mut g, b"\x1b[?3l"); // DECCOLM reset → 132 columns
+        assert_eq!(g.cols, 132);
+        assert_eq!(g.rows, 24);
     }
 
     // -- Tier-3 Batch B: tab stops, ICH, REP, ED 3, per-screen cursor --
@@ -4350,6 +4655,116 @@ mod tests {
         // Past the last stop → clamp to the last column.
         feed(&mut g, b"\x1b[9I");
         assert_eq!(g.cursor.col, 39);
+    }
+
+    // -- vt100.net research pass: DECSTR, DECREQTPARM, DECCOLM/DECSCPP,
+    //    DECIC/DECDC, DECFRA/DECERA, DECNKM/DECBKM --
+
+    #[test]
+    fn test_decstr_soft_reset() {
+        let mut g = make_grid(10, 6);
+        feed(&mut g, b"\x1b[?7l\x1b[4h\x1b[5;1Hxy"); // autowrap off, insert on, cursor row 4
+        assert!(!g.autowrap && g.insert_mode);
+        feed(&mut g, b"\x1b[!p"); // DECSTR
+        assert!(g.autowrap, "autowrap not restored");
+        assert!(!g.insert_mode, "insert mode not cleared");
+        assert_eq!(g.cursor.row, 0, "cursor not homed");
+        assert_eq!(g.cursor.col, 0);
+        assert_eq!(g.line_to_string(4), "          ", "screen not cleared");
+    }
+
+    #[test]
+    fn test_decreqtparm_reports() {
+        let mut g = make_grid(10, 3);
+        feed(&mut g, b"\x1b[x");
+        assert_eq!(
+            g.take_responses(),
+            vec![b"\x1b[2;1;1;112;112;1;0x".to_vec()],
+            "DECREQTPARM request 0 reply wrong"
+        );
+        feed(&mut g, b"\x1b[1x");
+        assert_eq!(
+            g.take_responses(),
+            vec![b"\x1b[3;1;1;112;112;1;0x".to_vec()],
+            "DECREQTPARM request 1 reply wrong"
+        );
+    }
+
+    #[test]
+    fn test_deccolm_and_decscpp_resize() {
+        let mut g = make_grid(40, 4);
+        feed(&mut g, b"hello\x1b[2;3H");
+        feed(&mut g, b"\x1b[?3h"); // DECCOLM set → 80 columns
+        assert_eq!(g.cols, 80, "DECCOLM did not switch to 80");
+        assert_eq!(g.cursor.row, 0, "DECCOLM did not home cursor");
+        assert_eq!(g.cursor.col, 0);
+        assert_eq!(
+            g.line_to_string(0),
+            "".to_owned() + &" ".repeat(80),
+            "DECCOLM did not clear"
+        );
+        feed(&mut g, b"\x1b[132$|"); // DECSCPP 132
+        assert_eq!(g.cols, 132, "DECSCPP 132 failed");
+        feed(&mut g, b"\x1b[?3l"); // DECCOLM reset → 132
+        assert_eq!(g.cols, 132, "DECCOLM reset should stay 132 (already 132)");
+        assert!(
+            g.window_resize_request.is_some(),
+            "window resize not requested"
+        );
+    }
+
+    #[test]
+    fn test_decic_and_decdc_columns() {
+        let mut g = make_grid(8, 2);
+        feed(&mut g, b"abcdef\x1b[4D"); // cursor at col 2
+        feed(&mut g, b"\x1b['}"); // DECIC 1: insert blank column
+        assert_eq!(
+            g.line_to_string(0),
+            "ab cdef ",
+            "DECIC insert wrong: {:?}",
+            g.line_to_string(0)
+        );
+        feed(&mut g, b"\x1b[2D\x1b['~"); // back to col 0, DECDC 1: delete col 0
+        assert_eq!(
+            g.line_to_string(0),
+            "b cdef  ",
+            "DECDC delete wrong: {:?}",
+            g.line_to_string(0)
+        );
+    }
+
+    #[test]
+    fn test_decfra_fills_and_decera_erases() {
+        let mut g = make_grid(8, 4);
+        feed(&mut g, b"\x1b[65;2;2;3;4$x"); // DECFRA: fill rows 2-3, cols 2-4 with 'A'
+        assert_eq!(g.cell(1, 1).ch, 'A', "DECFRA top-left");
+        assert_eq!(g.cell(3, 2).ch, 'A', "DECFRA bottom-right");
+        assert_eq!(g.cell(0, 0).ch, ' ', "DECFRA leaked outside rect");
+        feed(&mut g, b"\x1b[1;1;2;3$z"); // DECERA: erase rows 1-2, cols 1-3
+        assert_eq!(g.cell(0, 0).ch, ' ', "DECERA top-left not erased");
+        // (col 2, row 1) was filled by DECFRA and lies inside the erase
+        // rectangle → blank now; (col 3, row 1) is outside it → still 'A'.
+        assert_eq!(g.cell(2, 1).ch, ' ', "DECERA did not erase filled cells");
+        assert_eq!(g.cell(3, 1).ch, 'A', "DECERA over-erased");
+    }
+
+    #[test]
+    fn test_decpam_decnkm_and_decbkm() {
+        let mut g = make_grid(10, 3);
+        feed(&mut g, b"\x1b[?66h");
+        assert!(g.keypad_app, "DECNKM set failed");
+        feed(&mut g, b"\x1b>"); // DECPNM
+        assert!(!g.keypad_app, "DECPNM clear failed");
+        feed(&mut g, b"\x1b="); // DECPAM
+        assert!(g.keypad_app, "DECPAM set failed");
+        feed(&mut g, b"\x1b[?67h");
+        assert!(g.backarrow_del, "DECBKM set failed");
+        feed(&mut g, b"\x1b[?67$p");
+        assert_eq!(
+            g.take_responses(),
+            vec![b"\x1b[?67;1$y".to_vec()],
+            "DECRQM mode 67 mismatch"
+        );
     }
 
     #[test]

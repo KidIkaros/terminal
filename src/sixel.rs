@@ -353,8 +353,11 @@ pub fn decode_sixel(data: &[u8], max_w: u32, max_h: u32) -> Option<SixelImage> {
                     _ => {}
                 }
             }
-            // `"P1;P2;P3;P4` — raster attributes. P3 = pixel height,
-            // P4 = pixel width (P1/P2 are pan/pad and ignored).
+            // `"P1;P2;P3;P4` — raster attributes (DEC Sixel Graphics
+            // Protocol, VT330/VT340 RM): Pn1/Pn2 are the pixel aspect ratio
+            // (pan/pad, ignored here), Pn3 is the HORIZONTAL size in pixels
+            // (width) and Pn4 the VERTICAL size (height). chafa/img2sixel
+            // emit width first, e.g. `"1;1;200;120` for a 200x120 image.
             0x22 => {
                 let _pan = cursor.number();
                 if cursor.peek() == Some(b';') {
@@ -362,13 +365,13 @@ pub fn decode_sixel(data: &[u8], max_w: u32, max_h: u32) -> Option<SixelImage> {
                     let _pad = cursor.number();
                     if cursor.peek() == Some(b';') {
                         cursor.next();
-                        if let Some(h) = cursor.number() {
-                            raster_h = h;
+                        if let Some(w) = cursor.number() {
+                            raster_w = w;
                         }
                         if cursor.peek() == Some(b';') {
                             cursor.next();
-                            if let Some(w) = cursor.number() {
-                                raster_w = w;
+                            if let Some(h) = cursor.number() {
+                                raster_h = h;
                             }
                         }
                     }
@@ -524,9 +527,11 @@ mod tests {
 
     #[test]
     fn raster_attributes_size_the_output() {
-        // `"1;1;12;4` declares 12x4; draw 4 columns of color 3.
+        // `"1;1;12;4` declares 12 wide x 4 tall (Pn3 = width, Pn4 = height
+        // per the DEC spec); draw 4 columns of color 3, so the buffer pads
+        // to the declared width with the drawn columns top-left.
         let img = decode_sixel(b"\"1;1;12;4#3!4~", 100, 100).expect("decodes");
-        assert_eq!((img.width, img.height), (4, 12));
+        assert_eq!((img.width, img.height), (12, 4));
     }
 
     #[test]

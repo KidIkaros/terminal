@@ -146,7 +146,8 @@ fn sixel_decode_and_place() -> Result<(), String> {
     let mut grid = Grid::new(WinSize { cols: 40, rows: 10 }, 32);
     grid.set_cell_size(8, 16);
     // A 2x12 blue image: two bands of a 2-wide run, then LF + repeat.
-    feed(&mut grid, b"\x1bPq\"1;1;12;2#1!2~-!2~\x1b\\");
+    // Raster attrs declare width 2, height 12 (Pn3 = width per DEC spec).
+    feed(&mut grid, b"\x1bPq\"1;1;2;12#1!2~-!2~\x1b\\");
     expect(grid.sixel_images.len() == 1, "sixel image not placed")?;
     let img = &grid.sixel_images[0];
     expect(img.col == 0 && img.row == 0, "sixel misplaced")?;
@@ -403,6 +404,103 @@ fn decom_origin_mode() -> Result<(), String> {
     )
 }
 
+// -- Clean-room fixtures (spec: vt100.net DEC private sequences / VT220 RM) --
+// These mirror behaviors esctest2 exercises via its PTY oracle, written from
+// the DEC specs rather than copied from that GPL suite.
+
+fn decstr_soft_reset() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 6 }, 32);
+    feed(&mut grid, b"\x1b[?7l\x1b[4h\x1b[5;1Hxy");
+    feed(&mut grid, b"\x1b[!p"); // DECSTR
+    expect(grid.autowrap, "DECSTR did not restore autowrap")?;
+    expect(!grid.insert_mode, "DECSTR did not clear insert mode")?;
+    expect(
+        grid.cursor.row == 0 && grid.cursor.col == 0,
+        "DECSTR did not home the cursor",
+    )?;
+    expect(
+        grid.line_to_string(4) == "          ",
+        "DECSTR did not clear the screen",
+    )
+}
+
+fn decreqtparm_report() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 3 }, 32);
+    feed(&mut grid, b"\x1b[x");
+    expect(
+        grid.take_responses() == vec![b"\x1b[2;1;1;112;112;1;0x".to_vec()],
+        "DECREQTPARM request 0 reply wrong",
+    )?;
+    feed(&mut grid, b"\x1b[1x");
+    expect(
+        grid.take_responses() == vec![b"\x1b[3;1;1;112;112;1;0x".to_vec()],
+        "DECREQTPARM request 1 reply wrong",
+    )
+}
+
+fn deccolm_switches_width() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 40, rows: 4 }, 32);
+    feed(&mut grid, b"hello\x1b[2;3H");
+    feed(&mut grid, b"\x1b[?3h"); // set → 80 columns
+    expect(grid.cols == 80, "DECCOLM set did not widen to 80")?;
+    expect(
+        grid.cursor.row == 0 && grid.cursor.col == 0,
+        "DECCOLM did not home the cursor",
+    )?;
+    feed(&mut grid, b"\x1b[132$|"); // DECSCPP 132
+    expect(grid.cols == 132, "DECSCPP 132 failed")?;
+    feed(&mut grid, b"\x1b[?3l"); // reset → 132
+    expect(grid.cols == 132, "DECCOLM reset mismatch")?;
+    expect(
+        grid.window_resize_request.is_some(),
+        "DECCOLM did not surface a window resize request",
+    )
+}
+
+fn decic_decdc_columns() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 8, rows: 2 }, 32);
+    feed(&mut grid, b"abcdef\x1b[4D\x1b['}");
+    expect(
+        grid.line_to_string(0) == "ab cdef ",
+        format!("DECIC wrong: {:?}", grid.line_to_string(0)),
+    )?;
+    feed(&mut grid, b"\x1b[2D\x1b['~");
+    expect(
+        grid.line_to_string(0) == "b cdef  ",
+        format!("DECDC wrong: {:?}", grid.line_to_string(0)),
+    )
+}
+
+fn decfra_decera_rects() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 8, rows: 4 }, 32);
+    feed(&mut grid, b"\x1b[65;2;2;3;4$x"); // fill 'A' rows 2-3, cols 2-4
+    expect(grid.cell(1, 1).ch == 'A', "DECFRA top-left")?;
+    expect(grid.cell(3, 2).ch == 'A', "DECFRA bottom-right")?;
+    expect(grid.cell(0, 0).ch == ' ', "DECFRA leaked outside rect")?;
+    feed(&mut grid, b"\x1b[1;1;2;3$z"); // erase rows 1-2, cols 1-3
+    expect(grid.cell(0, 0).ch == ' ', "DECERA top-left not erased")?;
+    expect(
+        grid.cell(2, 1).ch == ' ',
+        "DECERA did not erase filled cells",
+    )?;
+    expect(grid.cell(3, 1).ch == 'A', "DECERA over-erased")
+}
+
+fn decpam_decnkm_and_decbkm() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    feed(&mut grid, b"\x1b="); // DECPAM
+    expect(grid.keypad_app, "DECPAM did not set keypad app mode")?;
+    feed(&mut grid, b"\x1b>"); // DECPNM
+    expect(!grid.keypad_app, "DECPNM did not clear keypad app mode")?;
+    feed(&mut grid, b"\x1b[?66h");
+    expect(grid.keypad_app, "DECSET 66 did not set keypad app mode")?;
+    feed(&mut grid, b"\x1b[?67h\x1b[?67$p");
+    expect(
+        grid.take_responses() == vec![b"\x1b[?67;1$y".to_vec()],
+        "DECRQM mode 67 mismatch",
+    )
+}
+
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -504,6 +602,30 @@ fn cases() -> Vec<Case> {
         Case {
             name: "decom_origin_mode",
             run: decom_origin_mode,
+        },
+        Case {
+            name: "decstr_soft_reset",
+            run: decstr_soft_reset,
+        },
+        Case {
+            name: "decreqtparm_report",
+            run: decreqtparm_report,
+        },
+        Case {
+            name: "deccolm_switches_width",
+            run: deccolm_switches_width,
+        },
+        Case {
+            name: "decic_decdc_columns",
+            run: decic_decdc_columns,
+        },
+        Case {
+            name: "decfra_decera_rects",
+            run: decfra_decera_rects,
+        },
+        Case {
+            name: "decpam_decnkm_and_decbkm",
+            run: decpam_decnkm_and_decbkm,
         },
     ]
 }
