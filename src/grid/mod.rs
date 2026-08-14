@@ -502,8 +502,19 @@ pub struct Grid {
     /// DECCKM (?1): application cursor keys — arrows send SS3 A..D instead of
     /// CSI A..D. Read by the key encoder via the app (T3-1).
     pub application_cursor_keys: bool,
-    /// Kitty keyboard protocol disambiguation mode.
-    pub kitty_keyboard: bool,
+    /// Kitty keyboard protocol: current progressive-enhancement flags.
+    /// Bit 0b1 disambiguate, 0b10 event types, 0b100 alternate keys,
+    /// 0b1000 all-keys-as-escape-codes, 0b10000 associated text.
+    pub kitty_flags: u8,
+    /// Kitty keyboard protocol push/pop stack for the active screen.
+    kitty_stack: Vec<u8>,
+    /// Saved kitty state (flags + stack) for the primary screen while the
+    /// alternate screen is active. The spec requires independent stacks.
+    kitty_flags_primary: u8,
+    kitty_stack_primary: Vec<u8>,
+    /// Saved kitty state for the alternate screen while the primary is up.
+    kitty_flags_alt: u8,
+    kitty_stack_alt: Vec<u8>,
     /// xterm modifyOtherKeys mode (0 disabled, 1/2 enabled).
     pub modify_other_keys: u8,
     /// DECNKM (?66): application keypad mode (DECPAM `ESC =` on, DECPNM
@@ -759,7 +770,12 @@ impl Grid {
             insert_mode: false,
             cursor_shape: 0, // 0 = terminal default (blinking block)
             application_cursor_keys: false,
-            kitty_keyboard: false,
+            kitty_flags: 0,
+            kitty_stack: Vec::new(),
+            kitty_flags_primary: 0,
+            kitty_stack_primary: Vec::new(),
+            kitty_flags_alt: 0,
+            kitty_stack_alt: Vec::new(),
             modify_other_keys: 0,
             keypad_app: false,
             backarrow_del: false,
@@ -2841,6 +2857,13 @@ impl Grid {
                                 // Sixels on the previous screen must not bleed
                                 // into the alt screen (shared placement list).
                                 self.sixel_images.clear();
+                                // Kitty keyboard stacks are per-screen: save the
+                                // primary screen's state, activate the alt
+                                // screen's saved state.
+                                self.kitty_flags_primary = self.kitty_flags;
+                                self.kitty_stack_primary = std::mem::take(&mut self.kitty_stack);
+                                self.kitty_flags = self.kitty_flags_alt;
+                                self.kitty_stack = std::mem::take(&mut self.kitty_stack_alt);
                             } else if !set && self.alt_active {
                                 self.alt_active = false;
                                 // Restore cursor from the position saved at alt-screen entry
@@ -2854,6 +2877,12 @@ impl Grid {
                                 self.row_blank_dirty = vec![false; self.rows];
                                 // Drop images drawn while the alt screen was up.
                                 self.sixel_images.clear();
+                                // Restore the primary screen's kitty keyboard
+                                // state; stash the alt screen's for next time.
+                                self.kitty_flags_alt = self.kitty_flags;
+                                self.kitty_stack_alt = std::mem::take(&mut self.kitty_stack);
+                                self.kitty_flags = self.kitty_flags_primary;
+                                self.kitty_stack = std::mem::take(&mut self.kitty_stack_primary);
                             }
                         }
                         2004 => {
@@ -3096,19 +3125,50 @@ impl Grid {
                     .max(1) as usize;
                 self.delete_columns(n);
             }
-            // Kitty keyboard protocol: CSI > 1 u enables disambiguation;
-            // CSI < u restores the previous mode. This handles the common
-            // negotiation path used by modern TUIs.
+            // Kitty keyboard protocol (CSI u) progressive enhancement.
+            // `CSI > flags u` pushes the current flags and sets new flags
+            // (default 0) — the quickstart `CSI > 1 u` enables disambiguation.
+            // `CSI < n u` pops n entries (default 1).
+            // `CSI = flags ; mode u` applies flags with mode semantics.
+            // `CSI ? u` queries the current flags (replies `CSI ? flags u`).
             (b">", b'u') => {
-                self.kitty_keyboard = params
+                let flags = params
+                    .first()
+                    .and_then(|group| group.first())
+                    .copied()
+                    .unwrap_or(0) as u8;
+                self.kitty_stack.push(self.kitty_flags);
+                self.kitty_flags = flags;
+            }
+            (b"<", b'u') => {
+                let count = params
                     .first()
                     .and_then(|group| group.first())
                     .copied()
                     .unwrap_or(1)
-                    != 0;
+                    .max(1) as usize;
+                for _ in 0..count {
+                    self.kitty_flags = self.kitty_stack.pop().unwrap_or(0);
+                }
             }
-            (b"<", b'u') => {
-                self.kitty_keyboard = false;
+            (b"=", b'u') => {
+                let groups: Vec<u16> = params
+                    .iter()
+                    .map(|group| group.first().copied().unwrap_or(0))
+                    .collect();
+                let flags = groups.first().copied().unwrap_or(0) as u8;
+                let mode = groups.get(1).copied().unwrap_or(1);
+                self.kitty_flags = match mode {
+                    // mode 2: set bits only (unset bits unchanged)
+                    2 => self.kitty_flags | flags,
+                    // mode 3: reset bits only (unset bits unchanged)
+                    3 => self.kitty_flags & !flags,
+                    // mode 1 (default): replace flags wholesale
+                    _ => flags,
+                };
+            }
+            (b"?", b'u') => {
+                self.respond(format!("\x1b[?{}u", self.kitty_flags).as_bytes());
             }
             // modifyOtherKeys: CSI > 4 ; 1 m enables, CSI > 4 ; 0 m disables.
             (b">", b'm') => {
@@ -5150,14 +5210,47 @@ mod tests {
     #[test]
     fn test_keyboard_protocol_negotiation() {
         let mut g = make_grid(10, 3);
+        // Quickstart: push + enable disambiguation.
         feed(&mut g, b"\x1b[>1u");
-        assert!(g.kitty_keyboard);
+        assert_eq!(g.kitty_flags, 0b1);
+        // Pop restores the previous (zero) flags.
         feed(&mut g, b"\x1b[<u");
-        assert!(!g.kitty_keyboard);
+        assert_eq!(g.kitty_flags, 0);
+        // Progressive enhancement set with mode semantics.
+        feed(&mut g, b"\x1b[=5u"); // disambiguate + alternate keys
+        assert_eq!(g.kitty_flags, 0b101);
+        feed(&mut g, b"\x1b[=2;2u"); // mode 2: set event-types bit
+        assert_eq!(g.kitty_flags, 0b111);
+        feed(&mut g, b"\x1b[=4;3u"); // mode 3: reset alternate-keys bit
+        assert_eq!(g.kitty_flags, 0b011);
+        // Query replies with the current flags.
+        feed(&mut g, b"\x1b[?u");
+        assert_eq!(g.take_responses(), vec![b"\x1b[?3u".to_vec()]);
+        // Nested push/pop.
+        feed(&mut g, b"\x1b[>0u");
+        assert_eq!(g.kitty_flags, 0);
+        feed(&mut g, b"\x1b[<u");
+        assert_eq!(g.kitty_flags, 0b011);
+        // modifyOtherKeys unaffected.
         feed(&mut g, b"\x1b[>4;1m");
         assert_eq!(g.modify_other_keys, 1);
         feed(&mut g, b"\x1b[>4;0m");
         assert_eq!(g.modify_other_keys, 0);
+    }
+
+    #[test]
+    fn test_kitty_keyboard_flags_are_per_screen() {
+        let mut g = make_grid(10, 3);
+        feed(&mut g, b"\x1b[>1u"); // primary: disambiguate
+        assert_eq!(g.kitty_flags, 0b1);
+        feed(&mut g, b"\x1b[?1049h"); // enter alt screen
+        assert_eq!(g.kitty_flags, 0, "alt screen starts with fresh flags");
+        feed(&mut g, b"\x1b[>5u"); // alt: disambiguate + event types
+        assert_eq!(g.kitty_flags, 0b101);
+        feed(&mut g, b"\x1b[?1049l"); // exit alt screen
+        assert_eq!(g.kitty_flags, 0b1, "primary flags restored on exit");
+        feed(&mut g, b"\x1b[?1049h"); // re-enter alt
+        assert_eq!(g.kitty_flags, 0b101, "alt flags remembered");
     }
 
     #[test]

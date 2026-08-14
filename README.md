@@ -13,14 +13,14 @@ A fast, GPU-accelerated terminal emulator written in Rust.
 - **Mouse Support** - X10, SGR, and urxvt mouse tracking (modes 1000/1002/1003/1006/1015)
 - **Bracketed Paste** - Safe paste handling
 - **Customizable Themes** - 16 built-in themes (Catppuccin, Gruvbox, Dracula, etc.)
-- **Tabs** - Multiple terminal sessions with a tab bar
+- **Tabs** - Multiple terminal sessions with a tab bar; background tabs pause their PTY reader so runaway output blocks under kernel backpressure (no unbounded memory growth), and switching is instant
 - **Sixel Inline Images** - Decode and render sixel (DEC 54870) graphics: `cat image.six`, chafa, img2sixel; images track their rows on scroll and are removed on clear/resize/alt-screen. Cross-validated against chafa (real encoder) and an independent Python encoder
 - **Shell Integration** - OSC 133 prompt/command markers with Ctrl+Shift+Up/Down prompt jumping, OSC 7 cwd tracking
 - **In-Band Resize** - Mode 2048 resize notifications (`CSI 4;h;w t`) for tmux/neovim
 - **Rectangular Selection** - Alt+Click block selection (VS Code/kitty style)
 - **Notifications** - OSC 9 desktop notifications via notify-send (falls back to logging without a notification daemon)
 - **Locked Down by Default** - OSC 52 clipboard reads are off by default; URI-scheme allowlist for hyperlinks
-- **Keyboard Protocols** - Kitty keyboard and xterm modifyOtherKeys
+- **Keyboard Protocols** - Full kitty keyboard protocol (`CSI u`) with progressive-enhancement flags, push/pop/query, key repeat/release events, alternate keys, and associated text; plus xterm modifyOtherKeys
 - **Parser Fuzz Harness** - Deterministic seeded fuzzing of the parser/grid seam
 
 ## Installation
@@ -151,8 +151,8 @@ Run it yourself: `cargo run --release --bin bench`.
 
 ## Verification
 
-- `cargo test --locked` — 296 tests (parser, grid, selection, sixel, fuzz smoke)
-- `cargo run --release --bin vt_conformance` — 33 headless VT conformance cases
+- `cargo test --locked` — 307 tests (parser, grid, selection, sixel, fuzz smoke)
+- `cargo run --release --bin vt_conformance` — 34 headless VT conformance cases
 - `cargo run --release --bin fuzz -- --quick` — deterministic parser fuzzing
 
 ## License

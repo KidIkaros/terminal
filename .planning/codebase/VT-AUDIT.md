@@ -141,9 +141,12 @@ The following broader Stage 2 items remain explicit follow-up work rather than b
 Unicode cluster tails now support arbitrary-length combining/variation/ZWJ codepoints with lazy
 heap storage on affected cells; extraction, scrollback, resize, and rendering preserve the full tail.
 RustyBuzz shaping is integrated for cluster render units with glyph offsets/advances and the existing
-fontdue atlas. Common Kitty keyboard character disambiguation and modifyOtherKeys negotiation are supported, and
-DEC double-width/double-height line presentation modes have metadata and renderer support. Extended
-underline styles have packed state, SGR colon parsing, rendering approximations, and regression coverage.
+fontdue atlas. The full kitty keyboard protocol (CSI u) is supported — progressive-enhancement flags
+(disambiguate, event types, alternate keys, all-keys-as-escape-codes, associated text), `CSI >/=/< /?`
+push/set/pop/query with per-screen stacks, key repeat/release reporting, and Escape disambiguation —
+plus xterm modifyOtherKeys negotiation. DEC double-width/double-height line presentation modes have
+metadata and renderer support. Extended underline styles have packed state, SGR colon parsing,
+rendering approximations, and regression coverage.
 
 ## ✅ Stage 3 — Renderer safe optimization slice — COMPLETE 2026-08-11
 
@@ -438,4 +441,30 @@ Driven by a comparison against pg83/shitty ("a serious terminal emulator with a 
 
 ### Remaining known gaps vs shitty
 - Bidirectional text and GPU-side compute rendering are not implemented (neither does shitty have bidi; its compute renderer is its speed edge).
+
+## ✅ Stage 9 — Kitty keyboard protocol + background-tab backpressure (2026-08-13) — 307 tests, 34/34 conformance
+
+- **Full kitty keyboard protocol (CSI u)** — replaced the single `kitty_keyboard` bool with a
+  per-screen flags + push/pop stack: `CSI > flags u` (push), `CSI < n u` (pop), `CSI = flags;mode u`
+  (progressive enhancement with mode 1/2/3), `CSI ? u` (query → `CSI ? flags u` reply). The key encoder
+  now handles all five enhancements (disambiguate, event types, alternate keys, all-keys-as-escape-codes,
+  associated text), Escape disambiguation (`CSI 27 u`), functional keys in canonical form, and the
+  super modifier (bit 8). Press/repeat/release events are wired through `KeyEvent.repeat` +
+  `ElementState::Released`. New grid, encoder, and conformance cases.
+- **Background-tab PTY backpressure** — each tab's reader thread now owns a shared `reading` flag;
+  `TabManager::switch_to` pauses the outgoing tab's reader and resumes the incoming one. A background
+  tab stops pulling bytes off the PTY, so the kernel buffer fills and the writer blocks (xterm/kitty
+  semantics) instead of growing the unbounded channel — fixing a real OOM risk and making tab
+  switches instant (no multi-GiB backlog to parse).
+
+### Assessed, deferred
+- **Parse-on-worker-thread with grid snapshot** (decoupling parse from render): the steady-state path
+  is already smooth — I/O runs on per-tab reader threads and wakes the loop via `EventLoopProxy`, with
+  coalesced wakes and small in-flight backlogs. The only residual risk is a rare large-backlog spike;
+  the full snapshot refactor is high-risk (it moves the grid off the main thread and would touch
+  render, selection, search, scrollback-nav, and resize) for low marginal value.
+- **Parallel (rayon) instance building**: the per-cell loop's cost is dominated by
+  `atlas.get_or_rasterize` (inherently serial, `&mut` atlas cache), and typical grids are ~10k cells
+  (microseconds to build); thread dispatch would likely regress small grids. Deferred until a GPU
+  profile shows instance building is the bottleneck.
 - GUI-frame throughput is not re-benchmarked on a display; the 30 MiB/s figure is parser+grid only.

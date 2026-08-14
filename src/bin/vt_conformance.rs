@@ -80,7 +80,10 @@ fn resize_reflow() -> Result<(), String> {
 fn protocols_and_styles() -> Result<(), String> {
     let mut grid = Grid::new(WinSize { cols: 12, rows: 3 }, 32);
     feed(&mut grid, b"\x1b[>1u\x1b[>4;1m\x1b[4:2mX\x1b#6");
-    expect(grid.kitty_keyboard, "Kitty keyboard negotiation failed")?;
+    expect(
+        grid.kitty_flags & 0b1 != 0,
+        "Kitty keyboard negotiation failed",
+    )?;
     expect(
         grid.modify_other_keys == 1,
         "modifyOtherKeys negotiation failed",
@@ -90,6 +93,31 @@ fn protocols_and_styles() -> Result<(), String> {
         "underline style failed",
     )?;
     expect(grid.line_mode(0) == 6, "double-width mode failed")
+}
+
+fn kitty_keyboard_protocol() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 12, rows: 3 }, 32);
+    // Quickstart push: disambiguate.
+    feed(&mut grid, b"\x1b[>1u");
+    expect(
+        grid.kitty_flags & 0b1 != 0,
+        "push did not enable disambiguation",
+    )?;
+    // Progressive enhancement set with mode semantics (set event-types bit).
+    feed(&mut grid, b"\x1b[=2;2u");
+    expect(
+        grid.kitty_flags == 0b1 | 0b10,
+        "mode 2 did not set event-types bit",
+    )?;
+    // Query replies with current flags.
+    feed(&mut grid, b"\x1b[?u");
+    expect(
+        grid.take_responses() == vec![b"\x1b[?3u".to_vec()],
+        "flag query reply mismatch",
+    )?;
+    // Pop restores the previous state.
+    feed(&mut grid, b"\x1b[<u");
+    expect(grid.kitty_flags == 0, "pop did not restore flags")
 }
 
 fn osc_and_limits() -> Result<(), String> {
@@ -686,6 +714,10 @@ fn cases() -> Vec<Case> {
         Case {
             name: "decsca_selective_erase",
             run: decsca_selective_erase,
+        },
+        Case {
+            name: "kitty_keyboard_protocol",
+            run: kitty_keyboard_protocol,
         },
     ]
 }

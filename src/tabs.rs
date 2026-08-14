@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use crate::grid::{Grid, WinSize};
 use crate::parser::Parser;
 use crate::pty::{self, PtyHandle, PtyWriter};
@@ -20,6 +25,11 @@ pub struct Tab {
     pub pty_handle: Option<PtyHandle>,
     /// Reader channel for PTY output.
     pub pty_rx: Option<Receiver<Vec<u8>>>,
+    /// Whether the PTY reader thread should be reading. Set false while the
+    /// tab is in the background so the kernel PTY buffer provides backpressure
+    /// (the shell blocks on a full buffer) instead of growing the channel
+    /// unboundedly. Toggled by [`TabManager::switch_to`].
+    pub reading: Arc<AtomicBool>,
 }
 
 impl Tab {
@@ -33,7 +43,7 @@ impl Tab {
         argv: &[String],
         wake: pty::WakeCallback,
     ) -> Result<Self, pty::PtyError> {
-        let (writer, handle, rx) = pty::spawn_pty(size, argv, wake)?;
+        let (writer, handle, rx, reading) = pty::spawn_pty(size, argv, wake)?;
         Ok(Self {
             title: title.to_string(),
             grid: Grid::new(size, scrollback),
@@ -42,6 +52,7 @@ impl Tab {
             pty_writer: Some(writer),
             pty_handle: Some(handle),
             pty_rx: Some(rx),
+            reading,
         })
     }
 
@@ -55,6 +66,7 @@ impl Tab {
             pty_writer: None,
             pty_handle: None,
             pty_rx: None,
+            reading: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -185,6 +197,9 @@ impl TabManager {
         }
 
         self.tabs[self.active_index].active = true;
+        self.tabs[self.active_index]
+            .reading
+            .store(true, Ordering::Release);
         Some(self.active_index)
     }
 
@@ -203,15 +218,26 @@ impl TabManager {
         }
 
         self.tabs[self.active_index].active = true;
+        self.tabs[self.active_index]
+            .reading
+            .store(true, Ordering::Release);
         Some(self.active_index)
     }
 
     /// Switch to a specific tab by index.
     pub fn switch_to(&mut self, index: usize) {
         if index < self.tabs.len() {
+            // Pause the outgoing tab's reader so it stops pulling output; the
+            // incoming tab's reader resumes so its (blocked) writer unblocks.
+            self.tabs[self.active_index]
+                .reading
+                .store(false, Ordering::Release);
             self.tabs[self.active_index].active = false;
             self.active_index = index;
             self.tabs[self.active_index].active = true;
+            self.tabs[self.active_index]
+                .reading
+                .store(true, Ordering::Release);
         }
     }
 
@@ -375,6 +401,44 @@ mod tests {
 
         manager.set_title(0, "Renamed");
         assert_eq!(manager.active().title, "Renamed");
+    }
+
+    #[test]
+    fn test_switch_to_pauses_and_resumes_pty_readers() {
+        let mut manager = make_manager();
+        manager.tabs.push(Tab::without_pty(
+            "T2",
+            manager.default_size,
+            manager.scrollback,
+        ));
+
+        // First tab starts reading.
+        manager.tabs[0].reading.store(true, Ordering::Release);
+
+        manager.switch_to(1);
+        assert!(!manager.tabs[0].reading.load(Ordering::Acquire));
+        assert!(manager.tabs[1].reading.load(Ordering::Acquire));
+
+        manager.switch_to(0);
+        assert!(manager.tabs[0].reading.load(Ordering::Acquire));
+        assert!(!manager.tabs[1].reading.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_close_tab_resumes_reader() {
+        let mut manager = make_manager();
+        manager.tabs.push(Tab::without_pty(
+            "T2",
+            manager.default_size,
+            manager.scrollback,
+        ));
+        manager.switch_to(1);
+        assert!(!manager.tabs[0].reading.load(Ordering::Acquire));
+        assert!(manager.tabs[1].reading.load(Ordering::Acquire));
+
+        // Close the active tab → the remaining tab becomes active and resumes.
+        manager.close_current();
+        assert!(manager.tabs[0].reading.load(Ordering::Acquire));
     }
 
     #[test]

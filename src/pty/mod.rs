@@ -16,7 +16,11 @@
 use std::{
     ffi::CString,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -149,11 +153,16 @@ impl Drop for PtyHandle {
 ///
 /// `argv[0]` is the program to exec; remaining elements are its arguments.
 /// For a plain shell, pass `&[shell.to_string()]`.
+///
+/// Returns the `reading` flag in addition to the writer/handle/channel: the
+/// reader thread pauses (stops pulling bytes off the PTY) while it is `false`,
+/// letting the kernel PTY buffer fill so a runaway background tab blocks its
+/// writer instead of growing our channel without bound.
 pub fn spawn_pty(
     size: WinSize,
     argv: &[String],
     wake: WakeCallback,
-) -> Result<(PtyWriter, PtyHandle, Receiver<Vec<u8>>), PtyError> {
+) -> Result<(PtyWriter, PtyHandle, Receiver<Vec<u8>>, Arc<AtomicBool>), PtyError> {
     // 1. Open master
     let master: PtyMaster = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
     grantpt(&master)?;
@@ -259,11 +268,13 @@ pub fn spawn_pty(
 
             // Spawn reader thread after both fd owners are established.
             let reader_fd = Arc::clone(&master_fd);
-            std::thread::spawn(move || reader_thread(reader_fd, tx, wake));
+            let reading = Arc::new(AtomicBool::new(true));
+            let reading_clone = Arc::clone(&reading);
+            std::thread::spawn(move || reader_thread(reader_fd, tx, wake, reading_clone));
 
             let writer = PtyWriter { file: writer_file };
             let handle = PtyHandle::new(child);
-            Ok((writer, handle, rx))
+            Ok((writer, handle, rx, reading))
         }
     }
 }
@@ -272,11 +283,25 @@ pub fn spawn_pty(
 // Reader thread — runs for the lifetime of the shell
 // ---------------------------------------------------------------------------
 
-fn reader_thread(master_fd: Arc<OwnedFd>, tx: Sender<Vec<u8>>, wake: WakeCallback) {
+fn reader_thread(
+    master_fd: Arc<OwnedFd>,
+    tx: Sender<Vec<u8>>,
+    wake: WakeCallback,
+    reading: Arc<AtomicBool>,
+) {
     let raw_fd = master_fd.as_raw_fd();
     let mut buf = [0u8; 16384]; // Larger buffer for batch reads
 
     loop {
+        // Paused (tab in background): stop reading so the kernel PTY buffer
+        // fills and the writer blocks under backpressure. This mirrors how
+        // xterm/kitty handle background panes and prevents unbounded channel
+        // growth. Sleep briefly, then re-check the flag.
+        if !reading.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
         // Use poll() for efficient I/O waiting (no busy loop)
         let mut pollfd = libc::pollfd {
             fd: raw_fd,
@@ -346,7 +371,8 @@ mod tests {
             "-c".to_string(),
             "printf pty-stage1".to_string(),
         ];
-        let (writer, handle, rx) = spawn_pty(size, &argv, Box::new(|| {})).expect("spawn PTY");
+        let (writer, handle, rx, _reading) =
+            spawn_pty(size, &argv, Box::new(|| {})).expect("spawn PTY");
 
         let mut output = Vec::new();
         for _ in 0..4 {
