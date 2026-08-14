@@ -82,6 +82,9 @@ mouse_reporting = false
 # Cursor blink interval in milliseconds (0 = no blink)
 cursor_blink_ms = 500
 
+# SGR text blink interval in milliseconds (0 = no blink; rendered solid)
+text_blink_ms = 500
+
 # Cursor style: "block", "bar", or "underline"
 cursor_style = "block"
 

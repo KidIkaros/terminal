@@ -129,7 +129,8 @@ Colors can be specified in the following formats:
 
 ```toml
 cursor_style = "block"    # Cursor style: "block", "bar", or "underline"
-cursor_blink_ms = 500     # Blink interval in milliseconds (0 = no blink)
+cursor_blink_ms = 500     # Cursor blink interval in milliseconds (0 = no blink)
+text_blink_ms = 500       # SGR text blink interval in milliseconds (0 = no blink)
 ```
 
 ### Options
@@ -137,7 +138,8 @@ cursor_blink_ms = 500     # Blink interval in milliseconds (0 = no blink)
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `cursor_style` | string | `"block"` | Cursor appearance |
-| `cursor_blink_ms` | u64 | `500` | Blink interval (0 to disable) |
+| `cursor_blink_ms` | u64 | `500` | Cursor blink interval (0 to disable) |
+| `text_blink_ms` | u64 | `500` | SGR text blink interval (0 to disable) |
 
 ### Cursor Styles
 

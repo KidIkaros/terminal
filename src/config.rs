@@ -38,6 +38,10 @@ pub struct Config {
     #[serde(default = "default_cursor_blink")]
     pub cursor_blink_ms: u64,
 
+    /// SGR text blink interval in milliseconds (0 = no blink; rendered solid).
+    #[serde(default = "default_text_blink")]
+    pub text_blink_ms: u64,
+
     /// Cursor style.
     #[serde(default = "default_cursor_style")]
     pub cursor_style: CursorStyle,
@@ -288,6 +292,10 @@ fn default_cursor_blink() -> u64 {
     500
 }
 
+fn default_text_blink() -> u64 {
+    500
+}
+
 fn default_cursor_style() -> CursorStyle {
     CursorStyle::Block
 }
@@ -423,6 +431,7 @@ impl Default for Config {
             scrollback: default_scrollback(),
             mouse_reporting: false,
             cursor_blink_ms: default_cursor_blink(),
+            text_blink_ms: default_text_blink(),
             cursor_style: CursorStyle::default(),
             tabs: TabsConfig::default(),
             reduced_motion: false,

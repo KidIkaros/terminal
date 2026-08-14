@@ -36,6 +36,11 @@ enum UserEvent {
     PtyData,
 }
 
+/// Maximum bytes parsed from a tab's PTY channel per drain call. Output
+/// bursts larger than this are spread across multiple frames so a single
+/// drain can't stall the render loop.
+const DRAIN_BUDGET_BYTES: usize = 256 * 1024;
+
 // ---------------------------------------------------------------------------
 // Application (winit ApplicationHandler)
 // ---------------------------------------------------------------------------
@@ -69,6 +74,9 @@ struct App {
     // Cursor blink state
     cursor_visible: bool,
     last_cursor_blink: std::time::Instant,
+    // SGR text blink state (blinking cells toggle on/off on a timer).
+    text_blink_on: bool,
+    last_text_blink: std::time::Instant,
 
     // Set when the last tab is closed — signals the event loop to exit.
     should_quit: bool,
@@ -99,6 +107,7 @@ impl App {
         }
         if config.reduced_motion {
             config.cursor_blink_ms = 0;
+            config.text_blink_ms = 0;
         }
 
         let size = WinSize {
@@ -121,6 +130,8 @@ impl App {
             selection: Selection::new(),
             cursor_visible: true,
             last_cursor_blink: std::time::Instant::now(),
+            text_blink_on: true,
+            last_text_blink: std::time::Instant::now(),
             should_quit: false,
             config,
             size,
@@ -172,11 +183,14 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Drain all pending bytes from the active tab's PTY channel, parse them,
-    /// update the grid. Returns true if any data was processed.
-    fn drain_pty(&mut self) -> bool {
+    /// Drain pending bytes from the active tab's PTY channel, parse them, and
+    /// update the grid. Parsing is budget-capped per call so a large output
+    /// burst is spread across multiple frames rather than stalling one frame.
+    /// Returns `(had_data, more_pending)`: whether anything was processed and
+    /// whether the channel still holds unparsed bytes after hitting the cap.
+    fn drain_pty(&mut self) -> (bool, bool) {
         let Some(tm) = &mut self.tab_manager else {
-            return false;
+            return (false, false);
         };
         let tab = tm.active_mut();
 
@@ -186,12 +200,26 @@ impl App {
         // Collect chunks first so we can split the borrow cleanly. A
         // disconnected receiver means the child shell exited; preserve the
         // final bytes already queued, then let the app close cleanly.
+        //
+        // Budget-capped: stop pulling once DRAIN_BUDGET_BYTES have been
+        // collected and flag that more remains, so the backlog drains across
+        // frames instead of blocking this one. A chunk is never split (it may
+        // end mid-escape-sequence), so we may overshoot the cap by one chunk.
         let mut pending: Vec<Vec<u8>> = Vec::new();
         let mut channel_closed = false;
+        let mut more_pending = false;
         if let Some(rx) = &tab.pty_rx {
+            let mut budget = 0usize;
             loop {
                 match rx.try_recv() {
-                    Ok(chunk) => pending.push(chunk),
+                    Ok(chunk) => {
+                        budget += chunk.len();
+                        pending.push(chunk);
+                        if budget >= DRAIN_BUDGET_BYTES {
+                            more_pending = !rx.is_empty();
+                            break;
+                        }
+                    }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         channel_closed = true;
@@ -208,8 +236,23 @@ impl App {
             // mark_all_dirty() below covers the same cells for rendering.
             tab.grid.bulk_output = true;
         }
+        // Env-gated parse timing: TERMINAL_RENDER_TRACE logs the bytes
+        // parsed and microseconds spent per drain, so a backlog spike is
+        // measurable in the field.
+        let trace = std::env::var_os("TERMINAL_RENDER_TRACE").is_some();
+        let parse_start = trace.then(std::time::Instant::now);
+        let mut parsed_bytes = 0usize;
         for chunk in pending {
+            parsed_bytes += chunk.len();
             tab.parser.advance_bytes(&mut tab.grid, &chunk);
+        }
+        if let Some(start) = parse_start {
+            log::info!(
+                "perf drain bytes={} elapsed_us={} more_pending={}",
+                parsed_bytes,
+                start.elapsed().as_micros(),
+                more_pending
+            );
         }
         if had_data {
             tab.grid.bulk_output = false;
@@ -333,7 +376,7 @@ impl App {
         if channel_closed {
             self.should_quit = true;
         }
-        had_data
+        (had_data, more_pending)
     }
 
     fn write_to_pty(&self, data: &[u8]) {
@@ -627,6 +670,51 @@ impl App {
             0
         }
     }
+
+    /// Advance the cursor and SGR-text blink phases on their timers. Returns
+    /// true if either phase flipped, so the caller can request a redraw.
+    fn advance_blinks(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let mut changed = false;
+        if self.config.cursor_blink_ms > 0 {
+            let interval = std::time::Duration::from_millis(self.config.cursor_blink_ms);
+            if now.duration_since(self.last_cursor_blink) >= interval {
+                self.cursor_visible = !self.cursor_visible;
+                self.last_cursor_blink = now;
+                changed = true;
+            }
+        } else {
+            self.cursor_visible = true;
+        }
+        if self.config.text_blink_ms > 0 {
+            let interval = std::time::Duration::from_millis(self.config.text_blink_ms);
+            if now.duration_since(self.last_text_blink) >= interval {
+                self.text_blink_on = !self.text_blink_on;
+                self.last_text_blink = now;
+                changed = true;
+            }
+        } else {
+            self.text_blink_on = true;
+        }
+        changed
+    }
+
+    /// Earliest upcoming blink deadline (cursor or text). None when no blink
+    /// timer is active, meaning the loop can sleep until a real event arrives.
+    fn next_blink_deadline(&self) -> Option<std::time::Instant> {
+        let mut deadline: Option<std::time::Instant> = None;
+        if self.config.cursor_blink_ms > 0 {
+            let t = self.last_cursor_blink
+                + std::time::Duration::from_millis(self.config.cursor_blink_ms);
+            deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        }
+        if self.config.text_blink_ms > 0 {
+            let t =
+                self.last_text_blink + std::time::Duration::from_millis(self.config.text_blink_ms);
+            deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        }
+        deadline
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -736,7 +824,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::PtyData => {
                 self.pty_wake_pending.store(false, Ordering::Release);
-                let had_data = self.drain_pty();
+                let (had_data, _more_pending) = self.drain_pty();
                 if self.should_quit {
                     _event_loop.exit();
                     return;
@@ -1319,19 +1407,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::RedrawRequested => {
-                // Update cursor blink (already handled in about_to_wait, but keep here for safety)
-                let blink_interval = std::time::Duration::from_millis(self.config.cursor_blink_ms);
-                let mut needs_redraw = false;
-                if self.config.cursor_blink_ms > 0 {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(self.last_cursor_blink) >= blink_interval {
-                        self.cursor_visible = !self.cursor_visible;
-                        self.last_cursor_blink = now;
-                        needs_redraw = true;
-                    }
-                } else {
-                    self.cursor_visible = true;
-                }
+                // Advance cursor + SGR text blink phases. about_to_wait also
+                // does this; keeping it here guarantees the first frame uses
+                // a fresh phase and mid-frame redraws keep blinking on time.
+                let needs_redraw = self.advance_blinks();
 
                 // Compute tab bar height before borrowing tab_manager mutably.
                 let tb_height = self.tab_bar_height();
@@ -1345,16 +1424,26 @@ impl ApplicationHandler<UserEvent> for App {
                     (&mut self.pipeline, &mut self.atlas, &mut self.tab_manager)
                 {
                     let tab = tm.active_mut();
+                    let trace = std::env::var_os("TERMINAL_RENDER_TRACE").is_some();
+                    let render_start = trace.then(std::time::Instant::now);
                     pipeline.render(RenderParams {
                         grid: &mut tab.grid,
                         atlas,
                         cursor_visible: self.cursor_visible,
+                        blink_on: self.text_blink_on,
                         colors: &self.config.colors,
                         selection: &self.selection,
                         search: Some(&mut self.search),
                         tab_bar: tb_ref,
                         tab_bar_height: tb_height as f32,
                     });
+                    if let Some(start) = render_start {
+                        log::info!(
+                            "perf render elapsed_us={} dirty_cells={}",
+                            start.elapsed().as_micros(),
+                            pipeline.last_dirty_cells()
+                        );
+                    }
                 }
 
                 if !self.first_frame_logged {
@@ -1389,28 +1478,20 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // T5-2: PTY reader threads wake the loop via EventLoopProxy, so we
         // can use ControlFlow::Wait instead of polling at 60 Hz. The only
-        // remaining reason to wake periodically is cursor blinking.
-        if self.config.cursor_blink_ms > 0 {
-            let now = std::time::Instant::now();
-            let blink_interval = std::time::Duration::from_millis(self.config.cursor_blink_ms);
-            let next_blink = self.last_cursor_blink + blink_interval;
-            if now >= next_blink {
-                self.cursor_visible = !self.cursor_visible;
-                self.last_cursor_blink = now;
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+        // remaining reason to wake periodically is blinking (cursor + SGR).
+        if self.advance_blinks() {
+            if let Some(w) = &self.window {
+                w.request_redraw();
             }
-            // Wake at the next blink tick.
-            event_loop.set_control_flow(ControlFlow::WaitUntil(next_blink));
-        } else {
-            // No blinking — pure wait, woken only by PTY/input/resize events.
-            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+        match self.next_blink_deadline() {
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
 
         // Drain any PTY data that arrived between events (safety net for
         // data that came in after the last user_event but before we sleep).
-        let had_data = self.drain_pty();
+        let (had_data, _more_pending) = self.drain_pty();
         if self.should_quit {
             event_loop.exit();
             return;

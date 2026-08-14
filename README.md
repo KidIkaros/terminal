@@ -90,6 +90,7 @@ cursor = "#F5E0DC"
 
 cursor_style = "block"
 cursor_blink_ms = 500
+text_blink_ms = 500
 ```
 
 ### Available Themes

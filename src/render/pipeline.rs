@@ -195,6 +195,9 @@ pub struct RenderParams<'a> {
     pub grid: &'a mut Grid,
     pub atlas: &'a mut GlyphAtlas,
     pub cursor_visible: bool,
+    /// Current SGR blink phase: true renders blinking glyphs, false hides
+    /// them (xterm blinks between foreground and background).
+    pub blink_on: bool,
     pub colors: &'a ColorConfig,
     pub selection: &'a Selection,
     pub search: Option<&'a mut SearchState>,
@@ -1112,6 +1115,7 @@ impl TerminalPipeline {
             grid,
             atlas,
             cursor_visible,
+            blink_on,
             colors,
             selection,
             search,
@@ -1462,13 +1466,19 @@ impl TerminalPipeline {
                 // T4-1: SGR style handling.
                 // invisible: render only the background, no glyph.
                 // dim: halve foreground intensity (xterm convention).
-                // blink: real terminals flash on a timer; we approximate by
-                //   rendering at half intensity so blinking text is at least
-                //   visually distinct. A time-based on/off toggle is future work.
+                // blink: real terminals flash between foreground and
+                //   background on a timer; in the off phase we hide the glyph
+                //   (background already drawn), in the on phase render full
+                //   intensity. `blink_on` is driven by the app's blink clock.
                 if cell.attrs.invisible() {
                     continue;
                 }
-                let glyph_fg = if cell.attrs.dim() || cell.attrs.blink() {
+                let glyph_fg = if cell.attrs.blink() || cell.attrs.blink_rapid() {
+                    if !blink_on {
+                        continue;
+                    }
+                    fg
+                } else if cell.attrs.dim() {
                     [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, fg[3]]
                 } else {
                     fg

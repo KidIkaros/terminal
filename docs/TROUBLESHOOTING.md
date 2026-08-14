@@ -135,6 +135,15 @@ This guide helps you solve common issues with the terminal.
    sudo powermetrics --samplers gpu
    ```
 
+5. **Profile the render/parse path:**
+   PTY output is drained in bounded chunks per frame, so a single burst can't
+   stall one frame. To measure where time actually goes, run with
+   `TERMINAL_RENDER_TRACE=1` and watch the `perf drain ...` / `perf render ...`
+   log lines:
+   ```bash
+   TERMINAL_RENDER_TRACE=1 RUST_LOG=info terminal
+   ```
+
 ### Mouse Not Working
 
 **Symptom:** Mouse clicks don't position cursor or select text.
