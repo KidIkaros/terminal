@@ -201,13 +201,21 @@ impl App {
             }
         }
         let had_data = !pending.is_empty();
+        if had_data {
+            // Bulk mode: skip per-cell dirty bookkeeping during the batch.
+            // Scrolling output would otherwise mark the whole visible region
+            // dirty on every line feed (O(rows×cols) per scroll). One
+            // mark_all_dirty() below covers the same cells for rendering.
+            tab.grid.bulk_output = true;
+        }
         for chunk in pending {
             tab.parser.advance_bytes(&mut tab.grid, &chunk);
         }
         if had_data {
+            tab.grid.bulk_output = false;
             // The parser marks changed cells dirty during print/scroll/erase
-            // operations. The renderer keeps the safe full-grid clear path;
-            // dirty state is retained for the future persistent framebuffer.
+            // operations; bulk mode deferred that, so mark the grid once.
+            tab.grid.mark_all_dirty();
 
             // Device-query responses (T2): DA/DSR/CPR/DECRQM/OSC color
             // replies queued by the grid during parsing. Write them straight
@@ -223,8 +231,14 @@ impl App {
             // queries with the current system clipboard contents. The reply is
             // written through tab.pty_writer directly (tab is already mutably
             // borrowed) — write_to_pty(&self) would conflict with the borrow.
+            //
+            // Security policy (locked down by default): writes are gated by
+            // `security.osc52_write`, reads by `security.osc52_read` — a
+            // hostile prompt must not silently read the clipboard.
             if let Some(text) = tab.grid.clipboard_set.take() {
-                if text.is_empty() {
+                if !self.config.security.osc52_write {
+                    log::warn!("OSC 52 write blocked by security policy");
+                } else if text.is_empty() {
                     self.clipboard.clear();
                     log::debug!("OSC 52: cleared system clipboard");
                 } else {
@@ -234,12 +248,33 @@ impl App {
             }
             if tab.grid.clipboard_query_requested {
                 tab.grid.clipboard_query_requested = false;
-                if let Some(contents) = self.clipboard.paste() {
+                if !self.config.security.osc52_read {
+                    log::warn!("OSC 52 query blocked by security policy");
+                } else if let Some(contents) = self.clipboard.paste() {
                     let response = ClipboardManager::osc52_set(&contents);
                     if let Some(w) = &tab.pty_writer {
                         w.write(response.as_bytes());
                     }
                     log::debug!("OSC 52: replied to clipboard query");
+                }
+            }
+
+            // Bell (BEL): surfaced to the log; a visual flash is future work.
+            if tab.grid.take_bell() {
+                log::debug!("bell: visual feedback requested by application");
+            }
+            // OSC 9 notifications: surface via the desktop notification
+            // daemon (notify-send/libnotify). Fire-and-forget — notify-send
+            // exits on its own — and fall back to the log when the binary is
+            // missing (headless session, non-Linux desktop).
+            if let Some(msg) = tab.grid.take_notification() {
+                match std::process::Command::new("notify-send")
+                    .args(["-a", "terminal", "-i", "utilities-terminal"])
+                    .arg(&msg)
+                    .spawn()
+                {
+                    Ok(_) => log::debug!("notification: {}", msg),
+                    Err(e) => log::info!("notification (notify-send unavailable): {} ({})", msg, e),
                 }
             }
 
@@ -644,6 +679,9 @@ impl ApplicationHandler<UserEvent> for App {
         match tm_result {
             Ok(mut tm) => {
                 trace("pty_ready");
+                // Record the real cell size so sixel cursor advances and
+                // image spans use the correct geometry.
+                tm.set_cell_size(atlas.cell_width, atlas.cell_height);
                 // Mark all cells dirty so the first frame renders the full grid.
                 tm.active_mut().grid.mark_all_dirty();
                 self.tab_manager = Some(tm);
@@ -723,8 +761,17 @@ impl ApplicationHandler<UserEvent> for App {
                             cols: new_cols,
                             rows: new_rows,
                         };
+                        let mut responses = Vec::new();
                         if let Some(tm) = &mut self.tab_manager {
                             tm.resize(self.size);
+                            // In-band resize notification (mode 2048): tell
+                            // the application the new size so tmux/neovim
+                            // redraw without polling.
+                            tm.active_mut().grid.resize_report();
+                            responses = tm.active_mut().grid.take_responses();
+                        }
+                        for response in responses {
+                            self.write_to_pty(&response);
                         }
                     }
                 }
@@ -941,7 +988,8 @@ impl ApplicationHandler<UserEvent> for App {
                                     .and_then(|tm| tm.active().grid.get_hyperlink_at(col, row))
                                     .map(|s| s.to_string());
                                 if let Some(url) = hyperlink_url {
-                                    if hyperlink_is_allowed(&url) {
+                                    if hyperlink_is_allowed(&url, &self.config.security.uri_schemes)
+                                    {
                                         log::debug!("Opening hyperlink: {}", url);
                                         // Open only explicitly supported web links.
                                         std::thread::spawn(move || {
@@ -951,8 +999,11 @@ impl ApplicationHandler<UserEvent> for App {
                                         log::warn!("Blocked unsupported hyperlink scheme");
                                     }
                                 }
-                                // Start new selection
-                                let mode = if self.modifiers.shift_key() {
+                                // Start new selection: Alt = rectangular (block)
+                                // selection, Shift = line selection, else char.
+                                let mode = if self.modifiers.alt_key() {
+                                    SelectionMode::Rectangular
+                                } else if self.modifiers.shift_key() {
                                     SelectionMode::Line
                                 } else {
                                     SelectionMode::Char
@@ -1062,7 +1113,49 @@ impl ApplicationHandler<UserEvent> for App {
                 if !handled {
                     // Check for scrollback navigation (Shift+PageUp/Down)
                     let shift = self.modifiers.shift_key();
+                    let ctrl = self.modifiers.control_key();
                     match &logical_key {
+                        // Ctrl+Shift+Up/Down — jump between shell prompts
+                        // (OSC 133 shell-integration markers). When the target
+                        // prompt is in scrollback, scroll it to the top of the
+                        // viewport; when visible, move the cursor to it.
+                        Key::Named(NamedKey::ArrowUp) if ctrl && shift => {
+                            if let Some(tm) = &mut self.tab_manager {
+                                let grid = &mut tm.active_mut().grid;
+                                let sb_len = grid.scrollback.len();
+                                let from = sb_len + grid.cursor.row;
+                                if let Some(idx) = grid.prev_prompt(from) {
+                                    if idx < sb_len {
+                                        grid.scrollback_offset = sb_len - idx;
+                                    } else {
+                                        grid.reset_scroll();
+                                        grid.cursor.row = idx - sb_len;
+                                        grid.mark_all_dirty();
+                                    }
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowDown) if ctrl && shift => {
+                            if let Some(tm) = &mut self.tab_manager {
+                                let grid = &mut tm.active_mut().grid;
+                                let sb_len = grid.scrollback.len();
+                                let from = sb_len + grid.cursor.row;
+                                if let Some(idx) = grid.next_prompt(from) {
+                                    if idx < sb_len {
+                                        grid.scrollback_offset = sb_len - idx;
+                                    } else {
+                                        grid.reset_scroll();
+                                        grid.cursor.row = idx - sb_len;
+                                        grid.mark_all_dirty();
+                                    }
+                                } else {
+                                    // No further prompt — return to the live
+                                    // view at the shell cursor.
+                                    grid.reset_scroll();
+                                    grid.mark_all_dirty();
+                                }
+                            }
+                        }
                         Key::Named(NamedKey::PageUp) if shift => {
                             // Scroll up in scrollback
                             let scroll_amount = self.size.rows as usize;
@@ -1280,11 +1373,17 @@ fn schedule_pty_wake(pending: &AtomicBool, send: impl FnOnce() -> bool) -> bool 
 // Hyperlink policy
 // ---------------------------------------------------------------------------
 
-/// Permit only web URLs without embedded control characters. OSC 8 content is
-/// terminal input and must not be allowed to invoke arbitrary URI handlers.
-fn hyperlink_is_allowed(url: &str) -> bool {
-    !url.chars().any(|ch| ch.is_control())
-        && (url.strip_prefix("https://").is_some() || url.strip_prefix("http://").is_some())
+/// Permit URLs without embedded control characters whose scheme is on the
+/// configured allowlist. OSC 8 / plain-text content is terminal input and
+/// must not be allowed to invoke arbitrary URI handlers.
+fn hyperlink_is_allowed(url: &str, schemes: &[String]) -> bool {
+    if url.chars().any(|ch| ch.is_control()) {
+        return false;
+    }
+    let Some(scheme) = url.split_once("://").map(|(s, _)| s) else {
+        return false;
+    };
+    schemes.iter().any(|s| s == scheme)
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,12 +1675,28 @@ mod tests {
     }
 
     #[test]
-    fn test_hyperlink_policy_allows_http_and_https_only() {
-        assert!(hyperlink_is_allowed("https://example.com/path"));
-        assert!(hyperlink_is_allowed("http://example.com"));
-        assert!(!hyperlink_is_allowed("file:///etc/passwd"));
-        assert!(!hyperlink_is_allowed("javascript:alert(1)"));
-        assert!(!hyperlink_is_allowed("https://example.com/\nnext"));
+    fn test_hyperlink_policy_default_schemes() {
+        let schemes: Vec<String> = vec!["http".into(), "https".into()];
+        assert!(hyperlink_is_allowed("https://example.com/path", &schemes));
+        assert!(hyperlink_is_allowed("http://example.com", &schemes));
+        assert!(!hyperlink_is_allowed("file:///etc/passwd", &schemes));
+        assert!(!hyperlink_is_allowed("javascript:alert(1)", &schemes));
+        assert!(!hyperlink_is_allowed(
+            "https://example.com/\nnext",
+            &schemes
+        ));
+        assert!(!hyperlink_is_allowed("example.com", &schemes)); // no scheme
+    }
+
+    #[test]
+    fn test_hyperlink_policy_custom_schemes() {
+        let schemes: Vec<String> = vec!["gemini".into(), "mailto".into()];
+        assert!(hyperlink_is_allowed(
+            "gemini://geminiprotocol.net",
+            &schemes
+        ));
+        assert!(hyperlink_is_allowed("mailto://x@y.com", &schemes));
+        assert!(!hyperlink_is_allowed("https://example.com", &schemes));
     }
 
     #[test]

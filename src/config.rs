@@ -49,6 +49,37 @@ pub struct Config {
     /// Reduce cursor and UI motion for accessibility.
     #[serde(default)]
     pub reduced_motion: bool,
+
+    /// Security and privacy policy for terminal-host interactions.
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+/// Security and privacy policy for terminal-host interactions.
+///
+/// Following the shitty/pg83 "locked down by default" posture: applications
+/// cannot read the clipboard or drive host-window behaviour unless explicitly
+/// allowed. Writing the clipboard and setting the window title are the two
+/// conveniences kept on by default.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SecurityConfig {
+    /// Allow applications to write to the system clipboard via OSC 52.
+    #[serde(default = "default_true")]
+    pub osc52_write: bool,
+
+    /// Allow applications to read the system clipboard via OSC 52 queries.
+    /// Off by default — a hostile prompt could otherwise exfiltrate secrets.
+    #[serde(default)]
+    pub osc52_read: bool,
+
+    /// Allow OSC 0/2 to change the window title.
+    #[serde(default = "default_true")]
+    pub window_title: bool,
+
+    /// URI schemes that hyperlinks may open (OSC 8 + plain-text detection).
+    /// A configured list replaces the default outright.
+    #[serde(default = "default_uri_schemes")]
+    pub uri_schemes: Vec<String>,
 }
 
 /// Cursor style options.
@@ -265,6 +296,21 @@ fn default_true() -> bool {
     true
 }
 
+fn default_uri_schemes() -> Vec<String> {
+    vec!["http".to_string(), "https".to_string()]
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            osc52_write: true,
+            osc52_read: false,
+            window_title: true,
+            uri_schemes: default_uri_schemes(),
+        }
+    }
+}
+
 fn default_bg() -> String {
     "#1E1E2E".to_string()
 }
@@ -380,6 +426,7 @@ impl Default for Config {
             cursor_style: CursorStyle::default(),
             tabs: TabsConfig::default(),
             reduced_motion: false,
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -546,5 +593,38 @@ cursor_style = "bar"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.cursor_style, CursorStyle::Bar);
+    }
+
+    #[test]
+    fn test_security_defaults_locked_down() {
+        let config = Config::default();
+        assert!(config.security.osc52_write);
+        assert!(!config.security.osc52_read);
+        assert!(config.security.window_title);
+        assert_eq!(config.security.uri_schemes, vec!["http", "https"]);
+    }
+
+    #[test]
+    fn test_security_parse() {
+        let toml_str = r#"
+[security]
+osc52_write = false
+osc52_read = true
+uri_schemes = ["https", "gemini"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.security.osc52_write);
+        assert!(config.security.osc52_read);
+        assert_eq!(config.security.uri_schemes, vec!["https", "gemini"]);
+        assert!(config.security.window_title); // untouched → default true
+    }
+
+    #[test]
+    fn test_security_roundtrip() {
+        let original = Config::default();
+        let serialized = toml::to_string_pretty(&original).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert!(!deserialized.security.osc52_read);
+        assert!(deserialized.security.osc52_write);
     }
 }

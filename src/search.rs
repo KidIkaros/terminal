@@ -246,7 +246,11 @@ impl SearchState {
             return self.status_cache.as_deref().unwrap_or("");
         }
 
-        let direction = if self.mode == SearchMode::Reverse { "reverse" } else { "search" };
+        let direction = if self.mode == SearchMode::Reverse {
+            "reverse"
+        } else {
+            "search"
+        };
         let mut buf = String::new();
         let _ = write!(buf, "/{}  {}  {}/{}", self.query, direction, current, total);
         self.status_cache = Some(buf);

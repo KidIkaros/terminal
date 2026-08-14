@@ -9,6 +9,10 @@ pub enum SelectionMode {
     Word,
     /// Line-by-line selection
     Line,
+    /// Rectangular (block) selection — every cell in the bounding box.
+    /// Enabled with Alt+Click; the extracted text drops trailing whitespace
+    /// on each row (VS Code / kitty behaviour).
+    Rectangular,
 }
 
 /// Represents a selection region in the terminal
@@ -127,6 +131,14 @@ impl Selection {
                 // Select entire lines
                 row >= start.0 && row <= end.0
             }
+            SelectionMode::Rectangular => {
+                // Bounding box, independent of drag direction.
+                let top = start.0.min(end.0);
+                let bottom = start.0.max(end.0);
+                let left = start.1.min(end.1);
+                let right = start.1.max(end.1);
+                row >= top && row <= bottom && col >= left && col <= right
+            }
         }
     }
 
@@ -138,6 +150,30 @@ impl Selection {
 
         let (start, end) = self.normalized();
         let mut result = String::new();
+
+        if self.mode == SelectionMode::Rectangular {
+            // Block semantics: fixed column range on every row, trailing
+            // whitespace trimmed per line, rows joined with newlines.
+            let top = start.0.min(end.0);
+            let bottom = start.0.max(end.0);
+            let left = start.1.min(end.1);
+            let right = start.1.max(end.1);
+            let mut rows = Vec::new();
+            for row in top..=bottom {
+                if row >= lines.len() {
+                    break;
+                }
+                let chars: Vec<char> = lines[row].chars().collect();
+                let start_idx = left.min(chars.len());
+                let end_idx = (right + 1).min(chars.len());
+                let mut line: String = chars[start_idx..end_idx].iter().collect();
+                while line.ends_with(' ') || line.ends_with('\t') {
+                    line.pop();
+                }
+                rows.push(line);
+            }
+            return rows.join("\n");
+        }
 
         for row in start.0..=end.0 {
             if row >= lines.len() {
@@ -315,6 +351,54 @@ mod tests {
         assert!(sel.contains(4, 0));
         assert!(!sel.contains(1, 0));
         assert!(!sel.contains(5, 0));
+    }
+
+    #[test]
+    fn test_rectangular_contains() {
+        let mut sel = Selection::new();
+        sel.start_selection(2, 5, SelectionMode::Rectangular);
+        sel.update(4, 8);
+        sel.end_selection();
+
+        assert!(sel.contains(2, 5));
+        assert!(sel.contains(2, 8));
+        assert!(sel.contains(3, 6));
+        assert!(sel.contains(4, 8));
+        assert!(!sel.contains(2, 4));
+        assert!(!sel.contains(4, 9));
+        assert!(!sel.contains(1, 6));
+        assert!(!sel.contains(3, 9));
+    }
+
+    #[test]
+    fn test_rectangular_reversed_drag() {
+        // Dragging up-left must still produce a valid bounding box.
+        let mut sel = Selection::new();
+        sel.start_selection(4, 8, SelectionMode::Rectangular);
+        sel.update(2, 3);
+        sel.end_selection();
+
+        assert!(sel.contains(2, 3));
+        assert!(sel.contains(3, 5));
+        assert!(sel.contains(4, 8));
+        assert!(!sel.contains(2, 2));
+        assert!(!sel.contains(4, 9));
+    }
+
+    #[test]
+    fn test_rectangular_extract_text() {
+        let lines = vec![
+            "alpha beta gamma".to_string(),
+            "delta epsilon zeta".to_string(),
+            "eta theta iota".to_string(),
+        ];
+        let mut sel = Selection::new();
+        sel.start_selection(0, 0, SelectionMode::Rectangular);
+        sel.update(2, 4);
+        sel.end_selection();
+
+        let text = sel.extract_text(&lines, 16);
+        assert_eq!(text, "alpha\ndelta\neta t");
     }
 
     #[test]

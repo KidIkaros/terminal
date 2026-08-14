@@ -239,8 +239,14 @@ Per vt100.net's own advice: spec + real terminal + **vttest**.
       `test_decaln_fills_screen`), including parser ST assertions
 - [x] Advanced compatibility coverage: grapheme tails/RustyBuzz shaping, Kitty keyboard,
       modifyOtherKeys, DEC line modes, and extended underline styles
-- [x] Native headless runner: `cargo run --release --bin vt_conformance -- --json` — 6/6 cases passed;
-      JSON report saved to `bench/results/vt-conformance.json`.
+- [x] Native headless runner: `cargo run --release --bin vt_conformance -- --json` — 25/25 cases
+      passed (grew from 6 → 9 → 19 → 25 across sessions; latest additions: IRM insert mode,
+      DECSC/DECRC save/restore, truecolor SGR colon+semicolon forms, CHT/CBT tabulation,
+      DECTCEM cursor visibility, DECOM origin mode — the CHT case found and fixed a missing
+      `CSI I` handler). JSON report saved to `bench/results/vt-conformance.json`.
+- [x] Sixel lifecycle hardened (2026-08-13): placements are grid-owned (stable ids, capped at
+      `MAX_LIVE_SIXELS`) and shift with scroll, drop on ED/EL/resize/alt-screen; the renderer
+      reconciles GPU textures by id each frame instead of draining the queue.
 
 ### Remaining interactive verification
 
@@ -403,3 +409,29 @@ Each finding is tagged with the audit item it informs.
 ---
 
 **Baseline:** 166 → 182 (Tier 1) → 194 (Tier 2) → 202 (T3 Batch A) → 213 (T3 Batch B) → 218 (Tier 3 complete) → 222 (Tier 4 complete) → **232 passed, 0 failed** (214 library tests + 18 binary tests; Stage 1 CPR/PTY/parser/security coverage added; T5-1 remains deferred). ROADMAP.md's "71" is stale.
+
+## ✅ Stage 8 — Feature, conformance, performance, and security pass (2026-08-13) — 276 tests
+
+Driven by a comparison against pg83/shitty ("a serious terminal emulator with a stupid name"):
+
+### Feature gaps closed (things shitty lacks or we were missing)
+- **Sixel inline images (DEC 54870)** — new `src/sixel.rs` decoder (palette + inline RGB/HLS + `!N` repeat + raster attributes + bounds clamping) wired through DCS `q` into `Grid::place_sixel`; cursor advances below the image; new `render/sixel.wgsl` + per-image texture/bind-group pipeline draws them over the terminal framebuffer. Shitty explicitly does not support sixel — this is a genuine differentiator.
+- **Rectangular (block) selection** — `SelectionMode::Rectangular`, Alt+Click to activate, bounding-box `contains`, trailing-whitespace-trimmed extraction.
+- **Shell integration** — OSC 133 prompt/command/output markers that scroll with their rows (visible + scrollback marker streams), Ctrl+Shift+Up/Down prompt jumping, OSC 7 cwd, OSC 9 notifications.
+- **In-band resize (mode 2048)** — `CSI 4;rows;cols t` on resize, DECRQM-reportable.
+
+### Conformance depth
+- Headless runner grew 6 → **19 cases** (shell markers, mode 2048, sixel decode/placement, DECAWM-off clamp, REP, ICH/DCH/ECH, scroll-region confinement, UTF-8 robustness, OSC 52, cursor shapes/paste, pending wrap, DECRQM, OSC 8); all pass. Sixel decoder cross-validated against an independent Python encoder (`bench/sixel_validate.py`) with a pixel-exact match — this caught a silent pixel-loss bug in buffer growth, now fixed (monotonic growth).
+- New `src/bin/fuzz.rs` deterministic harness (seeded LCG × 4 byte modes) asserting parser/grid invariants; `cargo test --bin fuzz` smoke + release-mode runs pass clean.
+
+### Performance (parser+grid headless, `bench` binary)
+- Row-vector grid (`Vec<Vec<Cell>>` per screen): scrolling rotates row handles and moves rows into scrollback instead of cloning the whole visible region per line feed.
+- Bulk-output path wired into the real PTY drain (`bulk_output` + one `mark_all_dirty()` per chunk), eliminating O(rows×cols) per-scroll dirty marking.
+- Printable ASCII: **1.25 → 30.6 MiB/s** (24×). Random bytes: **3.2 → 12.1 MiB/s** (3.8×). All 251 library tests stayed green through the refactor.
+
+### Security posture (shitty-style "locked down by default")
+- `[security]` config: `osc52_write` (on), `osc52_read` (off by default), `window_title` (on), `uri_schemes` allowlist (replaces the hardcoded http/https-only hyperlink policy).
+
+### Remaining known gaps vs shitty
+- Bidirectional text and GPU-side compute rendering are not implemented (neither does shitty have bidi; its compute renderer is its speed edge).
+- GUI-frame throughput is not re-benchmarked on a display; the 30 MiB/s figure is parser+grid only.

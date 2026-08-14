@@ -10,9 +10,18 @@ A fast, GPU-accelerated terminal emulator written in Rust.
 - **Configurable** - TOML-based configuration with theme support
 - **Search** - Built-in search with regex support
 - **Clipboard Integration** - System clipboard and OSC52 protocol
-- **Mouse Support** - X10 and SGR mouse tracking
+- **Mouse Support** - X10, SGR, and urxvt mouse tracking (modes 1000/1002/1003/1006/1015)
 - **Bracketed Paste** - Safe paste handling
 - **Customizable Themes** - 16 built-in themes (Catppuccin, Gruvbox, Dracula, etc.)
+- **Tabs** - Multiple terminal sessions with a tab bar
+- **Sixel Inline Images** - Decode and render sixel (DEC 54870) graphics: `cat image.six`, chafa, img2sixel; images track their rows on scroll and are removed on clear/resize/alt-screen
+- **Shell Integration** - OSC 133 prompt/command markers with Ctrl+Shift+Up/Down prompt jumping, OSC 7 cwd tracking
+- **In-Band Resize** - Mode 2048 resize notifications (`CSI 4;h;w t`) for tmux/neovim
+- **Rectangular Selection** - Alt+Click block selection (VS Code/kitty style)
+- **Notifications** - OSC 9 desktop notifications via notify-send (falls back to logging without a notification daemon)
+- **Locked Down by Default** - OSC 52 clipboard reads are off by default; URI-scheme allowlist for hyperlinks
+- **Keyboard Protocols** - Kitty keyboard and xterm modifyOtherKeys
+- **Parser Fuzz Harness** - Deterministic seeded fuzzing of the parser/grid seam
 
 ## Installation
 
@@ -103,11 +112,14 @@ cursor_blink_ms = 500
 | Ctrl+Shift+V | Paste |
 | Ctrl+Shift+F | Open search |
 | Ctrl+Shift+A | Select all |
+| Alt+Click+drag | Rectangular (block) selection |
+| Shift+Click+drag | Line selection |
 | F3 / Ctrl+G | Find next |
 | Ctrl+Shift+G | Find previous |
 | Ctrl+Shift+T | New tab |
 | Ctrl+Shift+W | Close tab |
 | Ctrl+PageUp/PageDown | Switch tabs |
+| Ctrl+Shift+Up/Down | Jump between shell prompts (OSC 133) |
 | Shift+PageUp/PageDown | Scroll buffer |
 
 ## Architecture
@@ -124,6 +136,24 @@ The terminal is built with a 4-layer architecture:
 - Rust 1.70+
 - GPU with Vulkan/Metal/DX12 support
 - Linux, macOS, or Windows
+
+## Performance
+
+Headless parser+grid throughput (CPU only, no GPU; 80×24 grid, 500 lines
+scrollback, release build, bulk-output mode — the `bench` binary):
+
+| Workload | Throughput |
+|----------|------------|
+| Printable ASCII (scroll path) | ~30 MiB/s |
+| Random bytes (parser worst case) | ~12 MiB/s |
+
+Run it yourself: `cargo run --release --bin bench`.
+
+## Verification
+
+- `cargo test --locked` — 287 tests (parser, grid, selection, sixel, fuzz smoke)
+- `cargo run --release --bin vt_conformance` — 25 headless VT conformance cases
+- `cargo run --release --bin fuzz -- --quick` — deterministic parser fuzzing
 
 ## License
 

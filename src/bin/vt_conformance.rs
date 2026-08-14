@@ -103,6 +103,306 @@ fn osc_and_limits() -> Result<(), String> {
     )
 }
 
+fn shell_integration_markers() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 20, rows: 6 }, 32);
+    feed(
+        &mut grid,
+        b"\x1b]133;A\x07prompt>\r\n\x1b]133;B\x07ls\r\n\x1b]133;C\x07out",
+    );
+    let stream: Vec<u8> = grid.marker_stream().collect();
+    expect(stream[0] == 1, "row 0 should be a prompt marker")?;
+    expect(stream[1] == 2, "row 1 should be a command marker")?;
+    expect(stream[2] == 3, "row 2 should be an output marker")?;
+    // Prev/next navigation over the stream.
+    expect(grid.prev_prompt(3) == Some(0), "prev_prompt failed")?;
+    expect(grid.next_prompt(0) == None, "next_prompt found a ghost")?;
+    // OSC 7 cwd + OSC 9 notification.
+    feed(&mut grid, b"\x1b]7;file:///srv\x07");
+    expect(grid.cwd.as_deref() == Some("file:///srv"), "OSC 7 cwd lost")?;
+    feed(&mut grid, b"\x1b]9;task done\x07");
+    expect(
+        grid.take_notification().as_deref() == Some("task done"),
+        "OSC 9 notification lost",
+    )
+}
+
+fn in_band_resize_2048() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 5 }, 32);
+    feed(&mut grid, b"\x1b[?2048h");
+    expect(grid.in_band_resize, "mode 2048 not set")?;
+    grid.resize_report();
+    expect(
+        grid.take_responses() == vec![b"\x1b[4;5;10t".to_vec()],
+        "in-band resize report mismatch",
+    )?;
+    feed(&mut grid, b"\x1b[?2048$p");
+    expect(
+        grid.take_responses() == vec![b"\x1b[?2048;1$y".to_vec()],
+        "DECRQM for 2048 mismatch",
+    )
+}
+
+fn sixel_decode_and_place() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 40, rows: 10 }, 32);
+    grid.set_cell_size(8, 16);
+    // A 2x12 blue image: two bands of a 2-wide run, then LF + repeat.
+    feed(&mut grid, b"\x1bPq\"1;1;12;2#1!2~-!2~\x1b\\");
+    expect(grid.sixel_images.len() == 1, "sixel image not placed")?;
+    let img = &grid.sixel_images[0];
+    expect(img.col == 0 && img.row == 0, "sixel misplaced")?;
+    expect(
+        img.image.width == 2 && img.image.height == 12,
+        "sixel dimensions wrong",
+    )?;
+    // Cursor advanced below the image (12px / 16px cell → 1 row).
+    expect(
+        grid.cursor.row == 1 && grid.cursor.col == 0,
+        "cursor not advanced",
+    )?;
+    // The RGBA payload is non-trivial: 2x12 with alpha set on drawn pixels.
+    expect(
+        img.image.rgba[3] == 0xff && img.image.rgba[7] == 0xff,
+        "sixel pixels not drawn",
+    )
+}
+
+fn decawm_off_clamps() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 5, rows: 2 }, 32);
+    feed(&mut grid, b"\x1b[?7labcdefgh");
+    expect(
+        grid.cursor.col == 5 && grid.cursor.row == 0,
+        "autowrap-off should clamp at the edge, not wrap",
+    )?;
+    // Each char past the edge overwrites the last cell (xterm behaviour).
+    expect(grid.cell(4, 0).ch == 'h', "overwrite clamp wrong")
+}
+
+fn rep_repeats_last_char() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    feed(&mut grid, b"ab\x1b[4b");
+    expect(grid.cursor.col == 6, "REP should repeat 4 times")?;
+    expect(
+        grid.line_to_string(0).starts_with("abbbbb"),
+        "REP characters wrong",
+    )
+}
+
+fn ich_dch_ech() -> Result<(), String> {
+    // ICH: insert blanks at the cursor, pushing text right.
+    let mut g1 = Grid::new(WinSize { cols: 8, rows: 2 }, 32);
+    feed(&mut g1, b"abcdef\x1b[4D\x1b[2@");
+    expect(
+        g1.line_to_string(0) == "ab  cdef",
+        format!("ICH shift wrong: {:?}", g1.line_to_string(0)),
+    )?;
+
+    // DCH: delete chars at the cursor, pulling text left.
+    let mut g2 = Grid::new(WinSize { cols: 8, rows: 2 }, 32);
+    feed(&mut g2, b"abcdef\x1b[4D\x1b[2P");
+    expect(
+        g2.line_to_string(0) == "abef    ",
+        format!("DCH shift wrong: {:?}", g2.line_to_string(0)),
+    )?;
+
+    // ECH: blank chars in place (no shift).
+    let mut g3 = Grid::new(WinSize { cols: 8, rows: 2 }, 32);
+    feed(&mut g3, b"abcdef\x1b[4D\x1b[2X");
+    expect(
+        g3.line_to_string(0) == "ab  ef  ",
+        format!("ECH blanking wrong: {:?}", g3.line_to_string(0)),
+    )
+}
+
+fn scroll_region_confines() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 5, rows: 6 }, 32);
+    feed(&mut grid, b"\x1b[2;5r"); // region = rows 2..5 (1-indexed)
+    feed(
+        &mut grid,
+        b"11111\r\n22222\r\n33333\r\n44444\r\n55555\r\n66666\r\n77777\r\n88888",
+    );
+    expect(
+        grid.line_to_string(0).starts_with("11111"),
+        "row outside the region scrolled",
+    )?;
+    expect(
+        grid.line_to_string(1).starts_with("55555"),
+        "region top lost its oldest line",
+    )?;
+    expect(
+        grid.line_to_string(4).starts_with("88888"),
+        "region bottom missing newest line",
+    )
+}
+
+fn utf8_and_invalid_bytes() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    // Valid multibyte, then a bad lead byte, a stray continuation, and a C1
+    // CSI (0x9B is the whole 8-bit CSI introducer — equivalent to ESC [).
+    feed(&mut grid, b"caf\xc3\xa9 \xff\x80\x9b1;1H");
+    expect(
+        grid.line_to_string(0).starts_with("caf\u{e9}"),
+        "valid UTF-8 lost next to invalid bytes",
+    )?;
+    expect(
+        grid.cursor.col == 0 && grid.cursor.row == 0,
+        "cursor corrupted by invalid bytes",
+    )
+}
+
+fn osc52_clipboard() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    // OSC 52 ; clipboard ; base64("hi") = aGk=
+    feed(&mut grid, b"\x1b]52;c;aGk=\x07");
+    expect(
+        grid.clipboard_set.as_deref() == Some("hi"),
+        "OSC 52 set payload lost",
+    )?;
+    feed(&mut grid, b"\x1b]52;c;?\x07");
+    expect(grid.clipboard_query_requested, "OSC 52 query not flagged")
+}
+
+fn cursor_shapes_and_paste() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    feed(&mut grid, b"\x1b[5 q");
+    expect(grid.cursor_shape == 5, "DECSCUR bar-blink not set")?;
+    feed(&mut grid, b"\x1b[?2004h");
+    expect(grid.bracketed_paste, "DECSET 2004 not set")?;
+    feed(&mut grid, b"\x1b[?2004l");
+    expect(!grid.bracketed_paste, "DECRST 2004 not cleared")
+}
+
+fn pending_wrap_then_wrap() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 5, rows: 2 }, 32);
+    feed(&mut grid, b"12345");
+    expect(
+        grid.cursor.col == 5,
+        "cursor should sit at the pending wrap",
+    )?;
+    feed(&mut grid, b"X");
+    expect(
+        grid.cursor.row == 1 && grid.cursor.col == 1,
+        "pending wrap did not fire on next char",
+    )?;
+    expect(grid.cell(0, 1).ch == 'X', "wrapped char landed wrong")
+}
+
+fn decrqm_ansi_and_private() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    // ANSI mode 7 (autowrap, default on) and private mode 2026 (default off).
+    feed(&mut grid, b"\x1b[7$p");
+    expect(
+        grid.take_responses() == vec![b"\x1b[7;1$y".to_vec()],
+        "DECRQM ANSI mode 7 mismatch",
+    )?;
+    feed(&mut grid, b"\x1b[?2026$p");
+    expect(
+        grid.take_responses() == vec![b"\x1b[?2026;2$y".to_vec()],
+        "DECRQM private mode 2026 mismatch",
+    )
+}
+
+fn osc8_hyperlink() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 20, rows: 2 }, 32);
+    feed(
+        &mut grid,
+        b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07next",
+    );
+    expect(
+        grid.get_hyperlink_at(0, 0) == Some("https://example.com"),
+        "OSC 8 link url lost",
+    )?;
+    expect(
+        grid.get_hyperlink_at(4, 0).is_none(),
+        "OSC 8 close did not clear the link",
+    )
+}
+
+fn irm_insert_mode() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    // Type "abc", enable IRM, back up 2, then type: existing cells shift
+    // right instead of being overwritten.
+    feed(&mut grid, b"abc\x1b[4h\x1b[2DXYZ");
+    expect(grid.insert_mode, "IRM (mode 4) not set")?;
+    expect(
+        grid.line_to_string(0) == "aXYZbc    ",
+        format!("IRM insert wrong: {:?}", grid.line_to_string(0)),
+    )?;
+    feed(&mut grid, b"\x1b[4l");
+    expect(!grid.insert_mode, "IRM (mode 4) not reset")
+}
+
+fn decsc_decrc_restore() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 4 }, 32);
+    feed(&mut grid, b"ab"); // cursor at (col 2, row 0)
+    feed(&mut grid, b"\x1b7"); // DECSC: save cursor
+    feed(&mut grid, b"\x1b[3;1HXY"); // draw elsewhere
+    expect(grid.cell(0, 2).ch == 'X', "DECSC detour text lost")?;
+    feed(&mut grid, b"\x1b8"); // DECRC: restore cursor
+    feed(&mut grid, b"Z");
+    expect(
+        grid.line_to_string(0) == "abZ       ",
+        format!("DECRC restore wrong: {:?}", grid.line_to_string(0)),
+    )?;
+    expect(
+        grid.cursor.col == 3 && grid.cursor.row == 0,
+        "DECRC cursor position not restored",
+    )
+}
+
+fn sgr_truecolor_colon_and_semicolon() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    // Colon form (38:2::r:g:b) and classic semicolon form (38;2;r;g;b).
+    feed(&mut grid, b"\x1b[38:2::12:34:56mA");
+    expect(
+        grid.cell(0, 0).fg == terminal::grid::Color::Rgb(12, 34, 56),
+        "colon truecolor fg wrong",
+    )?;
+    feed(&mut grid, b"\x1b[38;2;200;100;50mB");
+    expect(
+        grid.cell(1, 0).fg == terminal::grid::Color::Rgb(200, 100, 50),
+        "semicolon truecolor fg wrong",
+    )
+}
+
+fn cht_cbt_tabs() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 40, rows: 2 }, 32);
+    feed(&mut grid, b"\x1b[2I");
+    expect(grid.cursor.col == 16, "CHT(2) should land on tab 16")?;
+    feed(&mut grid, b"\x1b[2Z");
+    expect(grid.cursor.col == 0, "CBT(2) should land on tab 0")?;
+    feed(&mut grid, b"\x1b[3I");
+    expect(grid.cursor.col == 24, "CHT(3) should land on tab 24")
+}
+
+fn dectcem_hide_show() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 2 }, 32);
+    feed(&mut grid, b"\x1b[?25l");
+    expect(!grid.cursor_visible, "DECTCEM hide failed")?;
+    feed(&mut grid, b"\x1b[?25h");
+    expect(grid.cursor_visible, "DECTCEM show failed")
+}
+
+fn decom_origin_mode() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 10, rows: 6 }, 32);
+    feed(&mut grid, b"\x1b[3;5r\x1b[?6h\x1b[1;1H");
+    // DECOM: CUP is relative to the region top (0-based row 2), not row 0.
+    expect(
+        grid.cursor.row == 2 && grid.cursor.col == 0,
+        "DECOM CUP 1;1 not relative to region",
+    )?;
+    // Row 6 relative clamps to the region bottom (0-based row 4).
+    feed(&mut grid, b"\x1b[6;1H");
+    expect(
+        grid.cursor.row == 4 && grid.cursor.col == 0,
+        "DECOM CUP past region end did not clamp",
+    )?;
+    feed(&mut grid, b"\x1b[?6l\x1b[1;1H");
+    expect(
+        grid.cursor.row == 0 && grid.cursor.col == 0,
+        "DECRST origin mode did not restore absolute CUP",
+    )
+}
+
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -128,6 +428,82 @@ fn cases() -> Vec<Case> {
         Case {
             name: "osc_and_limits",
             run: osc_and_limits,
+        },
+        Case {
+            name: "shell_integration_markers",
+            run: shell_integration_markers,
+        },
+        Case {
+            name: "in_band_resize_2048",
+            run: in_band_resize_2048,
+        },
+        Case {
+            name: "sixel_decode_and_place",
+            run: sixel_decode_and_place,
+        },
+        Case {
+            name: "decawm_off_clamps",
+            run: decawm_off_clamps,
+        },
+        Case {
+            name: "rep_repeats_last_char",
+            run: rep_repeats_last_char,
+        },
+        Case {
+            name: "ich_dch_ech",
+            run: ich_dch_ech,
+        },
+        Case {
+            name: "scroll_region_confines",
+            run: scroll_region_confines,
+        },
+        Case {
+            name: "utf8_and_invalid_bytes",
+            run: utf8_and_invalid_bytes,
+        },
+        Case {
+            name: "osc52_clipboard",
+            run: osc52_clipboard,
+        },
+        Case {
+            name: "cursor_shapes_and_paste",
+            run: cursor_shapes_and_paste,
+        },
+        Case {
+            name: "pending_wrap_then_wrap",
+            run: pending_wrap_then_wrap,
+        },
+        Case {
+            name: "decrqm_ansi_and_private",
+            run: decrqm_ansi_and_private,
+        },
+        Case {
+            name: "osc8_hyperlink",
+            run: osc8_hyperlink,
+        },
+        Case {
+            name: "irm_insert_mode",
+            run: irm_insert_mode,
+        },
+        Case {
+            name: "decsc_decrc_restore",
+            run: decsc_decrc_restore,
+        },
+        Case {
+            name: "sgr_truecolor_colon_and_semicolon",
+            run: sgr_truecolor_colon_and_semicolon,
+        },
+        Case {
+            name: "cht_cbt_tabs",
+            run: cht_cbt_tabs,
+        },
+        Case {
+            name: "dectcem_hide_show",
+            run: dectcem_hide_show,
+        },
+        Case {
+            name: "decom_origin_mode",
+            run: decom_origin_mode,
         },
     ]
 }

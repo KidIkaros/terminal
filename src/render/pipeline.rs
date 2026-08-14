@@ -24,6 +24,7 @@ use crate::grid::{Color, ColorPalette, Grid};
 use crate::render::font::{GlyphAtlas, ShapedGlyph, ATLAS_SIZE};
 use crate::search::SearchState;
 use crate::selection::Selection;
+
 use crate::tab_bar::{TabBar, TabBarTarget};
 
 // ---------------------------------------------------------------------------
@@ -246,6 +247,27 @@ pub struct TerminalPipeline {
     /// allocating a 256-entry Vec every time. Now cached globally.
     color_table: Vec<[f32; 3]>,
     current_buffer: usize,
+
+    /// Sixel image pipeline: RGBA textures drawn over the cell grid.
+    sixel_pipeline: wgpu::RenderPipeline,
+    sixel_bind_group_layout: wgpu::BindGroupLayout,
+    sixel_images: Vec<SixelGpuImage>,
+    sixel_sampler: wgpu::Sampler,
+}
+
+/// A decoded sixel image uploaded to the GPU, ready to draw. Positions are
+/// not stored: the grid owns them and shifts them on scroll, so each frame
+/// the draw pass looks the current row/col up by `id`.
+struct SixelGpuImage {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    /// Instance buffer holding one quad (top-left + size + full-texture UVs).
+    instance_buf: wgpu::Buffer,
+    /// Placement id in the grid's live `sixel_images` list.
+    id: u64,
+    pixel_w: u32,
+    pixel_h: u32,
 }
 
 impl TerminalPipeline {
@@ -326,13 +348,14 @@ impl TerminalPipeline {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             }))
         };
-        let offscreen_view = offscreen_texture.as_ref().map(|t| {
-            t.create_view(&wgpu::TextureViewDescriptor::default())
-        });
+        let offscreen_view = offscreen_texture
+            .as_ref()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
 
         // ---- Atlas texture ----
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -508,7 +531,7 @@ impl TerminalPipeline {
                             format: wgpu::VertexFormat::Float32x2,
                         }],
                     },
-                    instance_attrs,
+                    instance_attrs.clone(),
                 ],
                 compilation_options: Default::default(),
             },
@@ -563,27 +586,29 @@ impl TerminalPipeline {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             }));
-            composite_bind_group_layout = Some(device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("terminal_composite_bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+            composite_bind_group_layout = Some(device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("terminal_composite_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            }));
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                },
+            ));
             let ov = offscreen_view.as_ref().unwrap();
             composite_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("terminal_composite_bg"),
@@ -595,7 +620,9 @@ impl TerminalPipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(composite_sampler.as_ref().unwrap()),
+                        resource: wgpu::BindingResource::Sampler(
+                            composite_sampler.as_ref().unwrap(),
+                        ),
                     },
                 ],
             }));
@@ -608,13 +635,102 @@ impl TerminalPipeline {
                 bind_group_layouts: &[composite_bind_group_layout.as_ref().unwrap()],
                 push_constant_ranges: &[],
             });
-            composite_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("terminal_composite_pipeline"),
-                layout: Some(&composite_layout),
-                vertex: wgpu::VertexState {
-                    module: &composite_shader,
-                    entry_point: "vs_main",
-                    buffers: &[wgpu::VertexBufferLayout {
+            composite_pipeline = Some(device.create_render_pipeline(
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("terminal_composite_pipeline"),
+                    layout: Some(&composite_layout),
+                    vertex: wgpu::VertexState {
+                        module: &composite_shader,
+                        entry_point: "vs_main",
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: 8,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &[wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x2,
+                            }],
+                        }],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &composite_shader,
+                        entry_point: "fs_main",
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                },
+            ));
+        }
+
+        // ---- Sixel image pipeline (inline RGBA images) ----
+        // A second pipeline sharing the uniform buffer and quad geometry but
+        // sampling a per-image RGBA texture. One draw per image; each image
+        // gets its own bind group + tiny instance buffer.
+        let sixel_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sixel_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let sixel_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sixel_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let sixel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sixel_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("sixel.wgsl").into()),
+        });
+        let sixel_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sixel_layout"),
+            bind_group_layouts: &[&sixel_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let sixel_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sixel_pipeline"),
+            layout: Some(&sixel_layout),
+            vertex: wgpu::VertexState {
+                module: &sixel_shader,
+                entry_point: "vs_main",
+                buffers: &[
+                    wgpu::VertexBufferLayout {
                         array_stride: 8,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[wgpu::VertexAttribute {
@@ -622,26 +738,30 @@ impl TerminalPipeline {
                             shader_location: 0,
                             format: wgpu::VertexFormat::Float32x2,
                         }],
-                    }],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &composite_shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            }));
-        }
+                    },
+                    instance_attrs.clone(),
+                ],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sixel_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
         TerminalPipeline {
             device,
@@ -670,6 +790,10 @@ impl TerminalPipeline {
             last_dirty_cells: 0,
             color_table: Vec::with_capacity(256),
             current_buffer: 0,
+            sixel_pipeline,
+            sixel_bind_group_layout,
+            sixel_images: Vec::new(),
+            sixel_sampler,
         }
     }
 
@@ -701,31 +825,36 @@ impl TerminalPipeline {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: self.surface_config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             }));
-            self.offscreen_view = Some(self
-                .offscreen_texture
-                .as_ref()
-                .unwrap()
-                .create_view(&wgpu::TextureViewDescriptor::default()));
-            if let (Some(cbl), Some(cs)) = (&self.composite_bind_group_layout, &self.composite_sampler) {
-                self.composite_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("terminal_composite_bg"),
-                    layout: cbl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(
-                                self.offscreen_view.as_ref().unwrap()
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(cs),
-                        },
-                    ],
-                }));
+            self.offscreen_view = Some(
+                self.offscreen_texture
+                    .as_ref()
+                    .unwrap()
+                    .create_view(&wgpu::TextureViewDescriptor::default()),
+            );
+            if let (Some(cbl), Some(cs)) =
+                (&self.composite_bind_group_layout, &self.composite_sampler)
+            {
+                self.composite_bind_group =
+                    Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("terminal_composite_bg"),
+                        layout: cbl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    self.offscreen_view.as_ref().unwrap(),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(cs),
+                            },
+                        ],
+                    }));
             }
         }
 
@@ -761,6 +890,142 @@ impl TerminalPipeline {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// Upload any sixel images the grid decoded since the last frame. Each
+    /// image gets its own texture, bind group, and single-instance buffer.
+    /// The grid list is *not* drained — it is the authoritative placement
+    /// state (rows shift on scroll, placements drop on clear/resize/alt
+    /// switch), so this reconciles by id: textures for placements the grid
+    /// removed are freed, and new placements are uploaded. The grid caps its
+    /// list at `MAX_LIVE_SIXELS`, so no GPU-side trim is needed.
+    fn upload_sixel_images(&mut self, grid: &mut Grid) {
+        if self.sixel_images.is_empty() && grid.sixel_images.is_empty() {
+            return;
+        }
+        self.sixel_images
+            .retain(|g| grid.sixel_images.iter().any(|p| p.id == g.id));
+        for p in &grid.sixel_images {
+            if self.sixel_images.iter().any(|g| g.id == p.id) {
+                continue;
+            }
+            let w = p.image.width.max(1);
+            let h = p.image.height.max(1);
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("sixel_texture"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                &p.image.rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sixel_bg"),
+                layout: &self.sixel_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sixel_sampler),
+                    },
+                ],
+            });
+            // One instance per image; updated per frame with the current
+            // cell geometry (tab bar height can differ from upload time).
+            let instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sixel_instance_buf"),
+                size: std::mem::size_of::<GlyphInstance>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.sixel_images.push(SixelGpuImage {
+                texture,
+                view,
+                bind_group,
+                instance_buf,
+                id: p.id,
+                pixel_w: w,
+                pixel_h: h,
+            });
+        }
+    }
+
+    /// Update each sixel image's instance quad with the current cell geometry
+    /// and draw them all into the given render pass (caller selects pipeline
+    /// and sets vertex buffers 0..2 is handled here). Positions come from the
+    /// grid's live placement list each frame, shifted by the scrollback view
+    /// offset like the cells underneath.
+    fn draw_sixel_images(
+        &mut self,
+        rpass: &mut wgpu::RenderPass<'_>,
+        cw: f32,
+        ch: f32,
+        tab_bar_height: f32,
+        grid: &Grid,
+    ) {
+        if self.sixel_images.is_empty() || grid.sixel_images.is_empty() {
+            return;
+        }
+        // Placement lookup by id (the lists are ≤ MAX_LIVE_SIXELS, so a
+        // linear scan per image is cheap and allocation-free).
+        let view_offset = grid.view_scrollback_lines();
+        for img in &self.sixel_images {
+            let Some(p) = grid.sixel_images.iter().find(|p| p.id == img.id) else {
+                continue;
+            };
+            // Live rows display shifted down by the scrollback offset; images
+            // pushed below the visible bottom are skipped.
+            let screen_row = p.row + view_offset;
+            if screen_row >= grid.rows {
+                continue;
+            }
+            let span_w = ((img.pixel_w as f32) / cw.max(1.0)).ceil() as u32;
+            let span_h = ((img.pixel_h as f32) / ch.max(1.0)).ceil() as u32;
+            let instance = GlyphInstance {
+                cell_pos: [p.col as f32 * cw, tab_bar_height + screen_row as f32 * ch],
+                cell_size: [span_w as f32 * cw, span_h as f32 * ch],
+                atlas_uv_min: [0.0, 0.0],
+                atlas_uv_max: [1.0, 1.0],
+                fg_color: [1.0, 1.0, 1.0, 1.0],
+                bg_color: [0.0, 0.0, 0.0, 0.0],
+                mode: 0,
+                _pad: [0; 3],
+            };
+            self.queue
+                .write_buffer(&img.instance_buf, 0, bytemuck::bytes_of(&instance));
+            rpass.set_bind_group(0, &img.bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+            rpass.set_vertex_buffer(1, img.instance_buf.slice(..));
+            rpass.draw(0..6, 0..1);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -874,6 +1139,9 @@ impl TerminalPipeline {
         // Keep the damage count for profiling and drive the guarded persistent
         // target path. UI overlays, selection, scrollback, cursor visibility,
         // and large damage regions use a correctness-first full redraw.
+        // Upload any sixel images the grid decoded since the last frame.
+        self.upload_sixel_images(grid);
+
         let dirty_cells = grid.take_dirty_cells();
         self.last_dirty_cells = dirty_cells.len();
         let full_redraw = needs_full_redraw(
@@ -1152,7 +1420,8 @@ impl TerminalPipeline {
                 let py = tab_bar_height + row as f32 * ch;
 
                 let fg_raw = color_to_rgba(cell.fg, true, colors, &grid.palette, &self.color_table);
-                let bg_raw = color_to_rgba(cell.bg, false, colors, &grid.palette, &self.color_table);
+                let bg_raw =
+                    color_to_rgba(cell.bg, false, colors, &grid.palette, &self.color_table);
 
                 // DECSCNM (?5) screen-reverse flips the whole display; combine
                 // with per-cell SGR inverse (T3-4).
@@ -1218,7 +1487,9 @@ impl TerminalPipeline {
                         stack_buf[ch_len..total].copy_from_slice(cluster_tail.as_bytes());
                         cluster = std::str::from_utf8(&stack_buf[..total])
                             .map(std::borrow::Cow::Borrowed)
-                            .unwrap_or_else(|_| std::borrow::Cow::Owned(format!("{}{}", cell.ch, cluster_tail)));
+                            .unwrap_or_else(|_| {
+                                std::borrow::Cow::Owned(format!("{}{}", cell.ch, cluster_tail))
+                            });
                     } else {
                         cluster = std::borrow::Cow::Owned(format!("{}{}", cell.ch, cluster_tail));
                     }
@@ -1396,13 +1667,9 @@ impl TerminalPipeline {
             let inst_bytes = bytemuck::cast_slice::<GlyphInstance, u8>(&instances);
             let size = wgpu::BufferSize::new(inst_bytes.len() as wgpu::BufferAddress)
                 .expect("inst_bytes len > 0");
-            let mut view = self.staging_belt.write_buffer(
-                &mut encoder,
-                buf,
-                0,
-                size,
-                &self.device,
-            );
+            let mut view = self
+                .staging_belt
+                .write_buffer(&mut encoder, buf, 0, size, &self.device);
             view.copy_from_slice(inst_bytes);
         }
 
@@ -1443,6 +1710,26 @@ impl TerminalPipeline {
                 }
             }
 
+            // Sixel images over the terminal framebuffer (before composite).
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("sixel_offscreen_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: offscreen_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rpass.set_pipeline(&self.sixel_pipeline);
+                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, grid);
+            }
+
             // Composite the persistent terminal framebuffer into the swapchain.
             {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1459,7 +1746,9 @@ impl TerminalPipeline {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                if let (Some(cp), Some(cbg)) = (&self.composite_pipeline, &self.composite_bind_group) {
+                if let (Some(cp), Some(cbg)) =
+                    (&self.composite_pipeline, &self.composite_bind_group)
+                {
                     rpass.set_pipeline(cp);
                     rpass.set_bind_group(0, cbg, &[]);
                     rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
@@ -1502,6 +1791,26 @@ impl TerminalPipeline {
                 rpass.draw(0..6, 0..bg_count);
                 // Draw mode=1 (glyphs) — samples atlas texture.
                 rpass.draw(0..6, bg_count..inst_count as u32);
+            }
+
+            // Sixel images over the terminal content.
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("sixel_direct_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rpass.set_pipeline(&self.sixel_pipeline);
+                self.draw_sixel_images(&mut rpass, cw, ch, tab_bar_height, grid);
             }
 
             self.offscreen_initialized = true;

@@ -13,6 +13,7 @@ pub mod pty;
 pub mod render;
 pub mod search;
 pub mod selection;
+pub mod sixel;
 pub mod tab_bar;
 pub mod tabs;
 pub mod theme;

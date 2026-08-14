@@ -177,6 +177,33 @@ cursor_blink_ms = 500     # Blink interval in milliseconds (0 = no blink)
 # mouse_reporting = false
 ```
 
+## Security Configuration
+
+Locked down by default: applications cannot read the clipboard or open
+arbitrary URI handlers unless explicitly allowed.
+
+```toml
+[security]
+osc52_write = true   # Allow applications to write to the clipboard (OSC 52)
+osc52_read = false   # Allow applications to READ the clipboard (OSC 52 queries)
+window_title = true  # Allow applications to change the window title (OSC 0/2)
+uri_schemes = ["http", "https"]  # Schemes hyperlinks may open
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `osc52_write` | bool | `true` | Allow OSC 52 to set the system clipboard |
+| `osc52_read` | bool | `false` | Allow OSC 52 queries to read the clipboard (disable to keep secrets safe from hostile prompts) |
+| `window_title` | bool | `true` | Allow OSC 0/2 window-title changes |
+| `uri_schemes` | list | `["http", "https"]` | URI schemes that Ctrl-click / OSC 8 hyperlinks may open; replaces the default outright |
+
+## Shell Integration
+
+- **OSC 133** — prompt/command/output markers; `Ctrl+Shift+Up/Down` jumps between prompts.
+- **OSC 7** — records the working directory (`grid.cwd`).
+- **OSC 9** — desktop notification requests (logged).
+- **Mode 2048** — in-band resize reports (`CSI 4;rows;cols t`) so tmux/neovim redraw without polling.
+
 ## Example Configurations
 
 ### Minimal Configuration

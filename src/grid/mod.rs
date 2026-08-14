@@ -4,6 +4,8 @@
 //! The grid owns all terminal state: cursor position, active SGR attributes,
 //! scroll region, and the alternate screen buffer.
 
+use std::sync::Arc;
+
 use unicode_width::UnicodeWidthChar;
 
 use crate::parser::{Action, Perform};
@@ -325,7 +327,10 @@ pub struct Cell {
     pub hyperlink_id: u32,
     /// Additional grapheme codepoints attached to this base character.
     /// Stored only for cells that actually have a cluster tail.
-    pub combining: Option<String>,
+    /// `Box<str>` (16 B) instead of `String` (24 B): combining marks are
+    /// frozen after append, and the smaller field shrinks Cell from 48 to
+    /// 40 bytes — less per-cell copy and scroll-blank traffic on the hot path.
+    pub combining: Option<Box<str>>,
 }
 
 impl Default for Cell {
@@ -407,15 +412,22 @@ pub enum MouseEncoding {
 // Grid
 // Max length for OSC and DCS strings (100KB; matches xterm class).
 const MAX_OSC_DCS_LEN: usize = 100_000;
+// Sixel payloads routinely exceed the OSC cap (a 640x480 image is ~100-300KB
+// of run-length-encoded data); allow up to 2MB, still bounded against
+// pathological allocation.
+const MAX_DCS_LEN: usize = 2_000_000;
 
 /// The terminal grid buffer and state.
 pub struct Grid {
     pub cols: usize,
     pub rows: usize,
 
-    // Two screens: primary and alternate (toggled by ?1049h / ?1049l)
-    cells_primary: Vec<Cell>,
-    cells_alt: Vec<Cell>,
+    // Two screens: primary and alternate (toggled by ?1049h / ?1049l).
+    // Each screen is a row-major array of rows (`Vec<Cell>` per row) so that
+    // scrolling rotates row handles instead of copying every cell — the hot
+    // path under heavy output like `cat bigfile`.
+    cells_primary: Vec<Arc<Vec<Cell>>>,
+    cells_alt: Vec<Arc<Vec<Cell>>>,
     alt_active: bool,
 
     pub cursor: Cursor,
@@ -436,7 +448,17 @@ pub struct Grid {
     // Scrollback buffer (primary screen only). VecDeque gives O(1) eviction
     // of the oldest line (T1-7); a Vec required remove(0), which is O(n)
     // and burned CPU under heavy scroll output like `cat bigfile`.
-    pub scrollback: std::collections::VecDeque<Vec<Cell>>,
+    pub scrollback: std::collections::VecDeque<Arc<Vec<Cell>>>,
+    /// Shared blank row: every blank grid slot points at this one Arc, so a
+    /// scroll bumps a refcount instead of allocating + memsetting a fresh
+    /// row. Blank-slot dirtiness is tracked per row in `row_blank_dirty` so
+    /// the dirty utilities never clone the shared row.
+    blank_row: Arc<Vec<Cell>>,
+    /// Per-row: true when the slot points at `blank_row`.
+    row_is_blank: Vec<bool>,
+    /// Per-row: a blank slot that must be redrawn (set at scroll time,
+    /// consumed once by `take_dirty_cells`).
+    row_blank_dirty: Vec<bool>,
     pub scrollback_offset: usize, // 0 = no scroll, >0 = lines scrolled up
     /// Fractional scroll offset for smooth scrolling (0.0 to 1.0)
     pub scroll_fraction: f32,
@@ -539,6 +561,38 @@ pub struct Grid {
     hyperlinks: std::collections::HashMap<u32, String>,
     active_hyperlink_id: u32,
     next_hyperlink_id: u32,
+
+    // --- In-band resize notification (terminal-wg mode 2048) ---
+    /// When set, the app reports window resizes to the application as
+    /// `CSI 4 ; rows ; cols t` (XTWINOPS text-area size) via [`Grid::resize_report`].
+    pub in_band_resize: bool,
+
+    // --- Shell integration (OSC 133) markers ---
+    /// Per-row marker for the visible grid: 0 = none, 1 = prompt start,
+    /// 2 = command start, 3 = command output. Scrolls with the rows and is
+    /// copied to `shell_scrollback_markers` when lines enter the scrollback.
+    shell_markers: Vec<u8>,
+    /// Markers for scrollback lines, parallel to `scrollback`.
+    shell_scrollback_markers: std::collections::VecDeque<u8>,
+    /// Current working directory reported via OSC 7 (raw `file://…` URI).
+    pub cwd: Option<String>,
+    /// Notification text requested via OSC 9 / OSC 9;4 (drained by the app).
+    pub notification: Option<String>,
+
+    // --- Sixel images (DCS `q`) ---
+    /// Decoded sixel images awaiting renderer upload, in arrival order. The
+    /// grid owns placement state: rows shift on scroll, placements drop on
+    /// clear/resize/alt-screen switches. The renderer reconciles its GPU
+    /// textures against these ids every frame instead of draining the list.
+    pub sixel_images: Vec<crate::sixel::SixelPlacement>,
+    /// Monotonic id source for [`Self::sixel_images`].
+    next_sixel_id: u64,
+    /// True while inside a sixel DCS sequence so Put accumulates raw data.
+    dcs_sixel: bool,
+    /// Cell size in pixels (set by the app after font load; used for the
+    /// post-image cursor advance).
+    pub cell_w: u32,
+    pub cell_h: u32,
 }
 
 /// Default horizontal tab stops: every 8 columns (VT100 power-up state).
@@ -642,12 +696,14 @@ impl Grid {
     pub fn new(size: WinSize, scrollback: usize) -> Self {
         let cols = size.cols as usize;
         let rows = size.rows as usize;
-        let len = cols * rows;
+        // The initial screen is entirely blank: every row starts as a handle
+        // to one shared blank row (a refcount bump each, no per-row alloc).
+        let blank = Arc::new(vec![Cell::default(); cols]);
         Grid {
             cols,
             rows,
-            cells_primary: vec![Cell::default(); len],
-            cells_alt: vec![Cell::default(); len],
+            cells_primary: vec![blank.clone(); rows],
+            cells_alt: vec![blank.clone(); rows],
             alt_active: false,
             cursor: Cursor::default(),
             saved_cursor: SavedCursor::default(),
@@ -658,9 +714,14 @@ impl Grid {
             scroll_bottom: rows - 1,
             line_modes: vec![0; rows],
             scrollback: std::collections::VecDeque::new(),
+            blank_row: blank,
+            row_is_blank: vec![true; rows],
+            // A fresh grid needs a full first redraw.
+            row_blank_dirty: vec![true; rows],
             scrollback_offset: 0,
             scroll_fraction: 0.0,
             scrollback_capacity: scrollback,
+            next_sixel_id: 0,
             cursor_visible: true,
             origin_mode: false,
             autowrap: true, // DECAWM defaults ON (VT100 behaviour)
@@ -687,6 +748,15 @@ impl Grid {
             bulk_output: false,
             bell_pending: false,
             clipboard_set: None,
+            in_band_resize: false,
+            shell_markers: vec![0; rows],
+            shell_scrollback_markers: std::collections::VecDeque::new(),
+            cwd: None,
+            notification: None,
+            sixel_images: Vec::new(),
+            dcs_sixel: false,
+            cell_w: 8,
+            cell_h: 16,
             clipboard_query_requested: false,
             responses: Vec::new(),
             dcs_buf: Vec::new(),
@@ -701,7 +771,7 @@ impl Grid {
     // Accessors
     // -----------------------------------------------------------------------
 
-    fn cells(&self) -> &[Cell] {
+    fn cells(&self) -> &[Arc<Vec<Cell>>] {
         if self.alt_active {
             &self.cells_alt
         } else {
@@ -709,16 +779,12 @@ impl Grid {
         }
     }
 
-    fn cells_mut(&mut self) -> &mut Vec<Cell> {
+    fn cells_mut(&mut self) -> &mut Vec<Arc<Vec<Cell>>> {
         if self.alt_active {
             &mut self.cells_alt
         } else {
             &mut self.cells_primary
         }
-    }
-
-    fn idx(&self, col: usize, row: usize) -> usize {
-        row * self.cols + col
     }
 
     // -----------------------------------------------------------------------
@@ -776,6 +842,68 @@ impl Grid {
         std::mem::take(&mut self.responses)
     }
 
+    /// Report a terminal resize in-band (mode 2048). When the mode is set,
+    /// queue `CSI 4 ; rows ; cols t` (XTWINOPS text-area size) so the
+    /// application learns about resizes without polling `TIOCGWINSZ`.
+    pub fn resize_report(&mut self) {
+        if self.in_band_resize {
+            let resp = format!("\x1b[4;{};{}t", self.rows, self.cols);
+            self.respond(resp.as_bytes());
+        }
+    }
+
+    /// Take the pending bell flag (BEL / OSC 9;7). The app consumes this to
+    /// flash or beep; cleared after the call.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell_pending)
+    }
+
+    /// Decode and place a completed sixel DCS payload (`DCS … q … ST`). The
+    /// image is positioned at the cursor and the cursor advances to column 0
+    /// of the line below the image (DEC 54870). Decoded images are queued in
+    /// [`Grid::sixel_images`] for the renderer to upload.
+    fn place_sixel(&mut self) {
+        let max_w = (self.cols as u32).saturating_mul(self.cell_w.max(1));
+        let max_h = (self.rows as u32).saturating_mul(self.cell_h.max(1));
+        let Some(image) = crate::sixel::decode_sixel(&self.dcs_buf, max_w.max(1), max_h.max(1))
+        else {
+            log::debug!("Sixel: payload did not decode");
+            return;
+        };
+        let col = self.cursor.col;
+        let row = self.cursor.row;
+        let rows = (image.height + self.cell_h - 1) / self.cell_h.max(1);
+        let id = self.next_sixel_id;
+        self.next_sixel_id = self.next_sixel_id.wrapping_add(1);
+        self.sixel_images.push(crate::sixel::SixelPlacement {
+            id,
+            col,
+            row,
+            image,
+        });
+        // Keep the placement list within the renderer's GPU texture budget
+        // (oldest evicted first — a refcount/free, no per-cell work).
+        while self.sixel_images.len() > crate::sixel::MAX_LIVE_SIXELS {
+            self.sixel_images.remove(0);
+        }
+        self.cursor.col = 0;
+        self.cursor.row = (self.cursor.row + rows as usize).min(self.rows - 1);
+        self.mark_all_dirty();
+        log::debug!("Sixel: placed image #{id} at ({col},{row})");
+    }
+
+    /// Take the pending notification text (OSC 9 / OSC 9;4), leaving None.
+    pub fn take_notification(&mut self) -> Option<String> {
+        std::mem::take(&mut self.notification)
+    }
+
+    /// Record the terminal's cell size in pixels. Used to compute the
+    /// post-sixel cursor advance (`CSI P q` images occupy whole cells).
+    pub fn set_cell_size(&mut self, w: u32, h: u32) {
+        self.cell_w = w.max(1);
+        self.cell_h = h.max(1);
+    }
+
     /// DECRPM mode value for DECRQM reports: 1 = set, 2 = reset,
     /// 0 = mode not recognized.
     fn mode_state(&self, mode: u16) -> u8 {
@@ -794,6 +922,7 @@ impl Grid {
             2004 => self.bracketed_paste,
             1004 => self.focus_reporting,
             2026 => self.synchronized_output,
+            2048 => self.in_band_resize,
             _ => return 0,
         };
         if set {
@@ -816,8 +945,7 @@ impl Grid {
     }
 
     pub fn cell(&self, col: usize, row: usize) -> &Cell {
-        let i = self.idx(col, row);
-        &self.cells()[i]
+        &self.cells()[row][col]
     }
 
     /// DEC line presentation mode for a visible row.
@@ -857,8 +985,70 @@ impl Grid {
     }
 
     fn cell_mut(&mut self, col: usize, row: usize) -> &mut Cell {
-        let i = self.idx(col, row);
-        &mut self.cells_mut()[i]
+        // Writing a cell makes the row a private, non-blank row: if the slot
+        // still points at the shared blank this copies it once (the copy is
+        // the price of the first write; the fast path in `print_ascii_run`
+        // rebuilds full-row writes instead).
+        self.row_is_blank[row] = false;
+        let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
+        &mut row_cells[col]
+    }
+
+    // -----------------------------------------------------------------------
+    // Shell integration (OSC 133) — prompt markers
+    // -----------------------------------------------------------------------
+
+    /// Marker stored for a row. 0 = none, 1 = prompt start (OSC 133;A/E),
+    /// 2 = command start (OSC 133;B), 3 = command output (OSC 133;C/D).
+    fn set_row_marker(&mut self, row: usize, marker: u8) {
+        if row < self.rows {
+            self.shell_markers[row] = marker;
+        }
+    }
+
+    /// The combined marker stream: scrollback markers (oldest first) followed
+    /// by visible-grid markers. An index into this stream is a stable address
+    /// for a row even after it scrolls off the visible grid.
+    pub fn marker_stream(&self) -> impl Iterator<Item = u8> + '_ {
+        self.shell_scrollback_markers
+            .iter()
+            .copied()
+            .chain(self.shell_markers.iter().copied())
+    }
+
+    /// Combined-stream length (scrollback + visible rows).
+    pub fn marker_stream_len(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    /// Index of the previous prompt marker strictly before `from` (a
+    /// combined-stream index), or None.
+    pub fn prev_prompt(&self, from: usize) -> Option<usize> {
+        if from == 0 {
+            return None; // nothing strictly before the stream start
+        }
+        let collected: Vec<u8> = self.marker_stream().collect();
+        let mut idx = from - 1;
+        loop {
+            if let Some(marker) = collected.get(idx) {
+                if *marker == 1 {
+                    return Some(idx);
+                }
+            } else {
+                return None;
+            }
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+        }
+    }
+
+    /// Index of the next prompt marker strictly after `from` (a combined
+    /// stream index), or None.
+    pub fn next_prompt(&self, from: usize) -> Option<usize> {
+        let collected: Vec<u8> = self.marker_stream().collect();
+        (from + 1..collected.len()).find(|&i| collected[i] == 1)
     }
 
     // -----------------------------------------------------------------------
@@ -877,12 +1067,9 @@ impl Grid {
         // cell lines. The existing model does not retain soft-wrap metadata,
         // so each old row is treated as an independent logical line; this is
         // still materially safer than dropping scrollback on every resize.
-        let mut source_lines: Vec<Vec<Cell>> = self.scrollback.iter().cloned().collect();
-        source_lines.extend(
-            self.cells_primary
-                .chunks(old_cols)
-                .map(|line| line.to_vec()),
-        );
+        let mut source_lines: Vec<Vec<Cell>> =
+            self.scrollback.iter().map(|l| l.as_ref().clone()).collect();
+        source_lines.extend(self.cells_primary.iter().map(|l| l.as_ref().clone()));
         let old_cursor_line = old_scrollback_len + old_cursor.row.min(old_rows - 1);
         let mut reflowed = Vec::new();
         let mut cursor_line = 0;
@@ -917,38 +1104,53 @@ impl Grid {
         let visible_start = cursor_line
             .saturating_sub(new_rows - 1)
             .min(preferred_start);
+        // The shared blank must match the new width before padding rows are
+        // built from it (otherwise the rebuilt grid mixes row widths).
+        self.blank_row = Arc::new(vec![Cell::default(); new_cols]);
+
         let visible_lines = &reflowed[visible_start..reflowed.len().min(visible_start + new_rows)];
-        let mut new_primary = Vec::with_capacity(new_cols * new_rows);
-        for line in visible_lines {
-            new_primary.extend(line.iter().cloned());
-        }
-        while new_primary.len() < new_cols * new_rows {
-            new_primary.extend(std::iter::repeat(Cell::default()).take(new_cols));
+        let mut new_primary: Vec<Arc<Vec<Cell>>> =
+            visible_lines.iter().map(|l| Arc::new(l.clone())).collect();
+        while new_primary.len() < new_rows {
+            new_primary.push(self.blank_row.clone());
         }
 
         let scrollback_start = visible_start.saturating_sub(self.scrollback_capacity);
         self.scrollback = reflowed[scrollback_start..visible_start]
             .iter()
-            .cloned()
+            .map(|l| Arc::new(l.clone()))
             .collect();
 
         // Resize the alternate screen in place, preserving its visible top-left
         // content. Alternate-screen applications generally redraw immediately,
         // but losing it during a transient resize causes visible corruption.
-        let mut new_alt = vec![Cell::default(); new_cols * new_rows];
+        let mut new_alt: Vec<Arc<Vec<Cell>>> =
+            (0..new_rows).map(|_| self.blank_row.clone()).collect();
         for row in 0..old_rows.min(new_rows) {
             let copy_cols = old_cols.min(new_cols);
-            let src = row * old_cols;
-            let dst = row * new_cols;
-            new_alt[dst..dst + copy_cols].clone_from_slice(&self.cells_alt[src..src + copy_cols]);
+            let src = &self.cells_alt[row][..copy_cols];
+            Arc::make_mut(&mut new_alt[row])[..copy_cols].clone_from_slice(src);
         }
 
         self.cols = new_cols;
         self.rows = new_rows;
         self.cells_primary = new_primary;
         self.cells_alt = new_alt;
+        // Recompute blank flags from the rebuilt screens (blank padding rows
+        // point at the shared blank).
+        self.row_is_blank = self
+            .cells()
+            .iter()
+            .map(|r| Arc::ptr_eq(r, &self.blank_row))
+            .collect();
+        self.row_blank_dirty = vec![false; new_rows];
         self.line_modes.resize(new_rows, 0);
         self.line_modes.truncate(new_rows);
+        // Reflow re-orders rows, so shell markers cannot stay aligned; reset
+        // them. In-flight sixel images are viewport-relative and are dropped.
+        self.shell_markers = vec![0; new_rows];
+        self.shell_scrollback_markers.clear();
+        self.sixel_images.clear();
         self.tab_stops = default_tab_stops(new_cols);
         self.scroll_top = 0;
         self.scroll_bottom = new_rows - 1;
@@ -1059,9 +1261,15 @@ impl Grid {
     // Dirty cell tracking for optimized rendering
     // -----------------------------------------------------------------------
 
-    /// Check if any cell is dirty
+    /// Check if any cell is dirty (blank rows report via their row flag).
     pub fn has_dirty_cells(&self) -> bool {
         for row in 0..self.rows {
+            if self.row_is_blank[row] {
+                if self.row_blank_dirty[row] {
+                    return true;
+                }
+                continue;
+            }
             for col in 0..self.cols {
                 if self.cell(col, row).dirty {
                     return true;
@@ -1072,34 +1280,54 @@ impl Grid {
     }
 
     /// Get positions of all dirty cells and clear their dirty flags
-    /// Returns a vector of (row, col) pairs
+    /// Returns a vector of (row, col) pairs. Blank rows are reported via
+    /// `row_blank_dirty` without touching the shared blank row's cells.
     pub fn take_dirty_cells(&mut self) -> Vec<(usize, usize)> {
         let mut dirty = Vec::new();
         for row in 0..self.rows {
-            for col in 0..self.cols {
-                let cell = self.cell_mut(col, row);
-                if cell.dirty {
+            if self.row_is_blank[row] {
+                if self.row_blank_dirty[row] {
+                    self.row_blank_dirty[row] = false;
+                    for col in 0..self.cols {
+                        dirty.push((row, col));
+                    }
+                }
+                continue;
+            }
+            let cols = self.cols;
+            let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
+            for col in 0..cols {
+                if row_cells[col].dirty {
                     dirty.push((row, col));
-                    cell.dirty = false;
+                    row_cells[col].dirty = false;
                 }
             }
         }
         dirty
     }
 
-    /// Mark all cells as dirty (full redraw)
+    /// Mark all cells as dirty (full redraw). Blank rows get their row flag
+    /// set instead of being cloned out of the shared blank.
     pub fn mark_all_dirty(&mut self) {
         for row in 0..self.rows {
-            for col in 0..self.cols {
-                let cell = self.cell_mut(col, row);
+            if self.row_is_blank[row] {
+                self.row_blank_dirty[row] = true;
+                continue;
+            }
+            for cell in Arc::make_mut(&mut self.cells_mut()[row]).iter_mut() {
                 cell.dirty = true;
             }
         }
     }
 
-    /// Mark a specific cell as dirty
+    /// Mark a specific cell as dirty. For a blank row this marks the whole
+    /// row (coarse but correct, and it never clones the shared blank).
     pub fn mark_dirty(&mut self, col: usize, row: usize) {
         if col < self.cols && row < self.rows {
+            if self.row_is_blank[row] {
+                self.row_blank_dirty[row] = true;
+                return;
+            }
             let cell = self.cell_mut(col, row);
             cell.dirty = true;
         }
@@ -1143,7 +1371,17 @@ impl Grid {
             };
             if let Some((col, row)) = target {
                 let cell = self.cell_mut(col, row);
-                cell.combining.get_or_insert_with(String::new).push(ch);
+                // Box<str> is immutable, so rebuild the tail when appending.
+                // Combining clusters are short and rare; the alloc is fine.
+                let tail = match cell.combining.take() {
+                    Some(existing) => {
+                        let mut s = existing.to_string();
+                        s.push(ch);
+                        s.into_boxed_str()
+                    }
+                    None => ch.to_string().into_boxed_str(),
+                };
+                cell.combining = Some(tail);
                 cell.dirty = true;
             }
             return;
@@ -1173,10 +1411,11 @@ impl Grid {
             let row = self.cursor.row;
             let col = self.cursor.col;
             let cols = self.cols;
-            let cells = self.cells_mut();
+            self.row_is_blank[row] = false;
+            let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
             for c in (col + width..cols).rev() {
-                cells[row * cols + c] = cells[row * cols + c - width].clone();
-                cells[row * cols + c].dirty = true;
+                row_cells[c] = row_cells[c - width].clone();
+                row_cells[c].dirty = true;
             }
         }
 
@@ -1269,15 +1508,24 @@ impl Grid {
             // batch run for newlines (the most frequent control in text output).
             match b {
                 0x0a => {
-                    // LF — line feed
-                    self.cursor.row += 1;
-                    if self.cursor.row > scroll_bottom {
-                        self.scroll_up(1);
+                    // LF — line feed. Batch consecutive LFs into a single
+                    // scroll: runs of blank lines (`\n\n\n`) are common in
+                    // real output and each one would otherwise pay the full
+                    // scroll cost (rotate + blank + marker shift).
+                    let mut n = 1;
+                    while idx + n < bytes.len() && bytes[idx + n] == 0x0a {
+                        n += 1;
+                    }
+                    let new_row = self.cursor.row + n;
+                    if new_row > scroll_bottom {
+                        self.scroll_up(new_row - scroll_bottom);
                         self.cursor.row = scroll_bottom;
+                    } else {
+                        self.cursor.row = new_row;
                     }
                     self.last_char = None;
-                    consumed += 1;
-                    idx += 1;
+                    consumed += n;
+                    idx += n;
                     continue;
                 }
                 0x0d => {
@@ -1344,12 +1592,10 @@ impl Grid {
                 let space_left = cols - self.cursor.col;
                 let take = (run.len() - run_idx).min(space_left);
 
-                // Write the chunk directly into the cells array.
+                // Write the chunk directly into the row's cells array.
                 let col = self.cursor.col;
                 let row = self.cursor.row;
                 {
-                    let cells = self.cells_mut();
-                    let start = row * cols + col;
                     let template = Cell {
                         ch: ' ',
                         fg,
@@ -1360,11 +1606,32 @@ impl Grid {
                         hyperlink_id,
                         combining: None,
                     };
-                    for i in 0..take {
-                        let b = run[run_idx + i];
-                        let mut cell = template.clone();
-                        cell.ch = b as char;
-                        cells[start + i] = cell;
+                    if col == 0 && take == cols {
+                        // Full-row write: rebuild the row in one pass instead
+                        // of Arc::make_mut cloning the (possibly shared blank)
+                        // row first — halves the per-line cell traffic under
+                        // `cat bigfile`.
+                        self.row_is_blank[row] = false;
+                        let mut new_row = Vec::with_capacity(cols);
+                        for i in 0..take {
+                            let b = run[run_idx + i];
+                            let mut cell = template.clone();
+                            cell.ch = b as char;
+                            new_row.push(cell);
+                        }
+                        self.cells_mut()[row] = Arc::new(new_row);
+                    } else {
+                        self.row_is_blank[row] = false;
+                        let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
+                        // Clone the template and override the char. LLVM turns
+                        // the clone into a tight vectorized copy; hand-written
+                        // field stores benchmark slower.
+                        for i in 0..take {
+                            let b = run[run_idx + i];
+                            let mut cell = template.clone();
+                            cell.ch = b as char;
+                            row_cells[col + i] = cell;
+                        }
                     }
                 }
 
@@ -1403,53 +1670,102 @@ impl Grid {
             return;
         }
         let n = n.min(bot - top + 1); // larger n just clears the rest
-        let cols = self.cols;
         let mark_dirty = !self.bulk_output;
 
-        // Push top line(s) into scrollback (primary screen, full-region only)
+        // Push top line(s) into scrollback (primary screen, full-region only).
+        // Rows are `Arc<Vec<Cell>>`, so the scrollback gets a shared handle —
+        // a refcount bump, no per-cell copying — and the grid slot is replaced
+        // by the rotate + blank below (hot path under heavy output).
         if !self.alt_active && top == self.scroll_top {
             for r in top..top + n {
                 if r < self.rows {
-                    // Clone the row into scrollback before we overwrite it.
-                    let start = r * cols;
-                    let row: Vec<Cell> = self.cells_primary[start..start + cols].to_vec();
-                    self.scrollback.push_back(row);
+                    self.scrollback.push_back(self.cells_primary[r].clone());
+                    // Shell-integration markers travel with their rows.
+                    let marker = self.shell_markers.get(r).copied().unwrap_or(0);
+                    self.shell_scrollback_markers.push_back(marker);
                 }
             }
-            // Enforce scrollback limit (O(1) eviction with VecDeque, T1-7)
+            // Enforce scrollback limit (O(1) eviction with VecDeque, T1-7).
+            // The evicted Arc is dropped — no allocation to recycle.
             while self.scrollback.len() > self.scrollback_capacity {
                 self.scrollback.pop_front();
+                self.shell_scrollback_markers.pop_front();
             }
         }
 
-        // Shift rows up using ptr::copy (memmove semantics) instead of
-        // per-cell clone loops. This is the hot path under heavy output.
-        let cells = self.cells_mut();
-        let total = (bot - top + 1) * cols;
-        let shift = n * cols;
-        if shift < total {
-            // Move rows up through a temporary clone so cells with grapheme
-            // tails remain safely owned.
-            let source_start = (top + n) * cols;
-            let moved: Vec<Cell> = cells[source_start..source_start + total - shift].to_vec();
-            cells[top * cols..top * cols + total - shift].clone_from_slice(&moved);
+        // Rotate row handles up — O(rows) pointer moves, no per-cell copies.
+        {
+            let cells = self.cells_mut();
+            if n < bot - top + 1 {
+                cells[top..=bot].rotate_left(n);
+            }
         }
-        // Fill the bottom n rows with defaults
-        let blank_start = (bot + 1 - n) * cols;
-        let blank_end = (bot + 1) * cols;
-        for i in blank_start..blank_end {
-            cells[i] = Cell::default();
+        // Blank flags shift with the rows, and the vacated bottom n rows
+        // become blank slots pointing at the shared blank (a refcount bump —
+        // no allocation, no memset on the scroll path).
+        if top <= bot {
+            if n < bot - top + 1 {
+                for r in top..=bot - n {
+                    self.shell_markers[r] = self.shell_markers[r + n];
+                    self.row_is_blank[r] = self.row_is_blank[r + n];
+                    self.row_blank_dirty[r] = self.row_blank_dirty[r + n];
+                }
+            }
+            for r in (bot + 1 - n).max(top)..=bot {
+                self.cells_mut()[r] = self.blank_row.clone();
+                self.shell_markers[r] = 0;
+                self.row_is_blank[r] = true;
+                self.row_blank_dirty[r] = true;
+            }
         }
 
-        // Mark scrolled region dirty in bulk (skip in bulk_output mode)
+        // Mark scrolled region dirty in bulk (skip in bulk_output mode).
+        // Blank slots are flagged per-row so the shared blank is never
+        // cloned just to set a dirty bit.
         if mark_dirty {
             for r in top..=bot {
-                let start = r * cols;
-                for i in start..start + cols {
-                    cells[i].dirty = true;
+                if self.row_is_blank[r] {
+                    self.row_blank_dirty[r] = true;
+                    continue;
+                }
+                for cell in Arc::make_mut(&mut self.cells_mut()[r]).iter_mut() {
+                    cell.dirty = true;
                 }
             }
         }
+        // Sixel images travel with their rows: shift placements up by `n`,
+        // dropping any whose top row scrolled off the region top.
+        self.shift_sixel_rows(top, bot, n, true);
+    }
+
+    /// Shift sixel placements inside the scroll band `[top, bot]` along with
+    /// the rows: up by `n` (LF scroll / DL) or down by `n` (IL). Placements
+    /// whose top row leaves the band are dropped — they scrolled into history
+    /// (or were discarded by DL/IL semantics, which never save). Placements
+    /// outside the band are untouched. For region scrolls with `top > 0` the
+    /// band's top rows land *above* the region (still on screen), so `up`
+    /// only drops rows that pass the screen top.
+    fn shift_sixel_rows(&mut self, top: usize, bot: usize, n: usize, up: bool) {
+        if self.sixel_images.is_empty() {
+            return;
+        }
+        self.sixel_images.retain_mut(|p| {
+            if p.row < top || p.row > bot {
+                return true; // outside the scrolled band
+            }
+            if up {
+                if p.row < n {
+                    return false; // scrolled off the region/screen top
+                }
+                p.row -= n;
+            } else {
+                if p.row + n > bot {
+                    return false; // pushed past the region bottom (IL discard)
+                }
+                p.row += n;
+            }
+            true
+        });
     }
 
     fn scroll_down(&mut self, n: usize) {
@@ -1466,35 +1782,49 @@ impl Grid {
         }
         let n = n.min(bot - top + 1);
 
-        let cols = self.cols;
         let mark_dirty = !self.bulk_output;
-        let cells = self.cells_mut();
-        // Shift rows down using ptr::copy (memmove). Iterate from bottom to
-        // top so we don't overwrite source rows before copying them.
-        let total = (bot - top + 1) * cols;
-        let shift = n * cols;
-        if shift < total {
-            // Move rows down through a temporary clone so cells with grapheme
-            // tails remain safely owned.
-            let source_start = top * cols;
-            let moved: Vec<Cell> = cells[source_start..source_start + total - shift].to_vec();
-            cells[source_start + shift..source_start + total].clone_from_slice(&moved);
+        // Rotate row handles down — O(rows) pointer moves, no per-cell copies.
+        {
+            let cells = self.cells_mut();
+            if n < bot - top + 1 {
+                cells[top..=bot].rotate_right(n);
+            }
         }
-        // Fill the top n rows with defaults
-        let blank_end = (top + n) * cols;
-        for i in top * cols..blank_end {
-            cells[i] = Cell::default();
+        // Blank flags shift with the rows, and the vacated top n rows become
+        // blank slots pointing at the shared blank (refcount bump, no alloc).
+        if top <= bot {
+            if n < bot - top + 1 {
+                for r in (top..=bot - n).rev() {
+                    self.shell_markers[r + n] = self.shell_markers[r];
+                    self.row_is_blank[r + n] = self.row_is_blank[r];
+                    self.row_blank_dirty[r + n] = self.row_blank_dirty[r];
+                }
+            }
+            for r in top..(top + n).min(bot + 1) {
+                self.cells_mut()[r] = self.blank_row.clone();
+                self.shell_markers[r] = 0;
+                self.row_is_blank[r] = true;
+                self.row_blank_dirty[r] = true;
+            }
         }
 
-        // Mark scrolled region dirty in bulk (skip in bulk_output mode)
+        // Mark scrolled region dirty in bulk (skip in bulk_output mode).
+        // Blank slots are flagged per-row so the shared blank is never
+        // cloned just to set a dirty bit.
         if mark_dirty {
             for r in top..=bot {
-                let start = r * cols;
-                for i in start..start + cols {
-                    cells[i].dirty = true;
+                if self.row_is_blank[r] {
+                    self.row_blank_dirty[r] = true;
+                    continue;
+                }
+                for cell in Arc::make_mut(&mut self.cells_mut()[r]).iter_mut() {
+                    cell.dirty = true;
                 }
             }
         }
+        // Sixel images travel with their rows: shift placements down by `n`,
+        // dropping any pushed past the region bottom (IL semantics).
+        self.shift_sixel_rows(top, bot, n, false);
     }
 
     // -----------------------------------------------------------------------
@@ -1503,18 +1833,17 @@ impl Grid {
 
     fn erase_in_display(&mut self, mode: u16) {
         let cursor = self.cursor;
-        let (start, end) = match mode {
+        let rows = self.rows;
+        let cols = self.cols;
+        let (start_row, start_col, end_row, end_col) = match mode {
             0 => {
                 // From cursor to end of screen
-                let s = self.idx(cursor.col, cursor.row);
-                let e = self.cols * self.rows;
-                (s, e)
+                (cursor.row, cursor.col, rows - 1, cols)
             }
             1 => {
-                // From start to cursor (inclusive)
-                let s = 0;
-                let e = self.idx(cursor.col, cursor.row) + 1;
-                (s, e)
+                // From start to cursor (inclusive). Clamp: the cursor can sit
+                // one past the last column (pending wrap after filling a row).
+                (0, 0, cursor.row, (cursor.col + 1).min(self.cols))
             }
             2 | 3 => {
                 // Entire screen. Mode 3 also wipes the scrollback history
@@ -1523,21 +1852,43 @@ impl Grid {
                     self.scrollback.clear();
                     self.scrollback_offset = 0;
                 }
-                (0, self.cols * self.rows)
+                (0, 0, rows - 1, cols)
             }
             _ => return,
         };
 
         let fg = self.active_fg;
         let bg = self.active_bg;
-        let cells = self.cells_mut();
-        for i in start..end {
-            cells[i] = Cell {
-                fg,
-                bg,
-                dirty: true,
-                ..Cell::default()
+        for r in start_row..=end_row {
+            self.row_is_blank[r] = false;
+            let row_cells = Arc::make_mut(&mut self.cells_mut()[r]);
+            let (cs, ce) = if r == start_row && r == end_row {
+                (start_col, end_col)
+            } else if r == start_row {
+                (start_col, cols)
+            } else if r == end_row {
+                (0, end_col)
+            } else {
+                (0, cols)
             };
+            for c in cs..ce {
+                row_cells[c] = Cell {
+                    fg,
+                    bg,
+                    dirty: true,
+                    ..Cell::default()
+                };
+            }
+        }
+        // Sixel placements whose top-left cell is inside the erased rectangle
+        // are removed (mode 2/3 covers the whole screen).
+        if mode == 2 || mode == 3 {
+            self.sixel_images.clear();
+        } else {
+            let (er, ec) = (start_row, start_col);
+            let (fr, fc) = (end_row, end_col.saturating_sub(1)); // end_col exclusive
+            self.sixel_images
+                .retain(|p| !(p.row >= er && p.row <= fr && p.col >= ec && p.col <= fc));
         }
     }
 
@@ -1545,24 +1896,31 @@ impl Grid {
         let cursor = self.cursor;
         let (start_col, end_col) = match mode {
             0 => (cursor.col, self.cols), // cursor to end of line
-            1 => (0, cursor.col + 1),     // start to cursor
-            2 => (0, self.cols),          // entire line
+            // Mode 1 erases start→cursor inclusive, but the cursor can sit
+            // one past the last column (pending wrap after filling a row),
+            // so clamp to the row length (T3-16 regression).
+            1 => (0, (cursor.col + 1).min(self.cols)),
+            2 => (0, self.cols), // entire line
             _ => return,
         };
 
         let fg = self.active_fg;
         let bg = self.active_bg;
         let row = cursor.row;
-        let cols = self.cols;
-        let cells = self.cells_mut();
+        self.row_is_blank[row] = false;
+        let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
         for c in start_col..end_col {
-            cells[row * cols + c] = Cell {
+            row_cells[c] = Cell {
                 fg,
                 bg,
                 dirty: true,
                 ..Cell::default()
             };
         }
+        // Drop sixel placements starting on the erased line inside the range
+        // (a full-line EL2 clears any image anchored on that row).
+        self.sixel_images
+            .retain(|p| !(p.row == row && p.col >= start_col && p.col < end_col));
     }
 
     // -----------------------------------------------------------------------
@@ -1839,20 +2197,21 @@ impl Grid {
                 let row = self.cursor.row;
                 let col = self.cursor.col;
                 let cols = self.cols;
-                let cells = self.cells_mut();
+                self.row_is_blank[row] = false;
+                let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
                 // Shift everything at/after `col` right by `n`, working from
                 // the right edge so we don't clobber source cells.
                 for c in (col..cols).rev() {
                     if c + n < cols {
-                        cells[row * cols + c + n] = cells[row * cols + c].clone();
+                        row_cells[c + n] = row_cells[c].clone();
                     }
                     if c >= col {
-                        cells[row * cols + c].dirty = true;
+                        row_cells[c].dirty = true;
                     }
                 }
                 // Blank the freshly-inserted cells at the cursor.
                 for c in col..(col + n).min(cols) {
-                    cells[row * cols + c] = Cell::default();
+                    row_cells[c] = Cell::default();
                 }
             }
             // TBC — tabulation clear (T3-9). `CSI g` clears the stop at the
@@ -1870,6 +2229,29 @@ impl Grid {
                 }
                 _ => {}
             },
+            // CHT — cursor forward tabulation. `CSI Ps I` advances to the
+            // `Ps`-th next tab stop (default 1); past the last stop → the
+            // last column (xterm behaviour, mirrors HT).
+            (_, b'I') => {
+                let n = p0.max(1);
+                let mut col = self.cursor.col;
+                for _ in 0..n {
+                    let mut next = self.cols - 1;
+                    let mut found = false;
+                    for c in (col + 1)..self.cols {
+                        if self.tab_stops.get(c).copied().unwrap_or(false) {
+                            next = c;
+                            found = true;
+                            break;
+                        }
+                    }
+                    col = next;
+                    if !found {
+                        break;
+                    }
+                }
+                self.cursor.col = col;
+            }
             // CBT — cursor backward tabulation (T3-15). `CSI Ps Z` moves to the
             // `Ps`-th previous tab stop (default 1). Past the first stop → col 0.
             (_, b'Z') => {
@@ -1917,14 +2299,15 @@ impl Grid {
                 let row = self.cursor.row;
                 let col = self.cursor.col;
                 let cols = self.cols;
-                let cells = self.cells_mut();
+                self.row_is_blank[row] = false;
+                let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
                 for c in col..cols {
                     if c + n < cols {
-                        cells[row * cols + c] = cells[row * cols + c + n].clone();
+                        row_cells[c] = row_cells[c + n].clone();
                     } else {
-                        cells[row * cols + c] = Cell::default();
+                        row_cells[c] = Cell::default();
                     }
-                    cells[row * cols + c].dirty = true;
+                    row_cells[c].dirty = true;
                 }
             }
             // REP — repeat preceding graphic character (T3-11).
@@ -1947,10 +2330,10 @@ impl Grid {
                 let end = (col + n).min(self.cols);
                 let fg = self.active_fg;
                 let bg = self.active_bg;
-                let cells_len = self.cols;
-                let cells = self.cells_mut();
+                self.row_is_blank[row] = false;
+                let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
                 for c in col..end {
-                    cells[row * cells_len + c] = Cell {
+                    row_cells[c] = Cell {
                         fg,
                         bg,
                         dirty: true,
@@ -2091,13 +2474,28 @@ impl Grid {
                                 // Save cursor position for later restoration
                                 self.alt_saved_cursor = self.cursor;
                                 self.alt_active = true;
-                                // Clear alternate screen
-                                self.cells_alt = vec![Cell::default(); self.cols * self.rows];
+                                // Clear alternate screen (all rows share the
+                                // blank; flags say they need a redraw).
+                                self.cells_alt = vec![self.blank_row.clone(); self.rows];
+                                self.row_is_blank = vec![true; self.rows];
+                                self.row_blank_dirty = vec![true; self.rows];
                                 self.cursor = Cursor::default();
+                                // Sixels on the previous screen must not bleed
+                                // into the alt screen (shared placement list).
+                                self.sixel_images.clear();
                             } else if !set && self.alt_active {
                                 self.alt_active = false;
                                 // Restore cursor from the position saved at alt-screen entry
                                 self.cursor = self.alt_saved_cursor;
+                                // Conservative flags: treat primary rows as
+                                // non-blank. A genuinely blank primary row
+                                // (still shared) gets cloned once on the next
+                                // dirty scan — a negligible cost for an
+                                // alt-screen excursion, and never incorrect.
+                                self.row_is_blank = vec![false; self.rows];
+                                self.row_blank_dirty = vec![false; self.rows];
+                                // Drop images drawn while the alt screen was up.
+                                self.sixel_images.clear();
                             }
                         }
                         2004 => {
@@ -2124,6 +2522,16 @@ impl Grid {
                             self.synchronized_output = set;
                             log::debug!(
                                 "Synchronized output: {}",
+                                if set { "enabled" } else { "disabled" }
+                            );
+                        }
+                        2048 => {
+                            // In-band resize notification (terminal-wg): the
+                            // app emits `CSI 4 ; rows ; cols t` on resize so
+                            // tmux/neovim can redraw without polling.
+                            self.in_band_resize = set;
+                            log::debug!(
+                                "In-band resize reporting: {}",
                                 if set { "enabled" } else { "disabled" }
                             );
                         }
@@ -2418,6 +2826,64 @@ impl Grid {
                     log::debug!("OSC 8: End hyperlink");
                 }
             }
+            // OSC 7 — Set current working directory (shell integration).
+            // Format: OSC 7 ; file://host/path  (VS Code / tmux convention).
+            // The raw URI is stored; the app can percent-decode when needed.
+            7 => {
+                if params.len() >= 2 {
+                    let uri = std::str::from_utf8(&params[1]).unwrap_or("");
+                    if uri.is_empty() {
+                        self.cwd = None;
+                    } else {
+                        self.cwd = Some(uri.to_string());
+                        log::debug!("OSC 7: cwd = {}", uri);
+                    }
+                }
+            }
+            // OSC 9 — Desktop notification: OSC 9 ; text
+            // OSC 9 ; 4 ; title ; message — progress/notification form
+            // (we surface the message; actual desktop integration is the app's
+            // job, gated by the bell/notification policy).
+            9 => {
+                let message = if params.len() >= 4 && params[1] == b"4" {
+                    Some(params[3].to_vec())
+                } else if params.len() >= 2 {
+                    Some(params[1].to_vec())
+                } else {
+                    None
+                };
+                if let Some(msg) = message {
+                    if let Ok(s) = String::from_utf8(msg) {
+                        if s.is_empty() {
+                            self.notification = None;
+                        } else {
+                            log::debug!("OSC 9: notification = {}", s);
+                            self.notification = Some(s);
+                        }
+                    }
+                }
+            }
+            // OSC 133 — Shell integration (FinalTerm/VS Code protocol):
+            //   A = prompt start, E = prompt (clean) start
+            //   B = command start
+            //   C = end of command output
+            //   D = command finished (optional ; exit status)
+            // Rows are marked so the app can jump between prompts.
+            133 => {
+                let row = self.cursor.row;
+                if let Some(kind) = params.get(1) {
+                    if kind == b"A" || kind == b"E" {
+                        // Prompt start.
+                        self.set_row_marker(row, 1);
+                    } else if kind == b"B" {
+                        // Command start.
+                        self.set_row_marker(row, 2);
+                    } else if kind == b"C" || kind == b"D" {
+                        // End of output / command finished.
+                        self.set_row_marker(row, 3);
+                    }
+                }
+            }
             _ => {
                 log::trace!("Unhandled OSC {}: {:?}", cmd, params);
             }
@@ -2464,7 +2930,7 @@ impl Grid {
         }
         // Also scan scrollback (primary screen only — alt screen has none).
         for line in &self.scrollback {
-            for cell in line {
+            for cell in line.iter() {
                 let id = cell.hyperlink_id;
                 if id != 0 {
                     live.insert(id);
@@ -2606,17 +3072,19 @@ impl Perform for Grid {
                     // prerequisite.
                     (&[b'#'], b'8') => {
                         let rows = self.rows;
-                        let cells = self.cells_mut();
-                        for cell in cells.iter_mut() {
-                            cell.ch = 'E';
-                            cell.fg = Color::Default;
-                            cell.bg = Color::Default;
-                            cell.attrs = Attrs::default();
-                            cell.dirty = true;
-                            cell.wide_filler = false;
-                            cell.hyperlink_id = 0;
+                        for r in 0..rows {
+                            self.row_is_blank[r] = false;
+                            let row = Arc::make_mut(&mut self.cells_mut()[r]);
+                            for cell in row.iter_mut() {
+                                cell.ch = 'E';
+                                cell.fg = Color::Default;
+                                cell.bg = Color::Default;
+                                cell.attrs = Attrs::default();
+                                cell.dirty = true;
+                                cell.wide_filler = false;
+                                cell.hyperlink_id = 0;
+                            }
                         }
-                        drop(cells);
                         self.cursor.row = 0;
                         self.cursor.col = 0;
                         self.scroll_top = 0;
@@ -2702,19 +3170,32 @@ impl Perform for Grid {
                 self.dcs_request = params.first().and_then(|p| p.first()).copied() == Some(1)
                     && intermediates.contains(&b'$')
                     && final_byte == b'q';
+                // Sixel graphics: DCS ... q with no `$` intermediate. The
+                // intro parameters (pan/pad) are permitted and ignored.
+                self.dcs_sixel = final_byte == b'q' && !self.dcs_request;
             }
             Action::Put(byte) => {
-                // Accumulate DCS data bytes (DECRQSS sends the query string).
-                if self.dcs_buf.len() < MAX_OSC_DCS_LEN {
+                // Accumulate DCS data bytes (DECRQSS sends the query string,
+                // sixel sends the encoded image). Sixel gets a larger cap.
+                let cap = if self.dcs_sixel {
+                    MAX_DCS_LEN
+                } else {
+                    MAX_OSC_DCS_LEN
+                };
+                if self.dcs_buf.len() < cap {
                     self.dcs_buf.push(byte);
                 }
             }
             Action::Unhook => {
-                // On DCS end, answer a DECRQSS request we recognized.
+                // On DCS end, answer a DECRQSS request we recognized, or
+                // decode and place a completed sixel image.
                 if self.dcs_request {
                     self.answer_decrqss();
+                } else if self.dcs_sixel {
+                    self.place_sixel();
                 }
                 self.dcs_request = false;
+                self.dcs_sixel = false;
                 self.dcs_buf.clear();
             }
         }
@@ -3049,6 +3530,65 @@ mod tests {
         feed(&mut g, b"\n");
         // Cursor should stay at row 2 (scroll happened)
         assert_eq!(g.cursor.row, 2);
+    }
+
+    #[test]
+    fn test_consecutive_lf_batched_into_single_scroll() {
+        // The batch path (advance_bytes) must collapse a run of LFs into one
+        // scroll instead of scrolling per-LF.
+        let mut g = make_grid(10, 3);
+        g.cursor = crate::grid::Cursor { col: 0, row: 2 };
+        let mut p = crate::parser::Parser::new();
+        p.advance_bytes(&mut g, b"\n\n\n\n");
+        // 4 LFs from the bottom of a 3-row screen scroll exactly 3 lines
+        // (the region clamps), and the cursor stays at the bottom.
+        assert_eq!(g.cursor.row, 2);
+        assert_eq!(g.scrollback.len(), 3);
+        // All scrolled-off rows were blank (grid started empty).
+        for line in g.scrollback.iter() {
+            assert!(line.iter().all(|c| c.ch == ' '));
+        }
+    }
+
+    #[test]
+    fn test_erase_line_at_pending_wrap_does_not_panic() {
+        // Fuzz-found: after filling a row the cursor sits one column past the
+        // end (pending wrap). EL mode 1 from that state used to index out of
+        // bounds; it must clamp to the row length.
+        let mut g = make_grid(10, 3);
+        feed(&mut g, b"abcdefghij"); // fills row 0, cursor.col == 10
+        assert_eq!(g.cursor.col, 10);
+        feed(&mut g, b"\x1b[1K"); // EL mode 1 — must not panic
+        assert_eq!(g.cursor.col, 10);
+        // ED mode 1 has the same shape.
+        feed(&mut g, b"\x1b[1J");
+        assert_eq!(g.cursor.col, 10);
+    }
+
+    #[test]
+    fn test_scrollback_eviction_recycles_blanks() {
+        // Heavy scrolling past a tiny scrollback exercises the blank-row
+        // recycle path: evicted rows are reset and reused, and the grid must
+        // stay correct (bounded scrollback, newest lines kept, clean blanks).
+        let mut g = make_grid(10, 3);
+        g.scrollback_capacity = 2;
+        let mut p = crate::parser::Parser::new();
+        let mut payload = Vec::new();
+        for i in 0..6 {
+            payload.extend_from_slice(format!("LINE{i}\r\n").as_bytes());
+        }
+        p.advance_bytes(&mut g, &payload);
+        // Scrollback bounded by capacity; oldest scrolled lines evicted.
+        assert_eq!(g.scrollback.len(), 2);
+        assert_eq!(g.scrollback[0][0].ch, 'L');
+        assert_eq!(g.scrollback[0][4].ch, '2');
+        assert_eq!(g.scrollback[1][4].ch, '3');
+        // Visible rows hold the newest lines; the bottom is a clean blank.
+        assert_eq!(g.cell(4, 0).ch, '4');
+        assert_eq!(g.cell(4, 1).ch, '5');
+        for c in 0..10 {
+            assert_eq!(g.cell(c, 2).ch, ' ');
+        }
     }
 
     // -- IL/DL act from the cursor row (T1-3) --
@@ -3801,6 +4341,18 @@ mod tests {
     }
 
     #[test]
+    fn test_cht_forward_tab() {
+        let mut g = make_grid(40, 3);
+        feed(&mut g, b"\x1b[2I"); // CHT(2): col 0 → 8 → 16
+        assert_eq!(g.cursor.col, 16);
+        feed(&mut g, b"\x1b[2Z"); // CBT(2): back to col 0
+        assert_eq!(g.cursor.col, 0);
+        // Past the last stop → clamp to the last column.
+        feed(&mut g, b"\x1b[9I");
+        assert_eq!(g.cursor.col, 39);
+    }
+
+    #[test]
     fn test_decrqss_answered() {
         // `DECRQSS m` should produce a DCS reply reporting the SGR state.
         let mut g = make_grid(10, 3);
@@ -3946,5 +4498,233 @@ mod tests {
         let lines = g.all_lines_with_scrollback();
         assert!(lines.iter().any(|l| l.contains("abc")));
         assert!(lines.iter().any(|l| l.contains("def")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Shell integration (OSC 133) markers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_osc133_prompt_markers() {
+        let mut g = make_grid(20, 6);
+        feed(
+            &mut g,
+            b"\x1b]133;A\x07prompt>\r\n\x1b]133;B\x07ls\r\n\x1b]133;C\x07",
+        );
+        assert_eq!(g.shell_markers[0], 1); // prompt row
+        assert_eq!(g.shell_markers[1], 2); // command row
+        assert_eq!(g.shell_markers[2], 3); // output row
+    }
+
+    #[test]
+    fn test_osc133_clean_prompt_and_exit() {
+        let mut g = make_grid(20, 6);
+        feed(&mut g, b"\x1b]133;E\x07\r\n\x1b]133;D;0\x07");
+        assert_eq!(g.shell_markers[0], 1); // 133;E → prompt marker
+        assert_eq!(g.shell_markers[1], 3); // 133;D → output marker
+    }
+
+    #[test]
+    fn test_prompt_markers_follow_scroll() {
+        let mut g = make_grid(10, 4);
+        g.scrollback_capacity = 32;
+        feed(&mut g, b"\x1b]133;A\x07");
+        // Scroll the marked row into scrollback.
+        feed(&mut g, b"a\r\nb\r\nc\r\nd\r\ne\r\n");
+        assert_eq!(g.shell_scrollback_markers.len(), g.scrollback.len());
+        assert_eq!(
+            g.shell_scrollback_markers.iter().find(|m| **m == 1),
+            Some(&1)
+        );
+        // The prompt is reachable by scanning backwards from the end.
+        let stream_len = g.marker_stream_len();
+        assert!(g.prev_prompt(stream_len).is_some());
+        assert_eq!(g.prev_prompt(0), None);
+    }
+
+    #[test]
+    fn test_prev_next_prompt_stream() {
+        let mut g = make_grid(20, 5);
+        feed(
+            &mut g,
+            b"\x1b]133;A\x07one\r\n\x1b]133;A\x07two\r\n\x1b]133;A\x07three",
+        );
+        // Prompts on rows 0, 1, 2 → stream indices 0, 1, 2 (no scrollback yet).
+        assert_eq!(g.prev_prompt(3), Some(2));
+        assert_eq!(g.prev_prompt(2), Some(1));
+        assert_eq!(g.next_prompt(0), Some(1));
+        assert_eq!(g.next_prompt(2), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // In-band resize (mode 2048), OSC 7/9, sixel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mode_2048_resize_report() {
+        let mut g = make_grid(10, 5);
+        feed(&mut g, b"\x1b[?2048h");
+        assert!(g.in_band_resize);
+        g.resize_report();
+        assert_eq!(g.take_responses(), vec![b"\x1b[4;5;10t".to_vec()]);
+        feed(&mut g, b"\x1b[?2048l");
+        g.resize_report();
+        assert!(g.take_responses().is_empty());
+    }
+
+    #[test]
+    fn test_decrqm_reports_2048() {
+        let mut g = make_grid(10, 5);
+        feed(&mut g, b"\x1b[?2048h\x1b[?2048$p");
+        assert_eq!(g.take_responses(), vec![b"\x1b[?2048;1$y".to_vec()]);
+        feed(&mut g, b"\x1b[?2048l\x1b[?2048$p");
+        assert_eq!(g.take_responses(), vec![b"\x1b[?2048;2$y".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc7_cwd() {
+        let mut g = make_grid(20, 3);
+        feed(&mut g, b"\x1b]7;file:///home/user/projects\x07");
+        assert_eq!(g.cwd.as_deref(), Some("file:///home/user/projects"));
+    }
+
+    #[test]
+    fn test_osc9_notification() {
+        let mut g = make_grid(20, 3);
+        feed(&mut g, b"\x1b]9;hello world\x07");
+        assert_eq!(g.take_notification().as_deref(), Some("hello world"));
+        // Progress form: OSC 9;4;title;message
+        feed(&mut g, b"\x1b]9;4;Task;done\x07");
+        assert_eq!(g.take_notification().as_deref(), Some("done"));
+        // Empty clears the pending notification.
+        feed(&mut g, b"\x1b]9;\x07");
+        assert_eq!(g.take_notification(), None);
+    }
+
+    #[test]
+    fn test_sixel_dcs_places_image() {
+        let mut g = make_grid(40, 10);
+        g.set_cell_size(8, 16);
+        // DCS q, blue columns at band 0 and band 1 (after LF), ST.
+        feed(&mut g, b"\x1bPq#1~$~$~$~-~\x1b\\");
+        assert_eq!(g.sixel_images.len(), 1);
+        let img = &g.sixel_images[0];
+        assert_eq!(img.col, 0);
+        assert_eq!(img.row, 0);
+        assert_eq!(img.image.width, 1);
+        assert_eq!(img.image.height, 12);
+        // Cursor advanced below the image: 12px / 16px cell → 1 row.
+        assert_eq!(g.cursor.row, 1);
+        assert_eq!(g.cursor.col, 0);
+    }
+
+    #[test]
+    fn test_sixel_respects_cursor_position() {
+        let mut g = make_grid(40, 10);
+        g.set_cell_size(8, 16);
+        feed(&mut g, b"abc\x1bPq#1~\x1b\\");
+        assert_eq!(g.sixel_images[0].col, 3);
+    }
+
+    #[test]
+    fn test_sixel_bad_payload_is_ignored() {
+        let mut g = make_grid(40, 10);
+        g.set_cell_size(8, 16);
+        // Only control characters (CR/LF) — no graphic chars, nothing drawn.
+        feed(&mut g, b"\x1bPq$-$-\x1b\\");
+        assert!(g.sixel_images.is_empty());
+        // And the cursor is untouched.
+        assert_eq!(g.cursor.row, 0);
+        assert_eq!(g.cursor.col, 0);
+    }
+
+    // -- Sixel lifecycle (scroll / clear / resize) --
+
+    fn placement(id: u64, row: usize, col: usize) -> crate::sixel::SixelPlacement {
+        crate::sixel::SixelPlacement {
+            id,
+            col,
+            row,
+            image: crate::sixel::SixelImage {
+                width: 8,
+                height: 8,
+                rgba: vec![0u8; 8 * 8 * 4],
+            },
+        }
+    }
+
+    #[test]
+    fn test_sixel_scroll_shifts_rows_and_drops_off_top() {
+        let mut g = make_grid(40, 6);
+        g.sixel_images = vec![placement(1, 2, 0), placement(2, 0, 5)];
+        g.scroll_up_from(0, 1);
+        // The image at row 2 travels up with its content; the one at the very
+        // top scrolled into history and is dropped.
+        assert_eq!(g.sixel_images.len(), 1);
+        assert_eq!(g.sixel_images[0].id, 1);
+        assert_eq!(g.sixel_images[0].row, 1);
+    }
+
+    #[test]
+    fn test_sixel_insert_shifts_down_and_drops_off_bottom() {
+        let mut g = make_grid(40, 6);
+        g.sixel_images = vec![placement(1, 2, 0), placement(2, 5, 0)];
+        g.scroll_down_from(0, 1);
+        // IL pushes content down; the bottom placement is discarded (IL
+        // semantics never save) and the middle one moves down a row.
+        assert_eq!(g.sixel_images.len(), 1);
+        assert_eq!(g.sixel_images[0].id, 1);
+        assert_eq!(g.sixel_images[0].row, 3);
+    }
+
+    #[test]
+    fn test_sixel_erase_display_clears_screen_and_region() {
+        let mut g = make_grid(40, 10);
+        g.sixel_images = vec![placement(1, 2, 3), placement(2, 6, 0)];
+        // ED 2 clears the whole screen.
+        feed(&mut g, b"\x1b[2J");
+        assert!(g.sixel_images.is_empty());
+
+        g.sixel_images = vec![placement(1, 2, 3), placement(2, 6, 0)];
+        // ED 0 erases cursor → end of screen; cursor is at row 5, so the
+        // placement at row 2 survives while the one at row 6 is dropped.
+        g.cursor.row = 5;
+        g.cursor.col = 0;
+        feed(&mut g, b"\x1b[0J");
+        assert_eq!(g.sixel_images.len(), 1);
+        assert_eq!(g.sixel_images[0].id, 1);
+    }
+
+    #[test]
+    fn test_sixel_erase_line_removes_anchored_image() {
+        let mut g = make_grid(40, 10);
+        g.sixel_images = vec![placement(1, 2, 3)];
+        // Cursor to row 2 (1-based 3;1H), then EL 2 wipes the whole line.
+        feed(&mut g, b"\x1b[3;1H\x1b[2K");
+        assert!(g.sixel_images.is_empty());
+    }
+
+    #[test]
+    fn test_sixel_resize_drops_all_placements() {
+        let mut g = make_grid(40, 6);
+        g.sixel_images = vec![placement(1, 2, 0), placement(2, 5, 0)];
+        g.resize(WinSize { cols: 30, rows: 4 });
+        // Reflow re-orders rows, so placements (viewport-relative) can no
+        // longer be positioned correctly and are dropped wholesale.
+        assert!(g.sixel_images.is_empty());
+    }
+
+    #[test]
+    fn test_sixel_ids_unique_and_list_capped() {
+        let mut g = make_grid(40, 10);
+        g.set_cell_size(8, 16);
+        // 20 tiny one-pixel images — ids must be unique and the list capped.
+        for _ in 0..20 {
+            feed(&mut g, b"\x1bPq!1~!1~!1~!1~!1~!1~\x1b\\");
+        }
+        assert_eq!(g.sixel_images.len(), crate::sixel::MAX_LIVE_SIXELS);
+        let mut ids: Vec<u64> = g.sixel_images.iter().map(|p| p.id).collect();
+        ids.dedup();
+        assert_eq!(ids.len(), crate::sixel::MAX_LIVE_SIXELS);
     }
 }

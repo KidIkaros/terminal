@@ -73,6 +73,9 @@ pub struct TabManager {
     shell: String,
     /// Wake callback cloned for each new tab's reader thread (T5-2).
     wake_factory: Box<dyn Fn() -> pty::WakeCallback + Send + Sync>,
+    /// Terminal cell size in pixels (width, height); inherited by new tabs
+    /// so sixel cursor advances use the correct geometry.
+    cell_size: (u32, u32),
 }
 
 impl TabManager {
@@ -96,6 +99,7 @@ impl TabManager {
             scrollback,
             shell: shell.to_string(),
             wake_factory,
+            cell_size: (8, 16),
         })
     }
 
@@ -119,6 +123,7 @@ impl TabManager {
             scrollback,
             shell: shell.to_string(),
             wake_factory,
+            cell_size: (8, 16),
         })
     }
 
@@ -157,7 +162,8 @@ impl TabManager {
         let title = format!("Terminal {}", self.tabs.len() + 1);
         let wake = (self.wake_factory)();
         let argv = vec![self.shell.clone()];
-        let tab = Tab::spawn(&title, self.default_size, self.scrollback, &argv, wake)?;
+        let mut tab = Tab::spawn(&title, self.default_size, self.scrollback, &argv, wake)?;
+        tab.grid.set_cell_size(self.cell_size.0, self.cell_size.1);
         self.tabs.push(tab);
         let new_index = self.tabs.len() - 1;
         self.switch_to(new_index);
@@ -256,6 +262,15 @@ impl TabManager {
     pub fn titles(&self) -> Vec<&str> {
         self.tabs.iter().map(|t| t.title.as_str()).collect()
     }
+
+    /// Record the terminal's cell size (pixels) for all tabs; new tabs
+    /// inherit it via [`TabManager::new_tab`].
+    pub fn set_cell_size(&mut self, w: u32, h: u32) {
+        self.cell_size = (w.max(1), h.max(1));
+        for tab in &mut self.tabs {
+            tab.grid.set_cell_size(self.cell_size.0, self.cell_size.1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +292,7 @@ mod tests {
             scrollback: 1000,
             shell: "/bin/bash".to_string(),
             wake_factory: Box::new(|| Box::new(|| {}) as pty::WakeCallback),
+            cell_size: (8, 16),
         }
     }
 

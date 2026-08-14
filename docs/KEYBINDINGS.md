@@ -26,7 +26,16 @@ This document lists all keyboard shortcuts available in the terminal.
 | Shortcut | Action | Description |
 |----------|--------|-------------|
 | Ctrl+Shift+A | Select All | Select all text in the terminal |
-| Click + Drag | Select | Select text by dragging |
+| Click + Drag | Select | Select text by dragging (character mode) |
+| Alt + Click + Drag | Rectangular Select | Block selection — a fixed column range on every row |
+| Shift + Click + Drag | Line Select | Select entire lines |
+
+### Shell Integration
+
+| Shortcut | Action | Description |
+|----------|--------|-------------|
+| Ctrl+Shift+Up | Jump to Previous Prompt | Move to the previous OSC 133 prompt marker (scrolls the viewport if needed) |
+| Ctrl+Shift+Down | Jump to Next Prompt | Move to the next OSC 133 prompt marker, or return to the live view |
 
 ### Tabs (Future)
 
@@ -95,6 +104,7 @@ When search mode is active:
 ### Selection Modes
 
 - **Character Mode** - Select individual characters (default)
+- **Rectangular Mode** - Select a fixed column block across rows (Alt+drag)
 - **Line Mode** - Select entire lines (hold Shift)
 
 ### Selection Actions
