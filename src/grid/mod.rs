@@ -197,6 +197,8 @@ const INVISIBLE: u16 = 1 << 7;
 const STRIKETHROUGH: u16 = 1 << 8;
 const UNDERLINE_STYLE_SHIFT: u16 = 9;
 const UNDERLINE_STYLE_MASK: u16 = 0b111 << UNDERLINE_STYLE_SHIFT;
+/// DECSCA protection: protected cells survive selective erase (DECSED/DECSEL).
+const PROTECTED: u16 = 1 << 12;
 
 impl Attrs {
     pub fn bold(&self) -> bool {
@@ -225,6 +227,9 @@ impl Attrs {
     }
     pub fn strikethrough(&self) -> bool {
         self.0 & STRIKETHROUGH != 0
+    }
+    pub fn protected(&self) -> bool {
+        self.0 & PROTECTED != 0
     }
 
     pub fn set_bold(&mut self, v: bool) {
@@ -288,6 +293,13 @@ impl Attrs {
             self.0 |= STRIKETHROUGH;
         } else {
             self.0 &= !STRIKETHROUGH;
+        }
+    }
+    pub fn set_protected(&mut self, v: bool) {
+        if v {
+            self.0 |= PROTECTED;
+        } else {
+            self.0 &= !PROTECTED;
         }
     }
 
@@ -441,6 +453,13 @@ pub struct Grid {
     // Scroll region (inclusive, 0-indexed)
     scroll_top: usize,
     scroll_bottom: usize,
+    /// DECSLRM left/right margins (inclusive, 0-indexed). Full width by
+    /// default; honored only while DECLRMM (?69) is set.
+    pub scroll_left: usize,
+    pub scroll_right: usize,
+    /// DECLRMM (?69): left/right margin mode. When off, the left/right
+    /// margins are always the full screen width.
+    pub left_right_margins: bool,
     /// DEC line presentation modes: 0 normal, 3/4 double-height halves,
     /// 6 double-width.
     line_modes: Vec<u8>,
@@ -720,6 +739,9 @@ impl Grid {
             active_attrs: Attrs::default(),
             scroll_top: 0,
             scroll_bottom: rows - 1,
+            scroll_left: 0,
+            scroll_right: cols - 1,
+            left_right_margins: false,
             line_modes: vec![0; rows],
             scrollback: std::collections::VecDeque::new(),
             blank_row: blank,
@@ -927,6 +949,7 @@ impl Grid {
             25 => self.cursor_visible,         // DECTCEM
             66 => self.keypad_app,             // DECNKM
             67 => self.backarrow_del,          // DECBKM
+            69 => self.left_right_margins,     // DECLRMM
             1000 => self.mouse_mode == MouseMode::Normal,
             1002 => self.mouse_mode == MouseMode::ButtonEvent,
             1003 => self.mouse_mode == MouseMode::AnyEvent,
@@ -1210,6 +1233,9 @@ impl Grid {
         self.erase_in_display(2);
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
+        self.scroll_left = 0;
+        self.scroll_right = self.cols - 1;
+        self.left_right_margins = false;
         self.cursor = Cursor::default();
         self.window_resize_request = Some(WinSize {
             cols: new_cols as u16,
@@ -1243,6 +1269,9 @@ impl Grid {
         self.tab_stops = default_tab_stops(self.cols);
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
+        self.scroll_left = 0;
+        self.scroll_right = self.cols - 1;
+        self.left_right_margins = false;
         self.erase_in_display(2);
         self.cursor = Cursor::default();
         self.mark_all_dirty();
@@ -1468,12 +1497,16 @@ impl Grid {
 
         // Wrap if at end of line. DECAWM (?7) controls this: with autowrap
         // off, text clamps to the last cell(s) and overwrites them (T3-3).
-        if self.cursor.col + width > self.cols {
+        // DECSLRM (?69) bounds the line to the left/right margins: wrap goes
+        // to the left margin, clamping to the right margin (VT420).
+        let left = self.left_margin();
+        let right = self.right_margin();
+        if self.cursor.col + width > right + 1 {
             if self.autowrap {
-                self.cursor.col = 0;
+                self.cursor.col = left;
                 self.cursor.row += 1;
             } else {
-                self.cursor.col = self.cols.saturating_sub(width);
+                self.cursor.col = (right + 1).saturating_sub(width).max(left);
             }
         }
 
@@ -1563,6 +1596,12 @@ impl Grid {
 
         // Bail if insert mode is active — it needs per-char row shifting.
         if self.insert_mode {
+            return 0;
+        }
+
+        // Bail when left/right margins are active — the wrap and write
+        // bounds differ from the full line; the per-byte path handles them.
+        if self.scroll_left != 0 || self.scroll_right != self.cols - 1 {
             return 0;
         }
 
@@ -1733,6 +1772,28 @@ impl Grid {
     // -----------------------------------------------------------------------
     // Scrolling
     // -----------------------------------------------------------------------
+
+    /// Effective right margin: `scroll_right` while DECLRMM is active,
+    /// otherwise the last column.
+    #[inline]
+    pub fn right_margin(&self) -> usize {
+        if self.left_right_margins {
+            self.scroll_right.min(self.cols - 1)
+        } else {
+            self.cols - 1
+        }
+    }
+
+    /// Effective left margin: `scroll_left` while DECLRMM is active,
+    /// otherwise column 0.
+    #[inline]
+    pub fn left_margin(&self) -> usize {
+        if self.left_right_margins {
+            self.scroll_left.min(self.cols - 1)
+        } else {
+            0
+        }
+    }
 
     fn scroll_up(&mut self, n: usize) {
         self.scroll_up_from(self.scroll_top, n);
@@ -1911,18 +1972,31 @@ impl Grid {
     // -----------------------------------------------------------------------
 
     fn erase_in_display(&mut self, mode: u16) {
+        self.erase_display_impl(mode, false);
+    }
+
+    /// DECSED — selective erase in display: skips cells whose DECSCA
+    /// protection is set.
+    fn erase_in_display_selective(&mut self, mode: u16) {
+        self.erase_display_impl(mode, true);
+    }
+
+    /// Core ED implementation. Horizontally bounded by the DECSLRM margins
+    /// when DECLRMM is active; `selective` skips protected cells.
+    fn erase_display_impl(&mut self, mode: u16, selective: bool) {
         let cursor = self.cursor;
         let rows = self.rows;
-        let cols = self.cols;
+        let left = self.left_margin();
+        let right = self.right_margin();
         let (start_row, start_col, end_row, end_col) = match mode {
             0 => {
-                // From cursor to end of screen
-                (cursor.row, cursor.col, rows - 1, cols)
+                // From cursor to end of screen (bounded by the right margin).
+                (cursor.row, cursor.col.min(right + 1), rows - 1, right + 1)
             }
             1 => {
                 // From start to cursor (inclusive). Clamp: the cursor can sit
-                // one past the last column (pending wrap after filling a row).
-                (0, 0, cursor.row, (cursor.col + 1).min(self.cols))
+                // one past the right margin (pending wrap after filling a row).
+                (0, left, cursor.row, (cursor.col + 1).clamp(left, right + 1))
             }
             2 | 3 => {
                 // Entire screen. Mode 3 also wipes the scrollback history
@@ -1931,7 +2005,7 @@ impl Grid {
                     self.scrollback.clear();
                     self.scrollback_offset = 0;
                 }
-                (0, 0, rows - 1, cols)
+                (0, left, rows - 1, right + 1)
             }
             _ => return,
         };
@@ -1944,13 +2018,16 @@ impl Grid {
             let (cs, ce) = if r == start_row && r == end_row {
                 (start_col, end_col)
             } else if r == start_row {
-                (start_col, cols)
+                (start_col, right + 1)
             } else if r == end_row {
-                (0, end_col)
+                (left, end_col)
             } else {
-                (0, cols)
+                (left, right + 1)
             };
             for c in cs..ce {
+                if selective && row_cells[c].attrs.protected() {
+                    continue;
+                }
                 row_cells[c] = Cell {
                     fg,
                     bg,
@@ -1972,14 +2049,26 @@ impl Grid {
     }
 
     fn erase_in_line(&mut self, mode: u16) {
+        self.erase_line_impl(mode, false);
+    }
+
+    /// DECSEL — selective erase in line: skips protected cells.
+    fn erase_in_line_selective(&mut self, mode: u16) {
+        self.erase_line_impl(mode, true);
+    }
+
+    /// Core EL implementation. Bounded by the DECSLRM margins when DECLRMM
+    /// is active; `selective` skips protected cells.
+    fn erase_line_impl(&mut self, mode: u16, selective: bool) {
         let cursor = self.cursor;
+        let left = self.left_margin();
+        let right = self.right_margin();
         let (start_col, end_col) = match mode {
-            0 => (cursor.col, self.cols), // cursor to end of line
-            // Mode 1 erases start→cursor inclusive, but the cursor can sit
-            // one past the last column (pending wrap after filling a row),
-            // so clamp to the row length (T3-16 regression).
-            1 => (0, (cursor.col + 1).min(self.cols)),
-            2 => (0, self.cols), // entire line
+            0 => (cursor.col.min(right + 1), right + 1), // cursor to right margin
+            // Mode 1 erases left margin→cursor inclusive; the cursor can sit
+            // one past the right margin (pending wrap), so clamp (T3-16).
+            1 => (left, (cursor.col + 1).clamp(left, right + 1)),
+            2 => (left, right + 1), // entire line between the margins
             _ => return,
         };
 
@@ -1989,6 +2078,9 @@ impl Grid {
         self.row_is_blank[row] = false;
         let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
         for c in start_col..end_col {
+            if selective && row_cells[c].attrs.protected() {
+                continue;
+            }
             row_cells[c] = Cell {
                 fg,
                 bg,
@@ -2002,11 +2094,20 @@ impl Grid {
             .retain(|p| !(p.row == row && p.col >= start_col && p.col < end_col));
     }
 
-    /// Fill a rectangular area (DECFRA / DECERA): rows `top..=bottom` and
-    /// columns `left..=right`, all 1-based and shifted by the origin in
-    /// DECOM mode, clamped to the screen. Cells are replaced with `fill`
-    /// using the current SGR (DECERA pre-sets SGR to defaults).
-    fn fill_rect(&mut self, top: usize, left: usize, bottom: usize, right: usize, fill: u16) {
+    /// Fill a rectangular area (DECFRA / DECERA / DECSERA): rows
+    /// `top..=bottom` and columns `left..=right`, all 1-based and shifted by
+    /// the origin in DECOM mode, clamped to the screen. Cells are replaced
+    /// with `fill` using the current SGR (DECERA/DECSERA pre-set SGR to
+    /// defaults); `selective` (DECSERA) leaves protected cells intact.
+    fn fill_rect(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        fill: u16,
+        selective: bool,
+    ) {
         let origin = if self.origin_mode {
             self.scroll_top.min(self.rows.saturating_sub(1))
         } else {
@@ -2031,6 +2132,9 @@ impl Grid {
             self.row_is_blank[r] = false;
             let row_cells = Arc::make_mut(&mut self.cells_mut()[r]);
             for c in c0..=c1 {
+                if selective && row_cells[c].attrs.protected() {
+                    continue;
+                }
                 row_cells[c] = Cell {
                     ch,
                     fg,
@@ -2046,25 +2150,25 @@ impl Grid {
     /// Insert `n` blank columns at the cursor (DECIC). Every row shifts its
     /// content from the cursor column right; the rightmost columns fall off.
     fn insert_columns(&mut self, n: usize) {
-        let cols = self.cols;
-        let col = self.cursor.col.min(cols);
-        if col >= cols {
+        let bound = self.right_margin() + 1;
+        let col = self.cursor.col.min(bound);
+        if col >= bound {
             return;
         }
-        let n = n.min(cols - col);
+        let n = n.min(bound - col);
         let fg = self.active_fg;
         let bg = self.active_bg;
         let attrs = self.active_attrs;
         for r in 0..self.rows {
             self.row_is_blank[r] = false;
             let row_cells = Arc::make_mut(&mut self.cells_mut()[r]);
-            for c in (col..cols).rev() {
-                if c + n < cols {
+            for c in (col..bound).rev() {
+                if c + n < bound {
                     row_cells[c + n] = row_cells[c].clone();
                 }
                 row_cells[c].dirty = true;
             }
-            for c in col..(col + n).min(cols) {
+            for c in col..(col + n).min(bound) {
                 row_cells[c] = Cell {
                     ch: ' ',
                     fg,
@@ -2080,23 +2184,23 @@ impl Grid {
     /// Delete `n` columns at the cursor (DECDC). Every row shifts its content
     /// left from the cursor column; the rightmost columns become blank.
     fn delete_columns(&mut self, n: usize) {
-        let cols = self.cols;
-        let col = self.cursor.col.min(cols);
-        if col >= cols {
+        let bound = self.right_margin() + 1;
+        let col = self.cursor.col.min(bound);
+        if col >= bound {
             return;
         }
-        let n = n.min(cols - col);
+        let n = n.min(bound - col);
         let fg = self.active_fg;
         let bg = self.active_bg;
         let attrs = self.active_attrs;
         for r in 0..self.rows {
             self.row_is_blank[r] = false;
             let row_cells = Arc::make_mut(&mut self.cells_mut()[r]);
-            for c in col..(cols - n) {
+            for c in col..(bound - n) {
                 row_cells[c] = row_cells[c + n].clone();
                 row_cells[c].dirty = true;
             }
-            for c in (cols - n)..cols {
+            for c in (bound - n)..bound {
                 row_cells[c] = Cell {
                     ch: ' ',
                     fg,
@@ -2129,7 +2233,11 @@ impl Grid {
                 0 => {
                     self.active_fg = Color::Default;
                     self.active_bg = Color::Default;
+                    // DECSCA protection survives an SGR reset (VT420 keeps
+                    // the two attributes independent).
+                    let protected = self.active_attrs.protected();
                     self.active_attrs = Attrs::default();
+                    self.active_attrs.set_protected(protected);
                     i += 1;
                 }
                 1 => {
@@ -2335,15 +2443,15 @@ impl Grid {
                 let n = p0.max(1);
                 self.cursor.row = (self.cursor.row + n).min(self.scroll_bottom);
             }
-            // CUF — cursor forward
+            // CUF — cursor forward (bounded by the right margin in DECLRMM).
             (_, b'C') => {
                 let n = p0.max(1);
-                self.cursor.col = (self.cursor.col + n).min(self.cols - 1);
+                self.cursor.col = (self.cursor.col + n).min(self.right_margin());
             }
-            // CUB — cursor backward
+            // CUB — cursor backward (bounded by the left margin in DECLRMM).
             (_, b'D') => {
                 let n = p0.max(1);
-                self.cursor.col = self.cursor.col.saturating_sub(n);
+                self.cursor.col = self.cursor.col.saturating_sub(n).max(self.left_margin());
             }
             // CNL — cursor next line
             (_, b'E') => {
@@ -2357,12 +2465,18 @@ impl Grid {
                 self.cursor.row = self.cursor.row.saturating_sub(n);
                 self.cursor.col = 0;
             }
-            // CHA — cursor horizontal absolute
+            // CHA — cursor horizontal absolute. In DECOM the column is
+            // relative to the left margin (VT420).
             (_, b'G') => {
-                self.cursor.col = p0.saturating_sub(1).min(self.cols - 1);
+                self.cursor.col = if self.origin_mode {
+                    (p0.saturating_sub(1) + self.left_margin()).min(self.right_margin())
+                } else {
+                    p0.saturating_sub(1).min(self.cols - 1)
+                };
             }
-            // CUP / HVP — cursor position. In DECOM (?6) the row is relative
-            // to the scroll region top and clamped inside the region (T3-2).
+            // CUP / HVP — cursor position. In DECOM (?6) the position is
+            // relative to the origin — the intersection of the top and left
+            // margins — and clamped inside it (T3-2, VT420).
             (_, b'H') | (_, b'f') => {
                 let row = if self.origin_mode {
                     (p0.saturating_sub(1) + self.scroll_top).min(self.scroll_bottom)
@@ -2370,25 +2484,36 @@ impl Grid {
                     p0.saturating_sub(1).min(self.rows - 1)
                 };
                 self.cursor.row = row;
-                self.cursor.col = p1.saturating_sub(1).min(self.cols - 1);
+                self.cursor.col = if self.origin_mode {
+                    (p1.saturating_sub(1) + self.left_margin()).min(self.right_margin())
+                } else {
+                    p1.saturating_sub(1).min(self.cols - 1)
+                };
             }
-            // ED — erase in display
+            // DECSED — selective erase in display: like ED but skips cells
+            // whose DECSCA protection is set. Must precede the catch-all.
+            (b"?", b'J') => self.erase_in_display_selective(p0 as u16),
+            // DECSEL — selective erase in line.
+            (b"?", b'K') => self.erase_in_line_selective(p0 as u16),
+            // ED — erase in display.
             (_, b'J') => self.erase_in_display(p0 as u16),
-            // EL — erase in line
+            // EL — erase in line.
             (_, b'K') => self.erase_in_line(p0 as u16),
             // ICH — insert characters (T3-10). Shifts the row right, leaving
-            // `n` blank cells at the cursor; remaining cells fall off the end.
+            // `n` blank cells at the cursor; remaining cells fall off the end
+            // (bounded by the right margin in DECLRMM).
             (_, b'@') => {
                 let n = p0.max(1);
                 let row = self.cursor.row;
                 let col = self.cursor.col;
-                let cols = self.cols;
+                let right = self.right_margin();
+                let bound = right + 1;
                 self.row_is_blank[row] = false;
                 let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
                 // Shift everything at/after `col` right by `n`, working from
                 // the right edge so we don't clobber source cells.
-                for c in (col..cols).rev() {
-                    if c + n < cols {
+                for c in (col..bound).rev() {
+                    if c + n < bound {
                         row_cells[c + n] = row_cells[c].clone();
                     }
                     if c >= col {
@@ -2396,7 +2521,7 @@ impl Grid {
                     }
                 }
                 // Blank the freshly-inserted cells at the cursor.
-                for c in col..(col + n).min(cols) {
+                for c in col..(col + n).min(bound) {
                     row_cells[c] = Cell::default();
                 }
             }
@@ -2479,16 +2604,16 @@ impl Grid {
                     self.scroll_up_from(self.cursor.row, n);
                 }
             }
-            // DCH — delete characters
+            // DCH — delete characters (bounded by the right margin).
             (_, b'P') => {
                 let n = p0.max(1);
                 let row = self.cursor.row;
                 let col = self.cursor.col;
-                let cols = self.cols;
+                let bound = self.right_margin() + 1;
                 self.row_is_blank[row] = false;
                 let row_cells = Arc::make_mut(&mut self.cells_mut()[row]);
-                for c in col..cols {
-                    if c + n < cols {
+                for c in col..bound {
+                    if c + n < bound {
                         row_cells[c] = row_cells[c + n].clone();
                     } else {
                         row_cells[c] = Cell::default();
@@ -2533,7 +2658,8 @@ impl Grid {
             }
             // SGR — select graphic rendition
             (b"", b'm') => self.apply_sgr(params),
-            // DECSTBM — set top/bottom margins (scroll region)
+            // DECSTBM — set top/bottom margins (scroll region). Per VT420,
+            // setting them resets the left/right margins to full width.
             (_, b'r') => {
                 let top = p0.saturating_sub(1);
                 let bot = if p1 == 0 { self.rows - 1 } else { p1 - 1 };
@@ -2541,7 +2667,32 @@ impl Grid {
                     self.scroll_top = top;
                     self.scroll_bottom = bot;
                 }
+                self.scroll_left = 0;
+                self.scroll_right = self.cols - 1;
                 self.cursor = Cursor::default(); // home cursor
+            }
+            // DECSLRM — set left/right margins: CSI Pl;Pr s. With DECLRMM
+            // (?69) off this resets them to full width (VT420). Setting them
+            // resets the top/bottom margins and homes the cursor into the
+            // margin region. The bare `CSI s` (no params) stays DECSC — save
+            // cursor (matched below).
+            (b"", b's') if p0 != 0 && params.len() >= 2 => {
+                let left = p0.saturating_sub(1);
+                let right = p1.saturating_sub(1);
+                self.scroll_left = if self.left_right_margins {
+                    left.min(self.cols - 1)
+                } else {
+                    0
+                };
+                self.scroll_right = if self.left_right_margins {
+                    right.min(self.cols - 1).max(self.scroll_left)
+                } else {
+                    self.cols - 1
+                };
+                self.scroll_top = 0;
+                self.scroll_bottom = self.rows - 1;
+                self.cursor.row = self.scroll_top;
+                self.cursor.col = self.scroll_left;
             }
             // DECSC — save cursor (per-screen, T3-14)
             (b"", b'7') | (b"", b's') => {
@@ -2603,9 +2754,10 @@ impl Grid {
                         }
                         6 => {
                             // DECOM — origin mode (T3-2). Setting or resetting
-                            // homes the cursor (to the region top when set).
+                            // homes the cursor — to the origin (the top-left
+                            // of the scroll region and left margin) when set.
                             self.origin_mode = set;
-                            self.cursor.col = 0;
+                            self.cursor.col = if set { self.left_margin() } else { 0 };
                             self.cursor.row = if set { self.scroll_top } else { 0 };
                         }
                         7 => {
@@ -2623,6 +2775,16 @@ impl Grid {
                             // DECBKM — backarrow key sends DEL when set, BS
                             // when reset (default).
                             self.backarrow_del = set;
+                        }
+                        69 => {
+                            // DECLRMM — left/right margin mode. Enabling keeps
+                            // the current margins; disabling returns to full
+                            // width (VT420).
+                            self.left_right_margins = set;
+                            if !set {
+                                self.scroll_left = 0;
+                                self.scroll_right = self.cols - 1;
+                            }
                         }
                         1000 => {
                             // Normal mouse tracking
@@ -2823,6 +2985,14 @@ impl Grid {
                     self.set_columns(cols as usize);
                 }
             }
+            // DECSCA — select character attributes: CSI Ps " q. Ps 0/1 =
+            // unprotected (default), 2 = protected. Protection is sticky and
+            // independent of SGR: protected cells survive selective erase
+            // (DECSED/DECSEL/DECSERA). It rides on the active SGR attrs bit.
+            (b"\"", b'q') => {
+                let n = p0;
+                self.active_attrs.set_protected(n == 2);
+            }
             // DECFRA — fill rectangular area: CSI Ps;Pt;Pl;Pp;Pv $ x. Fills
             // the rectangle (top/left/bottom/right, 1-based, cursor-relative
             // in origin mode) with the character Ps (space if omitted), using
@@ -2843,6 +3013,7 @@ impl Grid {
                     bottom as usize,
                     right as usize,
                     fill as u16,
+                    false,
                 );
             }
             // DECERA — erase rectangular area: CSI Pt;Pl;Pp;Pv $ z. Replaces
@@ -2868,6 +3039,36 @@ impl Grid {
                     bottom as usize,
                     right as usize,
                     b' ' as u16,
+                    false,
+                );
+                self.active_fg = old_fg;
+                self.active_bg = old_bg;
+                self.active_attrs = old_attrs;
+            }
+            // DECSERA — selective erase rectangular area: CSI Pt;Pl;Pp;Pv $ {.
+            // Like DECERA but protected (DECSCA) cells are left intact.
+            (b"$", b'{') => {
+                let flat: Vec<u16> = params
+                    .iter()
+                    .map(|p| p.first().copied().unwrap_or(0))
+                    .collect();
+                let top = flat.first().copied().unwrap_or(1);
+                let left = flat.get(1).copied().unwrap_or(1);
+                let bottom = flat.get(2).copied().unwrap_or(1);
+                let right = flat.get(3).copied().unwrap_or(1);
+                let old_fg = self.active_fg;
+                let old_bg = self.active_bg;
+                let old_attrs = self.active_attrs;
+                self.active_fg = Color::Default;
+                self.active_bg = Color::Default;
+                self.active_attrs = Attrs::default();
+                self.fill_rect(
+                    top as usize,
+                    left as usize,
+                    bottom as usize,
+                    right as usize,
+                    b' ' as u16,
+                    true,
                 );
                 self.active_fg = old_fg;
                 self.active_bg = old_bg;
@@ -4765,6 +4966,84 @@ mod tests {
             vec![b"\x1b[?67;1$y".to_vec()],
             "DECRQM mode 67 mismatch"
         );
+    }
+
+    #[test]
+    fn test_decslrm_margins_bound_wrap_el_and_movement() {
+        let mut g = make_grid(8, 3);
+        feed(&mut g, b"\x1b[?69h\x1b[3;6s"); // LRMM on, margins cols 3..6 (0-based 2..5)
+        assert!(g.left_right_margins);
+        assert_eq!((g.scroll_left, g.scroll_right), (2, 5));
+        assert_eq!(
+            (g.cursor.col, g.cursor.row),
+            (2, 0),
+            "DECSLRM should home into the margins"
+        );
+        feed(&mut g, b"abcdefgh");
+        // 'abcd' fills cols 2-5 of row 0; 'e' wraps to the left margin of row 1.
+        assert_eq!(g.line_to_string(0), "  abcd  ");
+        assert_eq!(g.line_to_string(1), "  efgh  ");
+        // CUF/CUB are bounded by the margins.
+        feed(&mut g, b"\x1b[3;1H"); // cursor to (2, 0)
+        feed(&mut g, b"\x1b[9C"); // CUF 9 → clamped at right margin (col 5)
+        assert_eq!(g.cursor.col, 5);
+        feed(&mut g, b"\x1b[9D"); // CUB 9 → clamped at left margin (col 2)
+        assert_eq!(g.cursor.col, 2);
+        // EL 2 is bounded by the margins: only cols 2-5 of the row are wiped.
+        feed(&mut g, b"\x1b[1;1H\x1b[2K");
+        assert_eq!(g.line_to_string(0), "        ");
+        // DECSTBM resets the left/right margins to full width.
+        feed(&mut g, b"\x1b[2;2r");
+        assert_eq!((g.scroll_left, g.scroll_right), (0, 7));
+    }
+
+    #[test]
+    fn test_decsca_protects_against_selective_erase() {
+        // DECSCA 2 protects: plain EL 2 wipes everything…
+        let mut g1 = make_grid(8, 2);
+        feed(&mut g1, b"\x1b[2\"qab\x1b[0\"qcd\x1b[1;1H\x1b[2K");
+        assert_eq!(g1.line_to_string(0), "        ");
+
+        // …but DECSEL (?K) skips protected cells.
+        let mut g2 = make_grid(8, 2);
+        feed(&mut g2, b"\x1b[2\"qab\x1b[0\"qcd\x1b[1;1H\x1b[?2K");
+        assert_eq!(g2.line_to_string(0), "ab      ");
+
+        // DECSED (?J) skips protected cells too (cursor → end of screen).
+        let mut g3 = make_grid(8, 2);
+        feed(&mut g3, b"\x1b[2\"qab\x1b[0\"qcd\r\nxy\x1b[1;1H\x1b[?J");
+        assert_eq!(g3.line_to_string(0), "ab      ");
+        assert_eq!(g3.line_to_string(1), "        ");
+
+        // DECSERA ($ {) erases a rectangle but leaves protected cells.
+        let mut g4 = make_grid(8, 2);
+        feed(&mut g4, b"\x1b[2\"qA\x1b[0\"qB");
+        feed(&mut g4, b"\x1b[1;1;2;2${");
+        assert_eq!(g4.cell(0, 0).ch, 'A', "DECSERA erased a protected cell");
+        assert_eq!(g4.cell(1, 0).ch, ' ', "DECSERA left an unprotected cell");
+    }
+
+    #[test]
+    fn test_decstr_clears_protection() {
+        let mut g = make_grid(8, 2);
+        // DECSCA 2 protects; DECSCA and SGR are independent (VT420), so SGR
+        // 0;1 restyles without losing protection.
+        feed(&mut g, b"\x1b[2\"qA\x1b[0;1mB");
+        assert!(g.cell(0, 0).attrs.protected(), "DECSCA 2 did not protect");
+        assert!(g.cell(1, 0).attrs.bold(), "SGR 0;1 after DECSCA broke");
+        assert!(
+            g.cell(1, 0).attrs.protected(),
+            "protection lost on SGR reset"
+        );
+        // DECSCA 0 clears protection for subsequent characters.
+        feed(&mut g, b"\x1b[0\"qC");
+        assert!(
+            !g.cell(2, 0).attrs.protected(),
+            "DECSCA 0 did not unprotect"
+        );
+        // DECSTR resets protection so selective erase wipes everything.
+        feed(&mut g, b"\x1b[!p\x1b[?2K");
+        assert_eq!(g.line_to_string(0), "        ");
     }
 
     #[test]

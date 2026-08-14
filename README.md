@@ -151,8 +151,8 @@ Run it yourself: `cargo run --release --bin bench`.
 
 ## Verification
 
-- `cargo test --locked` — 293 tests (parser, grid, selection, sixel, fuzz smoke)
-- `cargo run --release --bin vt_conformance` — 31 headless VT conformance cases
+- `cargo test --locked` — 296 tests (parser, grid, selection, sixel, fuzz smoke)
+- `cargo run --release --bin vt_conformance` — 33 headless VT conformance cases
 - `cargo run --release --bin fuzz -- --quick` — deterministic parser fuzzing
 
 ## License

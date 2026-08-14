@@ -501,6 +501,58 @@ fn decpam_decnkm_and_decbkm() -> Result<(), String> {
     )
 }
 
+fn decslrm_margins() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 8, rows: 3 }, 32);
+    feed(&mut grid, b"\x1b[?69h\x1b[3;6s"); // DECLRMM + margins 3..6 (0-based 2..5)
+    expect(grid.left_right_margins, "DECSET 69 not set")?;
+    expect(
+        grid.scroll_left == 2 && grid.scroll_right == 5,
+        "DECSLRM margins wrong",
+    )?;
+    feed(&mut grid, b"abcdefgh");
+    expect(
+        grid.line_to_string(0) == "  abcd  " && grid.line_to_string(1) == "  efgh  ",
+        format!(
+            "margin wrap wrong: {:?} / {:?}",
+            grid.line_to_string(0),
+            grid.line_to_string(1)
+        ),
+    )?;
+    feed(&mut grid, b"\x1b[1;1H\x1b[2K");
+    expect(
+        grid.line_to_string(0) == "        ",
+        "margin-bounded EL wrong",
+    )?;
+    feed(&mut grid, b"\x1b[?69l");
+    expect(!grid.left_right_margins, "DECRST 69 failed")?;
+    expect(
+        grid.scroll_left == 0 && grid.scroll_right == 7,
+        "disabling DECLRMM should restore full width",
+    )
+}
+
+fn decsca_selective_erase() -> Result<(), String> {
+    let mut grid = Grid::new(WinSize { cols: 8, rows: 2 }, 32);
+    feed(&mut grid, b"\x1b[2\"qab\x1b[0\"qcd");
+    feed(&mut grid, b"\x1b[1;1H\x1b[?2K"); // DECSEL 2
+    expect(
+        grid.line_to_string(0) == "ab      ",
+        format!("DECSEL kept wrong cells: {:?}", grid.line_to_string(0)),
+    )?;
+    feed(&mut grid, b"\x1b[?J"); // DECSED from cursor: wipes the rest
+    expect(
+        grid.line_to_string(1) == "        " && grid.cell(2, 0).ch == ' ',
+        "DECSED did not erase unprotected cells",
+    )?;
+    expect(grid.cell(0, 0).ch == 'a', "DECSED erased a protected cell")?;
+    // DECRQM reports DECLRMM state.
+    feed(&mut grid, b"\x1b[?69$p");
+    expect(
+        grid.take_responses() == vec![b"\x1b[?69;2$y".to_vec()],
+        "DECRQM mode 69 mismatch",
+    )
+}
+
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -626,6 +678,14 @@ fn cases() -> Vec<Case> {
         Case {
             name: "decpam_decnkm_and_decbkm",
             run: decpam_decnkm_and_decbkm,
+        },
+        Case {
+            name: "decslrm_margins",
+            run: decslrm_margins,
+        },
+        Case {
+            name: "decsca_selective_erase",
+            run: decsca_selective_erase,
         },
     ]
 }

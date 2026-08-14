@@ -17,9 +17,11 @@ UTF-8 robustness next to invalid bytes, OSC 52, cursor shapes / bracketed paste,
 behaviour, DECRQM, OSC 8 hyperlinks, IRM insert mode, DECSC/DECRC cursor save/restore,
 truecolor SGR (colon + semicolon forms), CHT/CBT tabulation, DECTCEM cursor visibility,
 DECOM origin mode, DECSTR soft reset, DECREQTPARM, DECCOLM/DECSCPP column switches,
-DECIC/DECDC column insert/delete, DECFRA/DECERA rectangular fill/erase, and
-DECPAM/DECNKM/DECBKM — **31 cases**. The CHT and DECCOLM cases caught real gaps: `CSI I`
-had no handler, and DECCOLM was accepted but did not resize.
+DECIC/DECDC column insert/delete, DECFRA/DECERA rectangular fill/erase,
+DECPAM/DECNKM/DECBKM, DECSLRM left/right margins (DECLRMM ?69), and DECSCA
+protected attributes with selective erase (DECSED/DECSEL/DECSERA) — **33 cases**.
+The CHT, DECCOLM, DECSLRM and DECSCA cases caught real gaps: `CSI I` had no handler,
+DECCOLM was accepted but did not resize, and DECSLRM/DECSCA were unimplemented.
 
 ## Parser fuzz harness
 
